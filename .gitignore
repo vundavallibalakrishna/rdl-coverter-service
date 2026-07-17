@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Local configuration (never commit real values)
+.env
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Scratch + generated artifacts. Everything written by a render, smoke run, or verifier belongs
+# under tmp/ so it cannot be committed by accident. See README "Working files".
+tmp/
+output/
+coverage/
+.docker-smoke-fonts-*/
+
+# Client RDLs, request fixtures, and row data are client property and must never be committed. They live
+# in tmp/samples/ (already ignored above); this rule also catches a samples/ directory recreated at the
+# old top-level path. Resolve them via scripts/lib/samples.js or RDL_SAMPLES_DIR.
+samples/
+
+# Rendered artifacts may embed client report content and row values, which must never enter version
+# control. Deliberately blanket rules: an artifact written outside tmp/ is still ignored.
+*.pdf
+*.docx
+*.png
+*.ppm
+
+# Test fixtures are the one intentional exception: they are synthetic and the suite requires them.
+!test/fixtures/**
+
+# Licensed fonts are never committed or baked into the image (see AGENTS.md).
+fonts/
+*.ttf
+*.otf
+*.ttc

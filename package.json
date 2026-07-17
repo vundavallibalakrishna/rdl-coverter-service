@@ -1,0 +1,47 @@
+{
+  "name": "rdl-converter-service",
+  "version": "0.1.0",
+  "description": "Standalone private-network RDL renderer. Converts an RDL definition plus caller-supplied datasets into PDF or DOCX. Never executes RDL data sources, SQL, or custom report code.",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "rdl-converter-service": "src/server.js"
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "README.md",
+    "AGENTS.md",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-reporter=spec",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "generate:samples": "node scripts/generate-sample-requests.js",
+    "smoke:sample": "node scripts/render-sample.js",
+    "verify:reference": "node scripts/verify-reference-sample.js",
+    "verify:stress": "node scripts/stress-certification.js",
+    "audit:schema": "node scripts/schema-coverage.js",
+    "smoke:docker": "node scripts/docker-smoke.js"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.3.0",
+    "docx": "^9.5.1",
+    "fast-xml-parser": "^5.3.1",
+    "fastify": "^5.6.2",
+    "jszip": "^3.10.1",
+    "pdf-lib": "^1.17.1",
+    "pdfkit": "^0.17.2",
+    "pngjs": "^7.0.0"
+  }
+}

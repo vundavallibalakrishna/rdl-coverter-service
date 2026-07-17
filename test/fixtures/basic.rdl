@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <Description>Basic Sales Report</Description>
+  <DataSources>
+    <DataSource Name="IgnoredSource"><DataSourceReference>/Shared/Ignored</DataSourceReference></DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="Sales">
+      <Fields>
+        <Field Name="Name"><DataField>Name</DataField><TypeName>System.String</TypeName></Field>
+        <Field Name="Amount"><DataField>Amount</DataField><TypeName>System.Decimal</TypeName></Field>
+      </Fields>
+      <Query><DataSourceName>IgnoredSource</DataSourceName><CommandText>select secret from ignored</CommandText></Query>
+    </DataSet>
+    <DataSet Name="Choices">
+      <Fields><Field Name="Value"><DataField>Value</DataField></Field></Fields>
+      <Query><DataSourceName>IgnoredSource</DataSourceName><CommandText>select ignored</CommandText></Query>
+    </DataSet>
+  </DataSets>
+  <ReportParameters>
+    <ReportParameter Name="Title">
+      <DataType>String</DataType><Prompt>Title</Prompt><DefaultValue><Values><Value>Sales</Value></Values></DefaultValue>
+    </ReportParameter>
+    <ReportParameter Name="Choice">
+      <DataType>String</DataType><Prompt>Choice</Prompt>
+      <ValidValues><DataSetReference><DataSetName>Choices</DataSetName><ValueField>Value</ValueField><LabelField>Value</LabelField></DataSetReference></ValidValues>
+    </ReportParameter>
+  </ReportParameters>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <Textbox Name="TitleBox">
+            <CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Parameters!Title.Value</Value><Style><FontFamily>Arial</FontFamily><FontSize>14pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns></Paragraph></Paragraphs>
+            <Top>0.1in</Top><Left>0.1in</Left><Height>0.3in</Height><Width>6in</Width><Style><FontFamily>Arial</FontFamily><FontSize>14pt</FontSize><FontWeight>Bold</FontWeight></Style>
+          </Textbox>
+          <Tablix Name="SalesTable">
+            <TablixBody>
+              <TablixColumns><TablixColumn><Width>3in</Width></TablixColumn><TablixColumn><Width>2in</Width></TablixColumn></TablixColumns>
+              <TablixRows>
+                <TablixRow><Height>0.3in</Height><TablixCells>
+                  <TablixCell><CellContents><Textbox Name="NameHeader"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Name</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><FontFamily>Arial</FontFamily><FontWeight>Bold</FontWeight><BackgroundColor>#dddddd</BackgroundColor><Border><Style>Solid</Style></Border></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="AmountHeader"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Amount</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><FontFamily>Arial</FontFamily><FontWeight>Bold</FontWeight><BackgroundColor>#dddddd</BackgroundColor><Border><Style>Solid</Style></Border></Style></Textbox></CellContents></TablixCell>
+                </TablixCells></TablixRow>
+                <TablixRow><Height>0.25in</Height><TablixCells>
+                  <TablixCell><CellContents><Textbox Name="NameCell"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Name.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><FontFamily>Arial</FontFamily><Border><Style>Solid</Style></Border></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="AmountCell"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Format(Fields!Amount.Value, "N2")</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><FontFamily>Arial</FontFamily><TextAlign>Right</TextAlign><Border><Style>Solid</Style></Border></Style></Textbox></CellContents></TablixCell>
+                </TablixCells></TablixRow>
+              </TablixRows>
+            </TablixBody>
+            <TablixColumnHierarchy><TablixMembers><TablixMember/><TablixMember/></TablixMembers></TablixColumnHierarchy>
+            <TablixRowHierarchy><TablixMembers><TablixMember/><TablixMember><Group Name="Details"/></TablixMember></TablixMembers></TablixRowHierarchy>
+            <DataSetName>Sales</DataSetName><Top>0.6in</Top><Left>0.1in</Left><Height>0.55in</Height><Width>5in</Width><Style><FontFamily>Arial</FontFamily></Style>
+          </Tablix>
+        </ReportItems>
+        <Height>3in</Height><Style/>
+      </Body>
+      <Width>7in</Width>
+      <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.5in</LeftMargin><RightMargin>0.5in</RightMargin><TopMargin>0.5in</TopMargin><BottomMargin>0.5in</BottomMargin></Page>
+    </ReportSection>
+  </ReportSections>
+</Report>
