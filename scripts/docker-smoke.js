@@ -13,9 +13,10 @@ const sample = path.resolve(process.argv[2] || path.join(serviceRoot, '..', 'lum
 const rdl = await fs.readFile(sample);
 const model = parseRdl(rdl);
 const requiredVariants = {
-  Arial: ['Arial.ttf', 'Arial Bold.ttf', 'Arial Italic.ttf', 'Arial Bold Italic.ttf'],
-  'Times New Roman': ['Times New Roman.ttf', 'Times New Roman Bold.ttf', 'Times New Roman Italic.ttf', 'Times New Roman Bold Italic.ttf'],
-  'Segoe UI': ['Segoe UI.ttf', 'Segoe UI Bold.ttf', 'Segoe UI Italic.ttf', 'Segoe UI Bold Italic.ttf'],
+  Arial: [['Arial.ttf'], ['Arial Bold.ttf'], ['Arial Italic.ttf'], ['Arial Bold Italic.ttf']],
+  'Times New Roman': [['Times New Roman.ttf'], ['Times New Roman Bold.ttf'], ['Times New Roman Italic.ttf'], ['Times New Roman Bold Italic.ttf']],
+  'Segoe UI': [['Segoe UI.ttf', 'segoeui.ttf'], ['Segoe UI Bold.ttf', 'segoeuib.ttf'], ['Segoe UI Italic.ttf', 'segoeuii.ttf'], ['Segoe UI Bold Italic.ttf', 'segoeuiz.ttf']],
+  'Segoe UI Symbol': [['Segoe UI Symbol.ttf', 'seguisym.ttf', 'Arial Unicode.ttf', 'Apple Symbols.ttf']],
 };
 const datasets = Object.fromEntries(model.datasets.filter((dataset) => model.renderingDatasets.includes(dataset.name)).map((dataset) => [
   dataset.name,
@@ -40,9 +41,9 @@ try {
   const expected = families.flatMap((family) => requiredVariants[family] || []);
   const unsupportedFamilies = families.filter((family) => !requiredVariants[family]);
   if (unsupportedFamilies.length) throw new Error(`Docker smoke has no licensed-font filename mapping for: ${unsupportedFamilies.join(', ')}`);
-  const selected = expected.map((expectedName) => available.find((name) => name.toLowerCase() === expectedName.toLowerCase())).filter(Boolean);
-  const missing = expected.filter((expectedName) => !available.some((name) => name.toLowerCase() === expectedName.toLowerCase()));
-  if (missing.length) throw new Error(`The font directory is missing required licensed variants: ${missing.join(', ')}`);
+  const selected = expected.map((alternatives) => available.find((name) => alternatives.some((expectedName) => name.toLowerCase() === expectedName.toLowerCase()))).filter(Boolean);
+  const missing = expected.filter((alternatives) => !available.some((name) => alternatives.some((expectedName) => name.toLowerCase() === expectedName.toLowerCase())));
+  if (missing.length) throw new Error(`The font directory is missing required licensed variants: ${missing.map((alternatives) => alternatives.join(' or ')).join(', ')}`);
   await Promise.all(selected.map((name) => fs.copyFile(path.join(fontHostDir, name), path.join(stagedFonts, name))));
   const { stdout } = await run('docker', [
     'run', '--rm', '-d', '-p', '127.0.0.1::7070',
@@ -64,7 +65,7 @@ try {
   if (!ready) throw new Error('Container did not become ready');
 
   const results = [];
-  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_VISUAL']) {
+  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_FIXED_EDITABLE', 'DOCX_VISUAL']) {
     const response = await fetch(`${baseUrl}/v1/render`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -74,7 +75,13 @@ try {
     if (!response.ok) throw new Error(`${output} failed: ${artifact.toString('utf8')}`);
     const expectedMagic = output === 'PDF' ? '%PDF' : 'PK';
     if (artifact.subarray(0, expectedMagic.length).toString() !== expectedMagic) throw new Error(`${output} returned an invalid artifact`);
-    results.push({ output, bytes: artifact.length, pageCount: response.headers.get('x-page-count') });
+    results.push({
+      output,
+      bytes: artifact.length,
+      pageCount: response.headers.get('x-page-count'),
+      layoutMode: response.headers.get('x-docx-layout-mode'),
+      editableTextRatio: response.headers.get('x-docx-editable-text-ratio'),
+    });
   }
   const leftovers = await run('docker', ['exec', container, 'find', '/tmp/rdl-converter', '-mindepth', '1', '-print']);
   if (leftovers.stdout.trim()) throw new Error(`Container temporary directory is not empty: ${leftovers.stdout.trim()}`);

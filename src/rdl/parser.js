@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { XMLParser } from 'fast-xml-parser';
 import { ServiceError } from '../errors.js';
 import { toPoints } from '../units.js';
@@ -540,6 +541,10 @@ export function parseRdl(input, limits = {}) {
   const model = {
     namespace,
     name: textValue(report.Description, 'RDL Report'),
+    identity: {
+      name: textValue(report.Description, 'RDL Report'),
+      definitionSha256: createHash('sha256').update(xml).digest('hex'),
+    },
     page: {
       width: toPoints(textValue(page.PageWidth, '8.27in')),
       height: toPoints(textValue(page.PageHeight, '11.69in')),
@@ -576,10 +581,10 @@ export function parseRdl(input, limits = {}) {
   return model;
 }
 
-export function analyzeRdl(input, limits) {
-  const model = parseRdl(input, limits);
+export function analyzeParsedRdl(model) {
   return {
     namespace: model.namespace,
+    identity: model.identity,
     page: {
       width: model.page.width,
       height: model.page.height,
@@ -606,4 +611,8 @@ export function analyzeRdl(input, limits) {
     blockingErrors: model.unsupported.map((type) => ({ code: 'UNSUPPORTED_FEATURE', feature: type })),
     capabilities: model.capabilities,
   };
+}
+
+export function analyzeRdl(input, limits) {
+  return analyzeParsedRdl(parseRdl(input, limits));
 }

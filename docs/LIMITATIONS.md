@@ -153,7 +153,32 @@ output** for the same RDL and rows. This is report logic, not rendering — the 
 
 Word performs final layout, so page breaks land differently. `KeepTogether` and row spans are honoured via
 `cantSplit`/`keepNext`, which keeps content coherent, but exact page parity is not achievable in an editable
-document. `DOCX_VISUAL` is the exact-match mode.
+reflowing document. Use `DOCX_FIXED_EDITABLE` for editable page-for-page canonical geometry, or
+`DOCX_VISUAL` for a non-editable raster copy.
+
+The experimental `docx.nativePageFragments` render option (legacy alias: `docxNativePageFragments`) keeps
+content as native Word tables while splitting large tablixes at PDF-like page break estimates. It can improve
+reports where Word otherwise compresses too many rows onto a page, but it can make row-span-heavy reports
+worse. Enable it only for a certified RDL/data set after page-by-page Word export comparison.
+
+`/v1/analyze` returns `structuredEditable` with the native-DOCX risk level, specific drift risks, and the
+fragmentation recommendation for the RDL shape. That analysis is static: it does not replace rendering the
+actual data set through Microsoft Word during release certification.
+
+Certified structured-DOCX profiles can be mounted through `RDL_DOCX_PROFILE_PATH` and matched by the
+`identity.definitionSha256` returned from `/v1/analyze`. Keep `RDL_DOCX_PROFILE_AUTO=false` until the profile
+has passed page-by-page Word export certification for the exact report/data family. Auto-apply ignores
+profiles where `certified` is not `true`; an uncertified candidate can still be selected explicitly for QA.
+The service rejects malformed profile files instead of guessing: duplicate IDs, unsafe IDs, invalid
+definition hashes, and unknown DOCX rendering keys return `CONFIG_INVALID` when a profile is requested or
+auto-apply is enabled.
+
+### DOCX_FIXED_EDITABLE is positioned, not reflowing
+
+Every canonical PDF text line is an independent positioned Word text box. This keeps page count, page size,
+headers, footers, lines, fills, images, and text anchors tied to the PDF, but large user edits can overflow a
+box instead of pushing later rows or pages. Unsupported PDF operators and any text that cannot remain
+editable fail with `UNSUPPORTED_FEATURE`; the renderer never hides raster text beneath editable overlays.
 
 ### Border thickness varies slightly between cells
 

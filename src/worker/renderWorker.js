@@ -32,6 +32,11 @@ process.on('message', async (message) => {
       extension: rendered.extension,
       size: rendered.buffer.length,
       totalRows: validation.totalRows,
+      layoutMode: rendered.layoutMode,
+      editableTextRatio: rendered.editableTextRatio,
+      docxProfile: rendered.docxProfile,
+      docxNativePageFragments: rendered.docxNativePageFragments,
+      sceneStats: rendered.sceneStats,
     });
   } catch (error) {
     const safe = toServiceError(error);

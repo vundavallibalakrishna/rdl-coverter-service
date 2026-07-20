@@ -334,6 +334,27 @@ function closesAtEnd(value, openIndex) {
 }
 
 // VB `Like` pattern → RegExp: * = any run, ? = one char, # = one digit, [list]/[!list] = char class.
+// VB equality, which is NOT JavaScript equality where Nothing is involved. VB coerces Nothing to the other
+// operand's default value, so `Nothing = 0` and `Nothing = ""` are both True — SSRS reports rely on this to
+// drive conditional borders from a NULL row-number field (e.g. Combined Assurance draws its group-boundary
+// rule from `=IIF(Fields!rn.Value = 0, "Solid", "None")`, and a NULL rn must still count as 0 or the rule
+// silently disappears). Comparing via String() alone got this backwards AND matched `Nothing = "null"`,
+// because String(null) is the literal text "null". Arithmetic here already coerces Nothing to 0
+// (`Nothing + 1` is 1), so equality treating it as unequal to 0 was internally inconsistent too.
+function vbEqual(left, right) {
+  const leftNothing = left === null || left === undefined;
+  const rightNothing = right === null || right === undefined;
+  if (leftNothing || rightNothing) {
+    if (leftNothing && rightNothing) return true;
+    const other = leftNothing ? right : left;
+    if (typeof other === 'number') return other === 0;
+    if (typeof other === 'string') return other === '';
+    if (typeof other === 'boolean') return other === false;
+    return false;
+  }
+  return left === right || String(left) === String(right);
+}
+
 function vbLike(text, pattern) {
   let regex = '^';
   for (let index = 0; index < pattern.length; index += 1) {
@@ -399,8 +420,8 @@ export function evaluateExpression(input, context = {}) {
       case 'and': case 'andalso': return Boolean(left) && Boolean(right);
       case 'xor': return Boolean(left) !== Boolean(right);
       case 'like': return vbLike(`${left ?? ''}`, `${right ?? ''}`);
-      case '<>': return left !== right;
-      case '=': return left === right || String(left) === String(right);
+      case '<>': return !vbEqual(left, right);
+      case '=': return vbEqual(left, right);
       case '>=': return left >= right;
       case '<=': return left <= right;
       case '>': return left > right;

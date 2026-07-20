@@ -11,6 +11,11 @@ function nonNegativeNumber(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function booleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(String(value));
+}
+
 export function loadConfig(env = process.env) {
   return Object.freeze({
     port: positiveInteger(env.PORT, 7070),
@@ -26,6 +31,13 @@ export function loadConfig(env = process.env) {
     workerMemoryMb: positiveInteger(env.RDL_WORKER_MEMORY_MB, 512),
     maxXmlNodes: positiveInteger(env.RDL_MAX_XML_NODES, 250_000),
     maxXmlDepth: positiveInteger(env.RDL_MAX_XML_DEPTH, 256),
+    maxFixedPages: positiveInteger(env.RDL_MAX_FIXED_PAGES, 250),
+    maxFixedObjects: positiveInteger(env.RDL_MAX_FIXED_OBJECTS, 50_000),
+    maxFixedImages: positiveInteger(env.RDL_MAX_FIXED_IMAGES, 2_000),
+    maxFixedTextRuns: positiveInteger(env.RDL_MAX_FIXED_TEXT_RUNS, 50_000),
+    docxNativePageFragments: booleanFlag(env.RDL_DOCX_NATIVE_PAGE_FRAGMENTS, false),
+    docxProfilePath: env.RDL_DOCX_PROFILE_PATH ? path.resolve(env.RDL_DOCX_PROFILE_PATH) : null,
+    docxProfileAuto: booleanFlag(env.RDL_DOCX_PROFILE_AUTO, false),
     pdftoppmPath: env.RDL_PDFTOPPM_PATH || 'pdftoppm',
     // Minimum PDF border stroke width in points. 0 = honour the RDL width exactly (default). A floor only
     // makes borders heavier, not more uniform (the unevenness is a viewer sub-pixel artifact, not width),

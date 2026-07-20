@@ -31,12 +31,18 @@ const config = loadConfig({ ...process.env, RDL_TEMP_ROOT: tempRoot });
 const runner = new RenderRunner(config);
 const outputs = [];
 try {
-  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_VISUAL']) {
+  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_FIXED_EDITABLE', 'DOCX_VISUAL']) {
     const rendered = await runner.render({
       rdlBuffer: buffer,
       request: { output, outputFileName: 'combined-assurance-smoke', parameters, datasets },
     });
-    outputs.push({ output, bytes: rendered.buffer.length, pageCount: rendered.pageCount });
+    outputs.push({
+      output,
+      bytes: rendered.buffer.length,
+      pageCount: rendered.pageCount,
+      layoutMode: rendered.layoutMode,
+      editableTextRatio: rendered.editableTextRatio,
+    });
   }
   const leftovers = await fs.readdir(tempRoot);
   if (leftovers.length > 0) throw new Error(`Temporary files were not removed: ${leftovers.join(', ')}`);

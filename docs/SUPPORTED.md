@@ -185,6 +185,11 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
   `IIF(IsNothing(a) And IsNothing(b), "green", …)` can therefore colour a cell "green" for rows with no data.
   **SSRS does exactly the same thing.** If output looks wrong this way, the RDL logic is the cause, not the
   renderer.
+- That coercion applies to **equality** too: `Nothing = 0` and `Nothing = ""` are both **True**, and `<>` is
+  its exact negation. This is not a curiosity — reports drive conditional formatting from query-computed
+  row-number fields (`=IIF(Fields!rn.Value = 0, "Solid", "None")` on a `TopBorder`, `=IIF(Fields!rn.Value = 0,
+  False, True)` on `Hidden`), so a NULL row number still counts as `0` and still draws the rule. Treating it
+  as unequal silently drops borders and blanks cells with no error anywhere.
 - `And`/`Or` do not short-circuit; `AndAlso`/`OrElse` do.
 
 ## Output modes
@@ -193,11 +198,31 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. Selectable text. | Exact |
 | `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables, real text. | Unknown (`null` / `X-Page-Count: unknown`) — Word paginates |
+| `DOCX_FIXED_EDITABLE` | Canonical PDF parsed into positioned editable text boxes, Word shapes, lines, and images. No page screenshot. | Exact canonical count |
 | `DOCX_VISUAL` | PDF rasterized at 300 DPI, one full-page floating image per Word page. | Exact |
+| `XLSX` | Native Excel workbook. Each tablix is a block of styled cells (fills, borders, merges, fonts); numeric and date fields are written as **live typed values** with a translated number format, not text. Charts and the logo embed as images. | Not paginated (`null`) — Excel owns print layout |
 
 `DOCX_EDITABLE` is editable but Word owns final layout, so its pagination will not match the PDF exactly.
-When byte-for-byte visual fidelity matters, `DOCX_VISUAL` is the mode that guarantees it. This is a trade-off
-in the file formats, not a defect.
+`POST /v1/analyze` returns `structuredEditable` with native-DOCX drift risks and the
+`structuredEditable.nativePageFragments.recommendation` value for the RDL shape. The optional
+`docx.nativePageFragments` render flag keeps real Word tables but must be certified per report/data set.
+Certified structured-DOCX profiles may be mounted and matched by `identity.definitionSha256`; auto-apply is
+off by default. Profile files fail closed on duplicate/unsafe IDs, malformed match hashes, or unknown DOCX
+rendering keys.
+`DOCX_FIXED_EDITABLE` locks pagination and geometry while keeping every report text line editable; large
+user edits can overflow their positioned text boxes. `DOCX_VISUAL` is the non-editable raster contract.
+
+`XLSX` is a data-first export. By default every tablix is stacked as a row block in one worksheet with
+autofit column widths; because the columns are shared, blocks with different column counts will not align —
+Excel is a grid, not a page. Set `excel.sheetPerTablix: true` on the render request to put each tablix on its
+own worksheet (`Table 1`, `Table 2`, …) with its own columns, and collect the title band, charts, and
+free-form text onto a leading `Overview` sheet — best when the goal is filtering/pivoting each table.
+
+Values that resolve to a number (including `=Format(Fields!X.Value, "N2")`, whose number is recovered behind
+the format) are written as live numbers so they stay summable/pivotable; multi-run, conditional, and
+genuinely textual cells stay text. Untrusted cell text is stored as typed strings that Excel never evaluates
+as formulas — no apostrophe-escaping is applied because, unlike CSV, an XLSX string cell carries an explicit
+type. The page footer (page numbers/dates) is omitted as it has no meaning in a continuous sheet.
 
 ## Certification status
 

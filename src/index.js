@@ -4,14 +4,17 @@
 import fs from 'node:fs/promises';
 import { loadConfig } from './config.js';
 import { ServiceError } from './errors.js';
-import { analyzeRdl } from './rdl/parser.js';
+import { analyzeParsedRdl, analyzeRdl, parseRdl } from './rdl/parser.js';
+import { analyzeFixedEditableCompatibility } from './render/fixedCompatibility.js';
+import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
 import { RenderRunner } from './worker/runner.js';
 
 export { buildApp } from './app.js';
 export { loadConfig } from './config.js';
 export { ServiceError, toServiceError } from './errors.js';
-export { analyzeRdl, parseRdl } from './rdl/parser.js';
+export { analyzeParsedRdl, analyzeRdl, parseRdl } from './rdl/parser.js';
 export { OUTPUTS } from './render/index.js';
+export { analyzeStructuredEditableCompatibility, shouldUseNativePageFragments } from './render/structuredCompatibility.js';
 export { RenderRunner } from './worker/runner.js';
 export { checkFonts } from './render/fonts.js';
 export { readiness } from './readiness.js';
@@ -52,17 +55,21 @@ export async function createConverter(options = {}) {
      * Pure and synchronous: no worker, no temp files. Check `compatible` before calling `render`.
      */
     analyze(rdl) {
-      return analyzeRdl(toBuffer(rdl), {
+      const model = parseRdl(toBuffer(rdl), {
         maxRdlBytes: config.maxRdlBytes,
         maxXmlNodes: config.maxXmlNodes,
         maxXmlDepth: config.maxXmlDepth,
       });
+      const result = analyzeParsedRdl(model);
+      result.structuredEditable = analyzeStructuredEditableCompatibility(model, config);
+      result.fixedEditable = analyzeFixedEditableCompatibility(model, config);
+      return result;
     },
 
     /**
      * Renders one artifact. Rejects with a ServiceError carrying a stable `code` and `statusCode`.
      *
-     * @param {{ rdl: Buffer|Uint8Array|string, output: 'PDF'|'DOCX_EDITABLE'|'DOCX_VISUAL',
+     * @param {{ rdl: Buffer|Uint8Array|string, output: 'PDF'|'DOCX_EDITABLE'|'DOCX_FIXED_EDITABLE'|'DOCX_VISUAL'|'XLSX',
      *   parameters?: object, datasets?: object, signal?: AbortSignal }} request
      *   `datasets` values are arrays of row objects keyed by exact RDL `DataField` names.
      * @returns {Promise<{ buffer: Buffer, mimeType: string, extension: string,

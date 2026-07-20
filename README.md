@@ -1,7 +1,7 @@
 # RDL Converter Service
 
 Standalone, private-network RDL renderer. It takes an RDL definition plus **caller-supplied datasets** and
-returns one PDF or DOCX.
+returns one PDF, DOCX, or XLSX.
 
 It has no database, no persistent storage, and no Lumina dependency. It **never** executes RDL data sources,
 SQL, stored procedures, custom report code, or external entities — see [Security model](#security-model).
@@ -36,10 +36,13 @@ Use it two ways, both supported and both backed by the identical pipeline:
 | Requirement | Why |
 | --- | --- |
 | **Node.js ≥ 22** | ESM, native test runner |
-| **Poppler** (`pdftoppm`) | `DOCX_VISUAL` only — rasterizes PDF pages. `brew install poppler` / `apt install poppler-utils` |
+| **Poppler** (`pdftoppm`) | `DOCX_VISUAL`, and chart images in `DOCX_EDITABLE`/`XLSX` — rasterizes PDF/chart pages. `brew install poppler` / `apt install poppler-utils` |
 | **Licensed fonts** | Production only. See [Fonts](#fonts) |
 
 `GET /readyz` (or `readiness(config)`) reports whether all three are actually satisfied.
+
+Microsoft Word is **not** installed or invoked by the service. All DOCX modes are generated as OOXML on
+Linux; Word for Mac/Windows is used only as the authoritative release-certification viewer.
 
 ## Quick start
 
@@ -67,8 +70,8 @@ npx rdl-converter-service            # if installed as a dependency
 | --- | --- | --- |
 | `GET` | `/healthz` | Process liveness. |
 | `GET` | `/readyz` | Writable temp storage, required font variants, PDFKit, and Poppler readiness. `503` when not ready. |
-| `POST` | `/v1/analyze` | Namespace, page settings, parameters, exact dataset fields, fonts, detected constructs, and fail-closed compatibility errors. **Does not render.** |
-| `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, or `DOCX_VISUAL` artifact. |
+| `POST` | `/v1/analyze` | Namespace, page settings, parameters, exact dataset fields, fonts, detected constructs, structured-DOCX drift risks, fixed-editable compatibility/limits, and fail-closed errors. **Does not render.** |
+| `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, `DOCX_FIXED_EDITABLE`, `DOCX_VISUAL`, or `XLSX` artifact. |
 
 ### Analyze before you render
 
@@ -96,7 +99,7 @@ curl -X POST http://localhost:7070/v1/render \
 // request.json
 {
   "rdlBase64": "PD94bWwg…",
-  "output": "PDF",                      // PDF | DOCX_EDITABLE | DOCX_VISUAL
+  "output": "PDF",                      // PDF | DOCX_EDITABLE | DOCX_FIXED_EDITABLE | DOCX_VISUAL | XLSX
   "outputFileName": "combined-assurance",
   "parameters": { "ReportYear": 2026 },
   "datasets": {
@@ -121,11 +124,14 @@ curl -X POST http://localhost:7070/v1/render \
 ### Response headers
 
 `Content-Type`, sanitized `Content-Disposition`, `Content-Length`, `X-Request-Id`, `X-Page-Count`,
-`X-Render-Duration-Ms`. The artifact is rendered completely before any header is sent, so a `200` means a
-finished file.
+`X-Render-Duration-Ms`, and for DOCX responses `X-Docx-Layout-Mode` plus
+`X-Docx-Editable-Text-Ratio`. Structured DOCX responses also include
+`X-Docx-Native-Page-Fragments`; if a profile was applied they include `X-Docx-Profile-Id` and
+`X-Docx-Profile-Certified`. The artifact is rendered completely before any header is sent, so a `200` means
+a finished file.
 
-`DOCX_EDITABLE` returns `X-Page-Count: unknown` — Word performs its own final pagination. `PDF` and
-`DOCX_VISUAL` return exact counts.
+`DOCX_EDITABLE` returns `X-Page-Count: unknown` — Word performs its own final pagination. `PDF`,
+`DOCX_FIXED_EDITABLE`, and `DOCX_VISUAL` return exact canonical counts.
 
 ---
 
@@ -164,7 +170,7 @@ const converter = await createConverter();
 try {
   const rendered = await converter.render({
     rdl: await fs.readFile('report.rdl'),   // Buffer | Uint8Array | string
-    output: 'PDF',                          // PDF | DOCX_EDITABLE | DOCX_VISUAL
+    output: 'PDF',                          // PDF | DOCX_EDITABLE | DOCX_FIXED_EDITABLE | DOCX_VISUAL | XLSX
     parameters: { ReportYear: 2026 },
     datasets: {
       MainDataset: [{ RiskName: 'Vendor concentration', Rating: 3 }],
@@ -261,23 +267,73 @@ guaranteed temp cleanup. That isolation is a property of the pipeline, not of th
 | --- | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. | Selectable | Exact |
 | `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables and text. | Editable | Unknown — Word paginates |
+| `DOCX_FIXED_EDITABLE` | Generates the canonical PDF unchanged, extracts a page scene with `pdfjs-dist`, then writes page-positioned Word text boxes, shapes, lines, and images. No full-page screenshot. | Editable; render fails if report text cannot remain editable | Exact canonical page count |
 | `DOCX_VISUAL` | Renders PDF, rasterizes every page at 300 DPI, one full-page floating image per Word page. | Images | Exact |
+| `XLSX` | Native Excel workbook. Tablixes become styled cell blocks (fills, borders, merges, fonts); numbers and dates are written as live typed values with a translated Excel number format; charts and the logo embed as images. | Live cells | Not paginated (`null`) |
 
 Because Word performs `DOCX_EDITABLE` pagination itself, the service cannot know the count: the library
-returns `pageCount: null` and the HTTP layer sends `X-Page-Count: unknown`. `PDF` and `DOCX_VISUAL` return
-exact numbers in both.
+returns `pageCount: null` and the HTTP layer sends `X-Page-Count: unknown`. `XLSX` is also `pageCount: null`
+(a spreadsheet is continuous; Excel decides print pagination). The other modes return numeric page counts.
 
-`DOCX_EDITABLE` is editable, but Word owns final layout, so its pagination will not match the PDF exactly.
-Use `DOCX_VISUAL` when exact visual fidelity matters. This is a property of the file formats, not a defect.
+Choose `DOCX_EDITABLE` when users need normal Word table editing and reflow. Choose
+`DOCX_FIXED_EDITABLE` when page-for-page PDF resemblance is the priority and edits are expected to fit
+inside fixed-position text boxes. Choose `DOCX_VISUAL` only when editability is not required. Large edits can
+overflow fixed text boxes; the fixed contract deliberately does not reflow or repaginate. Choose `XLSX` when
+the goal is the data itself — filtering, sorting, and pivoting live numbers — rather than page fidelity.
+
+`DOCX_EDITABLE` can optionally split large tablixes into multiple native Word tables using PDF-like page
+break estimates (`"docx": { "nativePageFragments": true }` on a render request; the legacy
+top-level `docxNativePageFragments: true` is still accepted; or `RDL_DOCX_NATIVE_PAGE_FRAGMENTS=true`).
+This preserves real table editability, but it is not universally better: some RDLs move closer to the PDF,
+while row-span-heavy reports can drift further. Treat it as a per-report certification knob, not a default
+guarantee. `/v1/analyze` returns `structuredEditable.nativePageFragments.recommendation` to tell callers
+whether to avoid, try, or ignore this option for the RDL shape.
+
+For certified reports, you can also mount a structured DOCX profile file and let the service apply the
+certified options only to matching RDL definitions:
+
+```json
+{
+  "profiles": [
+    {
+      "id": "incident-dashboard-native",
+      "certified": true,
+      "match": {
+        "definitionSha256": "sha256-from-v1-analyze"
+      },
+      "docx": {
+        "nativePageFragments": true
+      }
+    }
+  ]
+}
+```
+
+Set `RDL_DOCX_PROFILE_PATH=/app/config/docx-profiles.json`. With
+`RDL_DOCX_PROFILE_AUTO=false`, callers opt in using `"docx": { "profile": "incident-dashboard-native" }`.
+With `RDL_DOCX_PROFILE_AUTO=true`, the first matching profile with `certified: true` is applied
+automatically. Candidate profiles generated by `certify:docx` intentionally remain `certified: false`; they
+match in `/v1/analyze` but do not auto-apply until a reviewer marks them certified after the exact SSRS
+reference run. Explicit request selection (`"docx": { "profile": "..." }`) is still allowed for QA.
+Request flags such as `"docx": { "nativePageFragments": false }` override the profile.
+Profile files are validated before use. Each profile must have a unique header-safe `id`
+(`A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `-`; max 128 characters), a `match` object containing
+`definitionSha256`, `name`, or `namespace`, and only known `docx` options. Duplicate IDs, unknown rendering
+keys, malformed SHA-256 hashes, and unsafe IDs fail closed with `CONFIG_INVALID`.
+
+Fixed position does not mean read-only content. Fixed DOCX packages have no Word document/write protection,
+every drawing anchor is emitted unlocked, and every visible report text line can be edited in its text box.
+The service fails generation if package protection or a text-edit lock is detected.
 
 ## The request
 
 | Field | Required | Notes |
 | --- | --- | --- |
 | `rdlBase64` | JSON only | The RDL. Multipart uses the `rdl` file part instead. |
-| `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` |
+| `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_FIXED_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
+| `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Experimental native-table page fragmentation for certified report/data combinations. |
 | `outputFileName` | — | Sanitized for `Content-Disposition`; also `Globals!ReportName`. |
 
 > **`datasets` rows are keyed by the exact RDL `DataField` name — not the field `Name`.**
@@ -323,6 +379,13 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_WORKER_MEMORY_MB` | `512` | V8 heap cap per worker. |
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
+| `RDL_MAX_FIXED_PAGES` | `250` | Maximum canonical pages in `DOCX_FIXED_EDITABLE`. |
+| `RDL_MAX_FIXED_OBJECTS` | `50000` | Maximum positioned objects across a fixed DOCX. |
+| `RDL_MAX_FIXED_IMAGES` | `2000` | Maximum embedded images across a fixed DOCX. |
+| `RDL_MAX_FIXED_TEXT_RUNS` | `50000` | Maximum editable text runs across a fixed DOCX. |
+| `RDL_DOCX_NATIVE_PAGE_FRAGMENTS` | `false` | Experimental: split large `DOCX_EDITABLE` tablixes into native table fragments at PDF-like break estimates. Certify per RDL before enabling. |
+| `RDL_DOCX_PROFILE_PATH` | unset | Optional JSON file containing certified structured-DOCX profiles matched by RDL hash/name/namespace. |
+| `RDL_DOCX_PROFILE_AUTO` | `false` | Automatically apply the first matching structured-DOCX profile. Keep off unless every profile is release-certified. |
 | `RDL_PDFTOPPM_PATH` | `pdftoppm` | Poppler binary for `DOCX_VISUAL`. |
 | `RDL_BORDER_WIDTH_FLOOR_PT` | `0` | Minimum PDF border stroke, in points. `0` honours the RDL exactly. |
 | `LOG_LEVEL` | `info` | Fastify log level. |
@@ -461,19 +524,31 @@ RDL_FONT_HOST_DIR="/path/to/licensed-font-directory" npm run smoke:docker -- "/p
 npm run audit:schema
 npm run verify:stress -- --require-pass
 npm run verify:reference -- "/path/to/report.rdl" "/path/to/reference.pdf" "/path/to/hydration.json"
+npm run certify:docx -- "/path/to/report.rdl" "/path/to/request.json" "/path/to/ssrs-reference.pdf" --renderer=word --exact-inputs --require-match
 ```
 
 Inspect representative PDF/DOCX output. **An HTTP `200` is not verification.**
 
-- **`verify:stress`** renders a deterministic 520-row table as direct PDF and editable DOCX, converts the
-  DOCX back to PDF for independent pagination checks, and requires each output to land within 30–40 pages. It
+- **`verify:stress`** renders a deterministic 520-row table as direct PDF, structured DOCX, and fixed
+  editable DOCX; converts both DOCX files back to PDF; and requires the structured DOCX to preserve native
+  tables, repeated headers, merges, exact-once row markers, and overflow content. Structured page count is
+  reported as an advisory because Word/LibreOffice own native-table pagination. Fixed Word must exactly
+  match the canonical PDF page count and dimensions within Word's smallest page-size unit (one twip,
+  0.05 pt). It
   covers three repeating header rows, interlocking horizontal and vertical merges, nested group sorting,
   wrapped and conditionally styled cells, one cell taller than a page, natural pagination, an explicit page
-  break, and exact-once row markers. This certifies the normalized table renderer and editable Word
-  mechanics — it does not claim support for every SSRS hierarchy construct.
+  break, and exact-once row markers. It also verifies fixed Word contains positioned editable shapes rather
+  than native tables or a page screenshot. This certifies the mechanics — it does not claim SSRS pixel
+  certification.
 - **`verify:reference`** renders a hydrated PDF, compares page count and dimensions, checks text anchors,
   rasterizes the first three pages at 144 DPI, and writes a comparison report. Add `--exact-inputs
   --require-match` **only** when the hydration and font versions come from the exact SSRS reference run.
+- **`certify:docx`** renders the canonical PDF plus both structured DOCX variants (`nativePageFragments`
+  off/on), exports the DOCX through Microsoft Word for Mac or LibreOffice, compares page count, dimensions,
+  extracted text, and OpenXML editability, then writes a `docx-profile-candidate.json` matched by
+  `identity.definitionSha256`. Use `--renderer=word --exact-inputs --require-match` for release
+  certification. Without the exact SSRS reference PDF/data/fonts, it produces a candidate only and reports
+  the blocker explicitly.
   Without `--exact-inputs` it reports regression evidence but will never mark output certified. Page-count or
   pixel differences against a reference built from different rows are not certification failures by
   themselves.
@@ -498,6 +573,8 @@ src/
   render/
     pdf.js          PDF renderer (PDFKit)
     docx.js         Native OpenXML renderer
+    fixedDocx.js    PDF-matched positioned-object OpenXML renderer
+    pdfScene.js     Strict PDF.js operator-to-page-scene extraction
     visualDocx.js   Rasterized full-page DOCX
     chart.js        Vector charts
     fonts.js        Font resolution + strict-font enforcement

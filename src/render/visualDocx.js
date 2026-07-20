@@ -46,5 +46,12 @@ export async function renderVisualDocx(model, request, config, tempDir) {
     }],
   });
   const buffer = await Packer.toBuffer(document);
-  return { buffer, pageCount: pdf.pageCount, mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', extension: 'docx' };
+  return {
+    buffer,
+    pageCount: pdf.pageCount,
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    extension: 'docx',
+    layoutMode: 'visual',
+    editableTextRatio: 0,
+  };
 }

@@ -1,14 +1,19 @@
 import {
-  AlignmentType, BorderStyle, Document, Footer, Header, HorizontalPositionRelativeFrom, ImageRun, LineRuleType,
-  PageOrientation, Packer, Paragraph, ShadingType, Table, TableCell, TableLayoutType, TableRow, TextRun,
-  TextWrappingType, VerticalAlignTable, VerticalPositionRelativeFrom, WidthType,
+  AlignmentType, BorderStyle, Document, Footer, Header, HeightRule, HorizontalPositionRelativeFrom, ImageRun, LineRuleType,
+  PageOrientation, Packer, Paragraph, ShadingType, SimpleField, Table, TableCell, TableLayoutType, TableRow, TextRun,
+  TextWrappingType, VerticalAlignTable, VerticalAnchor, VerticalPositionRelativeFrom, WidthType, WpsShapeRun,
 } from 'docx';
+import PDFDocument from 'pdfkit';
+import { ServiceError } from '../errors.js';
 import { pointsToDisplayPixels, pointsToTwips } from '../units.js';
+import { evaluateExpression } from '../rdl/expression.js';
 import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleValue, tablixRows, textForItem } from './common.js';
 import { cellGridWidth, computeDocxTableGeometry } from './docxTableLayout.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
+import { pdfFont } from './fonts.js';
+import { resolveStructuredDocxOptions } from './structuredCompatibility.js';
 
 function alignment(value) {
   const normalized = String(value || '').toLowerCase();
@@ -28,12 +33,84 @@ function textRuns(text, runProps) {
   ));
 }
 
+function splitConcatenation(expression) {
+  const source = String(expression || '').replace(/^=/, '');
+  const parts = [];
+  let start = 0;
+  let quote = null;
+  let depth = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === quote && source[index + 1] === quote) index += 1;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") quote = character;
+    else if (character === '(') depth += 1;
+    else if (character === ')') depth = Math.max(0, depth - 1);
+    else if (character === '&' && depth === 0) {
+      parts.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  if (quote || depth !== 0) return null;
+  parts.push(source.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+// True when a textbox references PageNumber/TotalPages, which must become live Word fields rather than a
+// value frozen at render time. Used both for band textboxes and for tablix cells (a footer table cell can
+// hold "=Page N of M" and previously printed a literal "1" because the cell pre-flattened its text).
+function hasPageFieldExpression(item) {
+  return (item.paragraphs || []).some((paragraph) => paragraph.some((run) => (
+    typeof (run?.value ?? run) === 'string' && /Globals!(PageNumber|TotalPages)/i.test(run?.value ?? run)
+  )));
+}
+
+function fieldAwareChildren(item, context, runProps, overrideText) {
+  if (overrideText !== undefined) return textRuns(overrideText, runProps);
+  if (!hasPageFieldExpression(item)) return textRuns(textForItem(item, context), runProps);
+  const values = (item.paragraphs || []).flatMap((paragraph, paragraphIndex) => paragraph.flatMap((run, runIndex) => {
+    const source = run?.value ?? run;
+    const children = [];
+    if (paragraphIndex > 0 && runIndex === 0) children.push(new TextRun({ ...runProps, text: '', break: 1 }));
+    if (typeof source !== 'string' || !/^=/.test(source) || !/Globals!(PageNumber|TotalPages)/i.test(source)) {
+      const value = typeof source === 'string' && source.startsWith('=') ? evaluateExpression(source, context) : source;
+      if (value !== null && value !== undefined) children.push(...textRuns(String(value), runProps));
+      return children;
+    }
+    const parts = splitConcatenation(source);
+    if (!parts) return textRuns(textForItem(item, context), runProps);
+    for (const part of parts) {
+      if (/^Globals!PageNumber(?:\.Value)?$/i.test(part)) children.push(new SimpleField('PAGE', '1'));
+      else if (/^Globals!TotalPages(?:\.Value)?$/i.test(part)) children.push(new SimpleField('NUMPAGES', '1'));
+      else {
+        const value = evaluateExpression(`=${part}`, context);
+        if (value !== null && value !== undefined) children.push(...textRuns(String(value), runProps));
+      }
+    }
+    return children;
+  }));
+  return values.length ? values : textRuns(textForItem(item, context), runProps);
+}
+
 function paragraphForTextbox(item, context, overrideText, options = {}) {
   const style = item.style;
   const backgroundColor = styleColor(style.backgroundColor, context, null);
+  let effectiveText = overrideText;
+  if (effectiveText === undefined && options.clipToBox) {
+    const lineHeight = Number(styleValue(style.fontSize, context, 10)) * 1.2;
+    const availableHeight = Math.max(1, item.height - (style.paddingTop || 0) - (style.paddingBottom || 0));
+    const maxLines = Math.max(1, Math.floor(availableHeight / Math.max(1, lineHeight)));
+    const lines = String(textForItem(item, context) ?? '').split('\n');
+    if (lines.length > maxLines) effectiveText = lines.slice(0, maxLines).join('\n');
+  }
   const runProps = {
     font: styleValue(style.fontFamily, context, 'Arial'),
-    size: Math.round((style.fontSize || 10) * 2),
+    // fontSize may be an expression (e.g. =IIF(Sev="High",14,10)); resolve it like every other style
+    // property. Using it raw produced NaN half-points and threw inside the docx library.
+    size: Math.max(2, Math.round((Number(styleValue(style.fontSize, context, 10)) || 10) * 2)),
     bold: /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal'))),
     italics: /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal'))),
     underline: /underline/i.test(String(styleValue(style.textDecoration, context, 'None'))) ? {} : undefined,
@@ -42,18 +119,23 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
   };
   return new Paragraph({
     alignment: alignment(style.textAlign),
-    shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
-    spacing: { before: 0, after: 0 },
+    shading: !options.suppressShading && backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
+    spacing: {
+      before: 0,
+      after: 0,
+      line: options.lineHeight ? pointsToTwips(options.lineHeight) : undefined,
+      lineRule: options.lineHeight ? LineRuleType.EXACT : undefined,
+    },
     keepLines: Boolean(item.keepTogether),
     keepNext: Boolean(options.keepNext),
     widowControl: false,
-    wordWrap: true,
+    wordWrap: options.noWrap ? true : undefined,
     overflowPunctuation: false,
     // A group page break is expressed by breaking before the first paragraph of the group's first row.
     pageBreakBefore: options.pageBreakBefore || undefined,
     // Recursive (parent/child) groups indent the first cell by recursion depth.
     indent: options.indentLeft ? { left: options.indentLeft } : undefined,
-    children: textRuns(overrideText ?? textForItem(item, context), runProps),
+    children: fieldAwareChildren(item, context, runProps, effectiveText),
   });
 }
 
@@ -69,15 +151,32 @@ function borderFor(style, context) {
   if (!sides) return undefined;
   const convert = (border) => {
     const configuredStyle = String(styleValue(border?.style, context, 'None'));
-    const configuredColor = styleColor(border?.color, context, null);
-    if (/^none$/i.test(configuredStyle) || !configuredColor) return { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
-    const docxStyle = /dash/i.test(configuredStyle) ? BorderStyle.DASHED : /dot/i.test(configuredStyle) ? BorderStyle.DOTTED : BorderStyle.SINGLE;
-    return { style: docxStyle, size: Math.max(1, Math.round((border.width || 1) * 8)), color: configuredColor.replace('#', '') };
+    if (!configuredStyle || /^none$/i.test(configuredStyle)) return { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
+    // SSRS defaults an omitted BorderColor to Black, so a Solid border with no explicit colour must still
+    // be drawn — resolving to null previously dropped the whole side. Width may be an expression too.
+    const configuredColor = styleColor(border?.color, context, '#000000') || '#000000';
+    const docxStyle = /dash/i.test(configuredStyle) ? BorderStyle.DASHED
+      : /dot/i.test(configuredStyle) ? BorderStyle.DOTTED
+      : /double/i.test(configuredStyle) ? BorderStyle.DOUBLE
+      : BorderStyle.SINGLE;
+    const width = Number(styleValue(border?.width, context, 1)) || 1;
+    return { style: docxStyle, size: Math.max(1, Math.round(width * 8)), color: configuredColor.replace('#', '') };
   };
   return { top: convert(sides.top), right: convert(sides.right), bottom: convert(sides.bottom), left: convert(sides.left) };
 }
 
-// Native pixel dimensions of a PNG (IHDR) or JPEG (SOFn) buffer, or null when unreadable.
+// Word accepts png/jpg/gif/bmp raster data. Detect the real format from magic bytes rather than trusting
+// the RDL-declared MIMEType (which can be missing, "image/jpg" without the "e", or simply wrong); a
+// mislabelled type makes Word show a broken image. Falls back to png for anything unrecognized.
+function detectImageType(buffer) {
+  if (buffer.length > 8 && buffer[0] === 0x89 && buffer.toString('ascii', 1, 4) === 'PNG') return 'png';
+  if (buffer.length > 3 && buffer[0] === 0xFF && buffer[1] === 0xD8) return 'jpg';
+  if (buffer.length > 6 && buffer.toString('ascii', 0, 3) === 'GIF') return 'gif';
+  if (buffer.length > 2 && buffer[0] === 0x42 && buffer[1] === 0x4D) return 'bmp';
+  return 'png';
+}
+
+// Native pixel dimensions of a PNG/JPEG/GIF/BMP buffer, or null when unreadable.
 function naturalImageSize(buffer) {
   if (buffer.length > 24 && buffer.toString('ascii', 1, 4) === 'PNG') {
     return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
@@ -93,10 +192,16 @@ function naturalImageSize(buffer) {
       i += 2 + buffer.readUInt16BE(i + 2);
     }
   }
+  if (buffer.length > 10 && buffer.toString('ascii', 0, 3) === 'GIF') {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  if (buffer.length > 26 && buffer[0] === 0x42 && buffer[1] === 0x4D) {
+    return { width: buffer.readInt32LE(18), height: Math.abs(buffer.readInt32LE(22)) };
+  }
   return null;
 }
 
-function imageParagraph(model, item, floating = false) {
+function imageParagraph(model, item, floating = false, origin = null) {
   const image = model.embeddedImages[item.value];
   if (!image?.data) return null;
   const buffer = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
@@ -119,69 +224,249 @@ function imageParagraph(model, item, floating = false) {
   const emu = (pt) => Math.round(pt * 12700);
   const floatingOpts = floating ? {
     floating: {
-      horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: emu(model.page.marginLeft + item.left) },
-      verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: emu(model.page.marginTop + item.top) },
+      horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: emu((origin?.x ?? model.page.marginLeft) + item.left) },
+      verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: emu((origin?.y ?? model.page.marginTop) + item.top) },
       wrap: { type: TextWrappingType.NONE },
       allowOverlap: true,
     },
   } : {};
   return new Paragraph({ children: [new ImageRun({
     data: buffer,
-    type: image.mimeType.includes('jpeg') ? 'jpg' : 'png',
+    type: detectImageType(buffer),
     transformation: { width: pointsToDisplayPixels(width), height: pointsToDisplayPixels(height) },
     ...floatingOpts,
   })] });
 }
 
-function childrenForItems(model, items, context, floating = false) {
+function positionedShapeParagraph(item, context, origin, children = [], wordZIndex = null) {
+  const pointToEmu = (point) => Math.round(point * 12700);
+  const backgroundColor = styleColor(item.style?.backgroundColor, context, null);
+  const border = item.style?.border;
+  const borderStyle = String(styleValue(border?.style, context, 'None'));
+  const borderColor = styleColor(border?.color, context, null);
+  const verticalAnchor = /bottom/i.test(item.style?.verticalAlign) ? VerticalAnchor.BOTTOM
+    : /middle|center/i.test(item.style?.verticalAlign) ? VerticalAnchor.CENTER : VerticalAnchor.TOP;
+  const hasBorder = !/^none$/i.test(borderStyle) && Boolean(borderColor);
+  const makeShape = ({ fill, outline, shapeChildren, zOffset = 0 }) => new WpsShapeRun({
+    type: 'wps',
+    transformation: { width: Math.max(1, pointsToDisplayPixels(item.width)), height: Math.max(1, pointsToDisplayPixels(item.height)) },
+    floating: {
+      horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: pointToEmu(origin.x + item.left) },
+      verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: pointToEmu(origin.y + item.top) },
+      wrap: { type: TextWrappingType.NONE },
+      allowOverlap: true,
+      layoutInCell: false,
+      zIndex: Math.max(1, (wordZIndex ?? (item.zIndex + 1)) + zOffset),
+    },
+    solidFill: fill ? { type: 'rgb', value: fill.replace('#', '') } : undefined,
+    outline,
+    bodyProperties: {
+      margins: {
+        top: pointToEmu(item.style?.paddingTop || 0), right: pointToEmu(item.style?.paddingRight || 0),
+        bottom: pointToEmu(item.style?.paddingBottom || 0), left: pointToEmu(item.style?.paddingLeft || 0),
+      },
+      verticalAnchor,
+      // Page-section items are positioned in a fixed RDL band. Allowing Word to auto-grow them changes
+      // z-order coverage and can hide adjacent repeated-header labels; keep the declared box exactly.
+      noAutoFit: true,
+    },
+    children: shapeChildren?.length ? shapeChildren : [new Paragraph({ spacing: { before: 0, after: 0 }, children: [] })],
+  });
+  const borderOutline = hasBorder
+    ? { type: 'solidFill', solidFillType: 'rgb', value: borderColor.replace('#', ''), width: pointToEmu(border?.width || 1) }
+    : backgroundColor ? undefined : { type: 'noFill' };
+  // `docx` emits a shape that has both fill and outline in an invalid DrawingML property order
+  // (`noFill`, line, then `solidFill`). Word keeps the line but ignores the late fill. Keep the visual
+  // pieces editable, but stack them explicitly so text is never drawn beneath a fill or border shape.
+  const runs = backgroundColor && hasBorder
+    ? [
+      makeShape({ fill: backgroundColor, outline: undefined, shapeChildren: [], zOffset: 0 }),
+      makeShape({ fill: null, outline: { type: 'noFill' }, shapeChildren: children, zOffset: 1 }),
+      makeShape({ fill: null, outline: borderOutline, shapeChildren: [], zOffset: 2 }),
+    ]
+    : [makeShape({ fill: backgroundColor, outline: borderOutline, shapeChildren: children })];
+  return new Paragraph({
+    spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
+    children: runs,
+  });
+}
+
+function childrenForItems(model, items, context, floating = false, origin = null, zOrder = { value: 1 }) {
   const children = [];
+  const nextZIndex = () => {
+    const value = zOrder.value;
+    zOrder.value += 3;
+    return value;
+  };
   for (const item of [...items].sort((left, right) => left.zIndex - right.zIndex || left.top - right.top || left.left - right.left)) {
     if (isHidden(item.hidden, context)) continue;
-    if (item.type === 'Textbox') children.push(paragraphForTextbox(item, context));
+    if (item.type === 'Textbox') {
+      if (floating) children.push(positionedShapeParagraph(item, context, origin, [paragraphForTextbox(item, context, undefined, { suppressShading: true, noWrap: true, clipToBox: true })], nextZIndex()));
+      else children.push(paragraphForTextbox(item, context));
+    }
     else if (item.type === 'Image') {
-      const paragraph = imageParagraph(model, item, floating);
+      const paragraph = imageParagraph(model, item, floating, origin);
       if (paragraph) children.push(paragraph);
-    } else if (item.type === 'Rectangle') children.push(...childrenForItems(model, item.items || [], context, floating));
-    else if (item.type === 'Line') children.push(new Paragraph({ border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: color(item.style.border.color).replace('#', '') } } }));
+    } else if (item.type === 'Rectangle') {
+      if (floating && (item.style?.backgroundColor || !/^none$/i.test(String(item.style?.border?.style)))) children.push(positionedShapeParagraph(item, context, origin, [], nextZIndex()));
+      const childOrigin = floating ? { x: origin.x + item.left, y: origin.y + item.top } : origin;
+      children.push(...childrenForItems(model, item.items || [], context, floating, childOrigin, zOrder));
+    } else if (item.type === 'Line') {
+      if (floating) {
+        const line = {
+          ...item,
+          width: Math.max(item.width, item.style?.border?.width || 1),
+          height: Math.max(item.height, item.style?.border?.width || 1),
+          style: { ...item.style, backgroundColor: color(item.style?.border?.color), border: { style: 'None' }, paddingTop: 0, paddingRight: 0, paddingBottom: 0, paddingLeft: 0 },
+        };
+        children.push(positionedShapeParagraph(line, context, origin, [], nextZIndex()));
+      } else children.push(new Paragraph({ border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: color(item.style?.border?.color).replace('#', '') } } }));
+    }
   }
   return children;
 }
 
-function tableForTablix(model, item, request) {
+function applyMeasurementFont(doc, config, style, context) {
+  const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
+  const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
+  const family = styleValue(style.fontFamily, context, 'Arial');
+  doc.font(pdfFont(config, family, bold, italic)).fontSize(Number(styleValue(style.fontSize, context, 10)) || 10);
+}
+
+function measureRows(rows, geometry, request, globals, datasets, datasetName, config, measurementDoc) {
+  const placements = computeCellPlacements(rows, geometry.gridTwips.length);
+  const metrics = rows.map((row, rowIndex) => {
+    const contexts = row.cells.map((cell) => ({
+      fields: row.fields,
+      parameters: request.parameters || {},
+      globals,
+      dataset: datasets[datasetName] || [],
+      datasets,
+      cell,
+    }));
+    const heights = row.cells.map((cell, index) => {
+      const textbox = cellTextbox(cell);
+      if (!textbox || cell.hidden) return 0;
+      const columnIndex = placements[rowIndex][index];
+      const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1) / 20;
+      const context = contexts[index];
+      applyMeasurementFont(measurementDoc, config, textbox.style, context);
+      const innerWidth = Math.max(1, width - textbox.style.paddingLeft - textbox.style.paddingRight);
+      const text = cellText(cell);
+      const textHeight = text ? measurementDoc.heightOfString(text, { width: innerWidth, lineGap: 0 }) : 0;
+      return textHeight + textbox.style.paddingTop + textbox.style.paddingBottom;
+    });
+    return {
+      height: Math.max(row.height, ...heights),
+      lineHeights: row.cells.map((cell, index) => {
+        const textbox = cellTextbox(cell);
+        if (!textbox) return null;
+        applyMeasurementFont(measurementDoc, config, textbox.style, contexts[index]);
+        return measurementDoc.currentLineHeight(true);
+      }),
+    };
+  });
+  return { placements, metrics };
+}
+
+function fragmentRowsForWord(model, rows, rowMetrics) {
+  const headerRows = rows.filter((row) => row.isHeader);
+  const bodyRows = rows.filter((row) => !row.isHeader);
+  if (bodyRows.length === 0) return [rows];
+
+  const metricByRow = new Map(rows.map((row, index) => [row, rowMetrics[index]]));
+  const headerHeight = headerRows.reduce((sum, row) => sum + (metricByRow.get(row)?.height || row.height || 0), 0);
+  const pageBodyHeight = Math.max(1,
+    model.page.height - model.page.marginTop - (model.page.header?.height || 0)
+      - model.page.marginBottom - (model.page.footer?.height || 0));
+  const capacity = Math.max(1, pageBodyHeight - headerHeight);
+
+  const fragments = [];
+  let current = [];
+  let currentHeight = 0;
+  for (let index = 0; index < bodyRows.length;) {
+    const row = bodyRows[index];
+    let blockEnd = index;
+    for (let cursor = index; cursor <= blockEnd && cursor < bodyRows.length; cursor += 1) {
+      const sourceIndex = rows.indexOf(bodyRows[cursor]);
+      for (const cell of bodyRows[cursor].cells) {
+        const span = cell.rowSpan || 1;
+        if (span > 1) {
+          const endSourceIndex = sourceIndex + span - 1;
+          const endBodyIndex = bodyRows.findIndex((candidate) => rows.indexOf(candidate) === endSourceIndex);
+          if (endBodyIndex > blockEnd) blockEnd = endBodyIndex;
+        }
+      }
+    }
+    if (blockEnd < index) blockEnd = index;
+    const block = bodyRows.slice(index, blockEnd + 1);
+    const blockHeight = block.reduce((sum, candidate) => sum + (metricByRow.get(candidate)?.height || candidate.height || 0), 0);
+    if ((row.pageBreakBefore || (current.length > 0 && currentHeight + blockHeight > capacity)) && current.length > 0) {
+      fragments.push([...headerRows, ...current]);
+      current = [];
+      currentHeight = 0;
+    }
+    current.push(...block);
+    currentHeight += blockHeight;
+    index = blockEnd + 1;
+  }
+  if (current.length > 0) fragments.push([...headerRows, ...current]);
+  return fragments.length > 0 ? fragments : [rows];
+}
+
+function tableForTablix(model, item, request, config, measurementDoc, structuredOptions) {
   const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
   const datasets = normalizeDatasets(model, request);
   const { rows, columns } = tablixRows(item, request, globals, model);
   // Matrix tablixes expand to a data-dependent column grid; clamp uses the expanded natural width.
   const layoutItem = item.hasColumnGroups ? { ...item, columns, width: columns.reduce((sum, width) => sum + width, 0) } : item;
   const geometry = computeDocxTableGeometry(model, layoutItem);
-  const placements = computeCellPlacements(rows, geometry.gridTwips.length);
+  const { placements, metrics: rowMetrics } = measureRows(rows, geometry, request, globals, datasets, item.datasetName, config, measurementDoc);
   // Keep-together: Word has no group-level "keep rows together", but a merged (row-span) cell means those
-  // rows form one block. Mark every row a merge spans (except its last) to keepNext, so Word holds the
-  // block on one page — mirroring the PDF, where the row-spanning Risk-No/rating cells keep each risk whole.
+  // rows form one block. Only link a span when the whole block can fit on a fresh content page. The PDF
+  // renderer makes the same distinction; chaining an oversized span makes Word move content repeatedly
+  // and produces the large blank areas that SSRS avoids by splitting the group.
   const keepWithNext = new Array(rows.length).fill(false);
+  const repeatedHeaderHeight = rows.reduce((sum, row, index) => sum + (row.isHeader ? rowMetrics[index].height : 0), 0);
+  const freshPageCapacity = Math.max(1,
+    model.page.height - model.page.marginTop - (model.page.header?.height || 0)
+      - model.page.marginBottom - (model.page.footer?.height || 0) - repeatedHeaderHeight);
   rows.forEach((row, rowIndex) => {
     for (const cell of row.cells) {
       const span = cell.rowSpan || 1;
-      if (span > 1) for (let r = rowIndex; r < Math.min(rowIndex + span - 1, rows.length - 1); r += 1) keepWithNext[r] = true;
+      const end = Math.min(rowIndex + span, rows.length);
+      const spanHeight = rowMetrics.slice(rowIndex, end).reduce((sum, metric) => sum + metric.height, 0);
+      if (span > 1 && spanHeight <= freshPageCapacity) {
+        for (let r = rowIndex; r < Math.min(end - 1, rows.length - 1); r += 1) keepWithNext[r] = true;
+      }
     }
   });
+  const useNativePageFragments = structuredOptions?.nativePageFragments === true;
+  const fragments = useNativePageFragments ? fragmentRowsForWord(model, rows, rowMetrics) : [rows];
+  const metricByRow = new Map(rows.map((row, index) => [row, rowMetrics[index]]));
+  const keepWithNextByRow = new Map(rows.map((row, index) => [row, keepWithNext[index]]));
   const tableContext = { fields: {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
-  return new Table({
+  const tableForRows = (fragmentRows, fragmentIndex) => {
+    const fragmentPlacements = computeCellPlacements(fragmentRows, geometry.gridTwips.length);
+    return new Table({
     layout: TableLayoutType.FIXED,
     width: { size: geometry.tableTwips, type: WidthType.DXA },
     indent: geometry.indentTwips > 0 ? { size: geometry.indentTwips, type: WidthType.DXA } : undefined,
     columnWidths: geometry.gridTwips,
     borders: borderFor(item.style, tableContext),
-    rows: rows.map((row, rowIndex) => new TableRow({
+    rows: fragmentRows.map((row, rowIndex) => {
+      const rowMetric = metricByRow.get(row);
+      return new TableRow({
       tableHeader: row.isHeader || undefined,
       cantSplit: row.isHeader || row.keepTogether || undefined,
+      height: { value: pointsToTwips(rowMetric?.height || row.height), rule: HeightRule.ATLEAST },
       children: row.cells.map((cell, index, cells) => {
         const textbox = cellTextbox(cell);
         const style = textbox?.style || item.style;
         // Container-only cells (content wrapped in a Rectangle) have no border-bearing item of their own,
         // so their edges come from the tablix style — matching the PDF renderer.
         const borderStyle = cell.containerWrapped ? item.style : style;
-        const columnIndex = placements[rowIndex][index];
+        const columnIndex = fragmentPlacements[rowIndex][index];
         const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1);
         const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
         const backgroundColor = styleColor(style.backgroundColor, context, null);
@@ -193,27 +478,49 @@ function tableForTablix(model, item, request) {
           borders: borderFor(borderStyle, context),
           shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
           margins: { top: pointsToTwips(style.paddingTop), right: pointsToTwips(style.paddingRight), bottom: pointsToTwips(style.paddingBottom), left: pointsToTwips(style.paddingLeft) },
-          children: textbox && !cell.hidden ? [paragraphForTextbox(textbox, context, cellText(cell), { pageBreakBefore: index === 0 && row.pageBreakBefore, keepNext: keepWithNext[rowIndex], indentLeft: index === 0 && row.indentLevel ? pointsToTwips(row.indentLevel * 12) : undefined })] : [new Paragraph('')],
+          children: textbox && !cell.hidden ? [paragraphForTextbox(textbox, context,
+            hasPageFieldExpression(textbox) ? undefined : cellText(cell), {
+            pageBreakBefore: index === 0 && rowIndex === 0 && fragmentIndex > 0,
+            keepNext: keepWithNextByRow.get(row),
+            indentLeft: index === 0 && row.indentLevel ? pointsToTwips(row.indentLevel * 12) : undefined,
+            lineHeight: rowMetric?.lineHeights[index],
+          })] : [new Paragraph('')],
         });
       }),
-    })),
+    });
+    }),
   });
+  };
+  return fragments.map((fragment, index) => tableForRows(fragment, index));
 }
 
-function headerFooter(model, part, request, Kind) {
+function headerFooter(model, part, request, Kind, location) {
   if (!part) return undefined;
-  const context = { parameters: request.parameters || {}, globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: model.variables || {} }, datasets: normalizeDatasets(model, request), dataset: [] };
-  return { default: new Kind({ children: childrenForItems(model, part.items, context, true) }) };
+  // A Word header/footer is materialized once and reused. Evaluating page-dependent RDL visibility as
+  // page 1 of 1 incorrectly hides constructs intended for every non-final page (a common SSRS repeated-
+  // header pattern). Use a representative middle page here; PAGE/NUMPAGES text itself is still emitted
+  // as live Word fields by fieldAwareChildren.
+  const context = { parameters: request.parameters || {}, globals: { PageNumber: 2, TotalPages: 3, ExecutionTime: new Date(), variables: model.variables || {} }, datasets: normalizeDatasets(model, request), dataset: [] };
+  const origin = {
+    x: model.page.marginLeft,
+    y: location === 'footer' ? model.page.height - model.page.marginBottom - part.height : model.page.marginTop,
+  };
+  return { default: new Kind({ children: childrenForItems(model, part.items, context, true, origin) }) };
 }
 
 async function chartParagraph(model, item, request, config, tempDir, context, index) {
-  // Charts are inherently graphical, so they embed as a rasterized image at chart size while the rest
-  // of the document stays native OpenXML. Requires Poppler + a tempDir; without them the chart is
-  // skipped rather than blocking the whole document.
-  if (!config || !tempDir) return null;
+  // Charts are inherently graphical, so they embed as a rasterized image at chart size while the rest of
+  // the document stays native OpenXML. This needs Poppler + a tempDir. A visible chart that cannot be
+  // rendered must FAIL CLOSED — a silently missing chart in a compliance document is the exact silent-drop
+  // class the fail-closed design exists to prevent. Hidden charts are already skipped before reaching here.
+  if (!config || !tempDir) {
+    throw new ServiceError('RENDER_FAILED', 'Chart rendering requires a configured render environment (config and temporary directory)', 500, { chart: item.name });
+  }
   const data = materializeChart(item, context.datasets, context.parameters, context.globals);
   const image = await renderChartPng(item, data, config, tempDir, context, index);
-  if (!image) return null;
+  if (!image) {
+    throw new ServiceError('RENDER_FAILED', `Chart '${item.name}' could not be rendered`, 500, { chart: item.name });
+  }
   // Scale the chart image (preserving aspect ratio) so it can never exceed the usable page body and
   // spill onto an extra page. The reserve leaves room for an accompanying title/legend on the page.
   const usableWidth = Math.max(1, model.page.width - model.page.marginLeft - model.page.marginRight);
@@ -236,6 +543,11 @@ export async function renderEditableDocx(model, request, config, tempDir) {
   const context = { parameters: request.parameters || {}, globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: model.variables || {} }, fields: {}, dataset: [], datasets: normalizeDatasets(model, request) };
   let forcePageBreak = false;
   let chartIndex = 0;
+  const measurementConfig = config || { strictFonts: false, fontDir: process.cwd() };
+  const structuredOptions = resolveStructuredDocxOptions(model, request, measurementConfig);
+  const measurementDoc = new PDFDocument({ autoFirstPage: false });
+  measurementDoc.on('data', () => {});
+  measurementDoc.addPage({ size: [model.page.width, model.page.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
   for (const item of [...model.body.items].sort((a, b) => a.top - b.top || a.left - b.left || a.zIndex - b.zIndex)) {
     if (isHidden(item.hidden, context)) continue;
     const pageBreak = item.pageBreak && !isHidden(item.pageBreak.disabled, context) ? String(item.pageBreak.location) : 'None';
@@ -246,14 +558,14 @@ export async function renderEditableDocx(model, request, config, tempDir) {
       children.push(new Paragraph({ pageBreakBefore: true, spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } }));
     }
     forcePageBreak = false;
-    if (item.type === 'Tablix') children.push(tableForTablix(model, item, request));
+    if (item.type === 'Tablix') children.push(...tableForTablix(model, item, request, measurementConfig, measurementDoc, structuredOptions));
     else if (item.type === 'Chart') {
-      const paragraph = await chartParagraph(model, item, request, config, tempDir, context, chartIndex);
+      children.push(await chartParagraph(model, item, request, config, tempDir, context, chartIndex));
       chartIndex += 1;
-      if (paragraph) children.push(paragraph);
     } else children.push(...childrenForItems(model, [item], context));
     if (/^(End|StartAndEnd)$/i.test(pageBreak)) forcePageBreak = true;
   }
+  measurementDoc.end();
   const document = new Document({
     creator: 'RDL Converter Service',
     title: request.outputFileName || model.name,
@@ -273,11 +585,20 @@ export async function renderEditableDocx(model, request, config, tempDir) {
           },
         },
       },
-      headers: headerFooter(model, model.page.header, request, Header),
-      footers: headerFooter(model, model.page.footer, request, Footer),
+      headers: headerFooter(model, model.page.header, request, Header, 'header'),
+      footers: headerFooter(model, model.page.footer, request, Footer, 'footer'),
       children,
     }],
   });
   const buffer = await Packer.toBuffer(document);
-  return { buffer, pageCount: null, mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', extension: 'docx' };
+  return {
+    buffer,
+    pageCount: null,
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    extension: 'docx',
+    layoutMode: 'structured',
+    editableTextRatio: 1,
+    docxProfile: structuredOptions.profile?.selected || null,
+    docxNativePageFragments: structuredOptions.nativePageFragments === true,
+  };
 }

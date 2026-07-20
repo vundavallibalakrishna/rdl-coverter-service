@@ -17,6 +17,7 @@
     "docs/",
     "README.md",
     "AGENTS.md",
+    "CLAUDE.md",
     ".env.example"
   ],
   "engines": {
@@ -30,6 +31,9 @@
     "generate:samples": "node scripts/generate-sample-requests.js",
     "smoke:sample": "node scripts/render-sample.js",
     "verify:reference": "node scripts/verify-reference-sample.js",
+    "certify:docx": "node scripts/certify-docx-profile.js",
+    "collect:docx-profiles": "node scripts/collect-docx-profiles.js",
+    "verify:local-summary": "node scripts/local-readiness-summary.js",
     "verify:stress": "node scripts/stress-certification.js",
     "audit:schema": "node scripts/schema-coverage.js",
     "smoke:docker": "node scripts/docker-smoke.js"
@@ -37,10 +41,12 @@
   "dependencies": {
     "@fastify/multipart": "^9.3.0",
     "docx": "^9.5.1",
+    "exceljs": "^4.4.0",
     "fast-xml-parser": "^5.3.1",
     "fastify": "^5.6.2",
     "jszip": "^3.10.1",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.10.38",
     "pdfkit": "^0.17.2",
     "pngjs": "^7.0.0"
   }
