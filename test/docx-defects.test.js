@@ -165,3 +165,20 @@ test('a full-width shaded free-form bar stays a paragraph (no fixed-width table 
   assert.match(xml, /<w:shd[^>]*w:fill="003366"/); // shading survives on the paragraph
   assert.match(xml, /TITLE/);
 });
+
+test('a run that overrides the textbox style (White/Bold over black/Normal) renders per-run, not the textbox style', async () => {
+  // The SSRS pattern behind the Combined Assurance header's last two cells: the textbox style is black /
+  // Normal, but the visible run explicitly sets White / Bold. The DOCX previously styled every run from the
+  // textbox (black / Normal) and lost it; it must now honour each run's own style, matching the PDF.
+  const m = structuredClone(model);
+  const tb = detailCellTextbox(m);
+  tb.style = { ...tb.style, color: '#000000', fontWeight: 'Normal' };
+  const runStyle = { ...tb.style, color: '#FFFFFF', fontWeight: 'Bold' };
+  tb.value = 'HEADER';
+  tb.paragraphs = [[{ value: 'HEADER', markupType: 'None', style: runStyle }]];
+  const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
+  const i = xml.indexOf('HEADER');
+  const rpr = xml.slice(xml.lastIndexOf('<w:r>', i), i); // run properties of the HEADER run
+  assert.match(rpr, /<w:b\/>/); // bold from the run, not the textbox's Normal
+  assert.match(rpr, /<w:color w:val="FFFFFF"\/>/i); // white from the run, not the textbox's black
+});

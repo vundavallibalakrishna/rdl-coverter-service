@@ -7,7 +7,7 @@ import PDFDocument from 'pdfkit';
 import { ServiceError } from '../errors.js';
 import { pointsToDisplayPixels, pointsToTwips } from '../units.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, styledSegmentsForText, tablixRows, textForItem } from './common.js';
 import { cellGridWidth, computeDocxTableGeometry } from './docxTableLayout.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { materializeChart } from './chartData.js';
@@ -96,6 +96,36 @@ function fieldAwareChildren(item, context, runProps, overrideText) {
   return values.length ? values : textRuns(textForItem(item, context), runProps);
 }
 
+// Word run properties for a resolved style. Every property is an ExpressionType, so all resolve through the
+// style helpers (a literal passes straight through). Applied per RUN, not per textbox, so a run that overrides
+// the textbox's weight/colour (e.g. a header cell whose textbox style is black/Normal but whose run is
+// White/Bold) renders correctly — matching the PDF, which styles each run individually.
+function runPropsFor(style, context) {
+  return {
+    font: styleValue(style?.fontFamily, context, 'Arial'),
+    // fontSize may be an expression (e.g. =IIF(Sev="High",14,10)); resolve via styleSize (a literal passes
+    // through). Using it raw produced NaN half-points and threw inside the docx library.
+    size: Math.max(2, Math.round((styleSize(style?.fontSize, context, 10) || 10) * 2)),
+    bold: /bold|600|700|800|900/i.test(String(styleValue(style?.fontWeight, context, 'Normal'))),
+    italics: /italic/i.test(String(styleValue(style?.fontStyle, context, 'Normal'))),
+    underline: /underline/i.test(String(styleValue(style?.textDecoration, context, 'None'))) ? {} : undefined,
+    strike: /line.?through/i.test(String(styleValue(style?.textDecoration, context, 'None'))),
+    color: styleColor(style?.color, context, '#000000').replace('#', ''),
+  };
+}
+
+// Builds a paragraph's run children honouring per-run styles. Reuses the shared styled-segment slicer (the
+// same one the PDF uses) so a materialized tablix cell's flattened text keeps its runs' individual styling.
+// Falls back to the single-style path for PageNumber/TotalPages textboxes (which must emit live Word fields,
+// not styled text) and for cells whose override text is not a contiguous slice of their own runs.
+function styledRunChildren(item, context, textboxRunProps, effectiveText) {
+  if (hasPageFieldExpression(item)) return fieldAwareChildren(item, context, textboxRunProps, effectiveText);
+  const styled = styledSegmentsForText(item, context, effectiveText);
+  if (!styled) return fieldAwareChildren(item, context, textboxRunProps, effectiveText);
+  if (styled.segments.length === 0) return textRuns(styled.text, textboxRunProps);
+  return styled.segments.flatMap((segment) => textRuns(segment.text, runPropsFor(segment.style, context)));
+}
+
 function paragraphForTextbox(item, context, overrideText, options = {}) {
   const style = item.style;
   const backgroundColor = styleColor(style.backgroundColor, context, null);
@@ -107,17 +137,7 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
     const lines = String(textForItem(item, context) ?? '').split('\n');
     if (lines.length > maxLines) effectiveText = lines.slice(0, maxLines).join('\n');
   }
-  const runProps = {
-    font: styleValue(style.fontFamily, context, 'Arial'),
-    // fontSize may be an expression (e.g. =IIF(Sev="High",14,10)); resolve via styleSize (a literal passes
-    // through). Using it raw produced NaN half-points and threw inside the docx library.
-    size: Math.max(2, Math.round((styleSize(style.fontSize, context, 10) || 10) * 2)),
-    bold: /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal'))),
-    italics: /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal'))),
-    underline: /underline/i.test(String(styleValue(style.textDecoration, context, 'None'))) ? {} : undefined,
-    strike: /line.?through/i.test(String(styleValue(style.textDecoration, context, 'None'))),
-    color: styleColor(style.color, context, '#000000').replace('#', ''),
-  };
+  const runProps = runPropsFor(style, context);
   return new Paragraph({
     alignment: alignment(style.textAlign, context),
     shading: !options.suppressShading && backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
@@ -136,7 +156,7 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
     pageBreakBefore: options.pageBreakBefore || undefined,
     // Recursive (parent/child) groups indent the first cell by recursion depth.
     indent: options.indentLeft ? { left: options.indentLeft } : undefined,
-    children: fieldAwareChildren(item, context, runProps, effectiveText),
+    children: styledRunChildren(item, context, runProps, effectiveText),
   });
 }
 
@@ -167,6 +187,33 @@ function borderFor(style, context) {
     return { style: docxStyle, size: Math.max(1, Math.round(width * 8)), color: configuredColor.replace('#', '') };
   };
   return { top: convert(sides.top), right: convert(sides.right), bottom: convert(sides.bottom), left: convert(sides.left) };
+}
+
+// Normalizes a style so its bottom border is the enforced one (see enforcedBottomBorder), keeping the other
+// three sides. Applied to a table's last row so the table is always closed with a bottom rule, even when the
+// RDL declares None there.
+function withEnforcedBottom(style) {
+  const sides = style?.borders || (style?.border
+    ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
+    : {});
+  return { ...style, borders: { ...sides, bottom: enforcedBottomBorder(style) } };
+}
+
+function hasPageDependentVisibility(value) {
+  return typeof value === 'string' && /Globals!\s*(?:PageNumber|TotalPages)\b/i.test(value);
+}
+
+// A Word header/footer is one reusable part, so resolving a page-dependent Hidden expression while the
+// package is being built freezes that decision for every page. Word cannot apply SSRS visibility to an
+// arbitrary positioned item per page. Preserve the declared content instead of silently deleting it; live
+// PAGE/NUMPAGES text remains field-backed. Literal and parameter/dataset-driven visibility is still resolved
+// normally. Recurse because page visibility is commonly declared on a Rectangle around footer text.
+function reusablePartItems(items) {
+  return (items || []).map((item) => ({
+    ...item,
+    hidden: hasPageDependentVisibility(item.hidden) ? false : item.hidden,
+    items: item.items ? reusablePartItems(item.items) : item.items,
+  }));
 }
 
 // Word accepts png/jpg/gif/bmp raster data. Detect the real format from magic bytes rather than trusting
@@ -512,7 +559,7 @@ function measureRows(rows, geometry, request, globals, datasets, datasetName, co
   return { placements, metrics };
 }
 
-function fragmentRowsForWord(model, rows, rowMetrics) {
+function fragmentRowsForWord(model, rows, rowMetrics, columnCount) {
   const headerRows = rows.filter((row) => row.isHeader);
   const bodyRows = rows.filter((row) => !row.isHeader);
   if (bodyRows.length === 0) return [rows];
@@ -522,10 +569,17 @@ function fragmentRowsForWord(model, rows, rowMetrics) {
   const pageBodyHeight = Math.max(1,
     model.page.height - model.page.marginTop - (model.page.header?.height || 0)
       - model.page.marginBottom - (model.page.footer?.height || 0));
-  const capacity = Math.max(1, pageBodyHeight - headerHeight);
+  // Fragment page breaks are baked from OUR measured row heights, but the viewer (Word/LibreOffice) lays the
+  // rows out with its own font metrics — which run taller when a declared font is substituted. Without a
+  // margin a fragment sized to exactly fill the page spills one row onto a second, header-less page. Reserve
+  // a fraction of the body so every fragment fits with headroom; a partial extra page is far worse than a
+  // slightly shorter one. Not report-specific — a general safety buffer for approximate height measurement.
+  const SAFETY = 0.9;
+  const capacity = Math.max(1, pageBodyHeight * SAFETY - headerHeight);
 
-  const fragments = [];
-  let current = [];
+  const fragmentRanges = [];
+  let currentStart = -1;
+  let currentEnd = -1;
   let currentHeight = 0;
   for (let index = 0; index < bodyRows.length;) {
     const row = bodyRows[index];
@@ -542,18 +596,67 @@ function fragmentRowsForWord(model, rows, rowMetrics) {
       }
     }
     if (blockEnd < index) blockEnd = index;
-    const block = bodyRows.slice(index, blockEnd + 1);
+    let block = bodyRows.slice(index, blockEnd + 1);
     const blockHeight = block.reduce((sum, candidate) => sum + (metricByRow.get(candidate)?.height || candidate.height || 0), 0);
-    if ((row.pageBreakBefore || (current.length > 0 && currentHeight + blockHeight > capacity)) && current.length > 0) {
-      fragments.push([...headerRows, ...current]);
-      current = [];
+    // Keep a vertical-merge block intact when it fits on a fresh page. If the block itself is taller than a
+    // page, keeping it indivisible merely lets Word auto-flow one table across several pages; those implicit
+    // continuation pages have neither repeated headers nor a physical last-row border. Split that oversized
+    // block at real row boundaries instead. Its merge owners are clipped/carried below for valid OOXML.
+    if (blockHeight > capacity) {
+      blockEnd = index;
+      block = [row];
+    }
+    const unitHeight = block.reduce((sum, candidate) => sum + (metricByRow.get(candidate)?.height || candidate.height || 0), 0);
+    if ((row.pageBreakBefore || (currentStart >= 0 && currentHeight + unitHeight > capacity)) && currentStart >= 0) {
+      fragmentRanges.push([currentStart, currentEnd]);
+      currentStart = -1;
+      currentEnd = -1;
       currentHeight = 0;
     }
-    current.push(...block);
-    currentHeight += blockHeight;
+    if (currentStart < 0) currentStart = index;
+    currentEnd = blockEnd;
+    currentHeight += unitHeight;
     index = blockEnd + 1;
   }
-  if (current.length > 0) fragments.push([...headerRows, ...current]);
+  if (currentStart >= 0) fragmentRanges.push([currentStart, currentEnd]);
+
+  const placements = computeCellPlacements(rows, columnCount);
+  const owners = [];
+  rows.forEach((row, rowIndex) => row.cells.forEach((cell, cellIndex) => owners.push({
+    cell,
+    rowIndex,
+    columnIndex: placements[rowIndex][cellIndex],
+    endRowIndex: Math.min(rows.length - 1, rowIndex + Math.max(1, cell.rowSpan || 1) - 1),
+  })));
+  const bodySourceIndexes = bodyRows.map((row) => rows.indexOf(row));
+  const sliceRows = (bodyStart, bodyEnd) => {
+    const sourceStart = bodySourceIndexes[bodyStart];
+    const sourceEnd = bodySourceIndexes[bodyEnd];
+    const sliced = [];
+    for (let sourceIndex = sourceStart; sourceIndex <= sourceEnd; sourceIndex += 1) {
+      const starting = owners.filter((owner) => owner.rowIndex === sourceIndex);
+      const continuing = sourceIndex === sourceStart
+        ? owners.filter((owner) => owner.rowIndex < sourceStart && owner.endRowIndex >= sourceStart)
+        : [];
+      const cells = [...starting, ...continuing]
+        .sort((left, right) => left.columnIndex - right.columnIndex)
+        .map((owner) => {
+          const spanStart = Math.max(owner.rowIndex, sourceStart);
+          const spanEnd = Math.min(owner.endRowIndex, sourceEnd);
+          const continuation = owner.rowIndex < sourceStart;
+          return {
+            ...owner.cell,
+            rowSpan: Math.max(1, spanEnd - spanStart + 1),
+            // The first fragment owns the editable value. Later fragments carry a blank styled merge owner
+            // so the visual grouping, fills, widths and borders continue without duplicating report text.
+            values: continuation ? (owner.cell.values || []).map(() => '') : owner.cell.values,
+          };
+        });
+      sliced.push({ ...rows[sourceIndex], cells, docxSourceRow: rows[sourceIndex] });
+    }
+    return sliced;
+  };
+  const fragments = fragmentRanges.map(([start, end]) => [...headerRows, ...sliceRows(start, end)]);
   return fragments.length > 0 ? fragments : [rows];
 }
 
@@ -561,6 +664,11 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
   const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
   const datasets = normalizeDatasets(model, request);
   const { rows, columns } = tablixRows(item, request, globals, model);
+  // Closing rules are a data-table invariant, not a generic layout-table invariant. A static, borderless
+  // one/two-row tablix is frequently used only to position a section heading; synthesizing a bottom border
+  // there creates a line that the RDL never declared. Dynamic tablixes still receive the guaranteed closing
+  // edge, while declared borders on static tablixes continue through borderFor unchanged.
+  const enforceBottomClosure = rows.some((row) => row.isStatic === false);
   // Matrix tablixes expand to a data-dependent column grid; clamp uses the expanded natural width.
   const layoutItem = item.hasColumnGroups ? { ...item, columns, width: columns.reduce((sum, width) => sum + width, 0) } : item;
   const geometry = computeDocxTableGeometry(model, layoutItem);
@@ -584,12 +692,20 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
       }
     }
   });
-  const useNativePageFragments = structuredOptions?.nativePageFragments === true;
-  const fragments = useNativePageFragments ? fragmentRowsForWord(model, rows, rowMetrics) : [rows];
+  // Word disables native repeat-header (`w:tblHeader`) for any table that contains vertically-merged
+  // (rowSpan) cells. So a merged table with header rows can only repeat its header by physically redrawing it
+  // per page — page-fragment mode, where each page is a self-contained table starting with the header rows.
+  // Non-merged tables keep native reflow (w:tblHeader works and Word re-paginates on edit). A table that fits
+  // one page yields a single fragment either way, so this only changes tables that actually overflow.
+  const hasMergedCells = rows.some((row) => row.cells.some((cell) => (cell.rowSpan || 1) > 1));
+  const hasRepeatingHeader = rows.some((row) => row.isHeader);
+  const useNativePageFragments = structuredOptions?.nativePageFragments === true
+    || (hasRepeatingHeader && hasMergedCells);
+  const fragments = useNativePageFragments ? fragmentRowsForWord(model, rows, rowMetrics, geometry.gridTwips.length) : [rows];
   const metricByRow = new Map(rows.map((row, index) => [row, rowMetrics[index]]));
   const keepWithNextByRow = new Map(rows.map((row, index) => [row, keepWithNext[index]]));
   const tableContext = { fields: {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
-  const tableForRows = (fragmentRows, fragmentIndex) => {
+  const tableForRows = (fragmentRows) => {
     const fragmentPlacements = computeCellPlacements(fragmentRows, geometry.gridTwips.length);
     return new Table({
     layout: TableLayoutType.FIXED,
@@ -598,7 +714,8 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
     columnWidths: geometry.gridTwips,
     borders: borderFor(item.style, tableContext),
     rows: fragmentRows.map((row, rowIndex) => {
-      const rowMetric = metricByRow.get(row);
+      const sourceRow = row.docxSourceRow || row;
+      const rowMetric = metricByRow.get(sourceRow);
       return new TableRow({
       tableHeader: row.isHeader || undefined,
       cantSplit: row.isHeader || row.keepTogether || undefined,
@@ -608,7 +725,14 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
         const style = textbox?.style || item.style;
         // Container-only cells (content wrapped in a Rectangle) have no border-bearing item of their own,
         // so their edges come from the tablix style — matching the PDF renderer.
-        const borderStyle = cell.containerWrapped ? item.style : style;
+        let borderStyle = cell.containerWrapped ? item.style : style;
+        // Hard rule: the table's last row is always closed with a bottom border (cell borders win over the
+        // table border in Word, so enforcing it on the cell — not just tblBorders — is what makes it show).
+        // A vertically merged cell is declared only on its OWNER row; the final physical row contains no
+        // cell object for that covered column. Enforce the edge on every owner whose rowSpan reaches the
+        // fragment end, otherwise grouped columns remain open when the final row is a merge continuation.
+        const reachesFragmentBottom = rowIndex + Math.max(1, cell.rowSpan || 1) >= fragmentRows.length;
+        if (enforceBottomClosure && reachesFragmentBottom) borderStyle = withEnforcedBottom(borderStyle);
         const columnIndex = fragmentPlacements[rowIndex][index];
         const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1);
         const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
@@ -623,8 +747,7 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
           margins: { top: pointsToTwips(styleSize(style.paddingTop, context, 2)), right: pointsToTwips(styleSize(style.paddingRight, context, 2)), bottom: pointsToTwips(styleSize(style.paddingBottom, context, 2)), left: pointsToTwips(styleSize(style.paddingLeft, context, 2)) },
           children: textbox && !cell.hidden ? [paragraphForTextbox(textbox, context,
             hasPageFieldExpression(textbox) ? undefined : cellText(cell), {
-            pageBreakBefore: index === 0 && rowIndex === 0 && fragmentIndex > 0,
-            keepNext: keepWithNextByRow.get(row),
+            keepNext: keepWithNextByRow.get(sourceRow),
             indentLeft: index === 0 && row.indentLevel ? pointsToTwips(row.indentLevel * 12) : undefined,
             lineHeight: rowMetric?.lineHeights[index],
           })] : [new Paragraph('')],
@@ -634,21 +757,24 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
     }),
   });
   };
-  return fragments.map((fragment, index) => tableForRows(fragment, index));
+  // A pageBreakBefore inside the first table cell is ignored by some Word-compatible viewers, allowing the
+  // next fragment to begin in the remainder of the current page and overflow again. Put the break on a tiny
+  // standalone paragraph BETWEEN tables—the same reliable construct used for explicit RDL section breaks.
+  return fragments.flatMap((fragment, index) => [
+    ...(index > 0 ? [new Paragraph({ pageBreakBefore: true, spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } })] : []),
+    tableForRows(fragment),
+  ]);
 }
 
 function headerFooter(model, part, request, Kind, location) {
   if (!part) return undefined;
-  // A Word header/footer is materialized once and reused. Evaluating page-dependent RDL visibility as
-  // page 1 of 1 incorrectly hides constructs intended for every non-final page (a common SSRS repeated-
-  // header pattern). Use a representative middle page here; PAGE/NUMPAGES text itself is still emitted
-  // as live Word fields by fieldAwareChildren.
-  const context = { parameters: request.parameters || {}, globals: { PageNumber: 2, TotalPages: 3, ExecutionTime: new Date(), variables: model.variables || {} }, datasets: normalizeDatasets(model, request), dataset: [] };
+  const datasets = normalizeDatasets(model, request);
+  const context = { parameters: request.parameters || {}, globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: model.variables || {} }, datasets, dataset: [] };
   const origin = {
     x: model.page.marginLeft,
     y: location === 'footer' ? model.page.height - model.page.marginBottom - part.height : model.page.marginTop,
   };
-  return { default: new Kind({ children: childrenForItems(model, part.items, context, true, origin) }) };
+  return { default: new Kind({ children: childrenForItems(model, reusablePartItems(part.items), context, true, origin) }) };
 }
 
 async function chartParagraph(model, item, request, config, tempDir, context, index) {
@@ -715,9 +841,6 @@ export async function renderEditableDocx(model, request, config, tempDir) {
     sections: [{
       properties: {
         page: {
-          // A landscape-sized page must be declared landscape or Word reflows it and can spill pages.
-          // The docx library swaps width/height for landscape, so pass the pre-rotation (portrait)
-          // dimensions and let it produce the standard w>h landscape pgSz.
           size: landscape
             ? { width: pointsToTwips(model.page.height), height: pointsToTwips(model.page.width), orientation: PageOrientation.LANDSCAPE }
             : { width: pointsToTwips(model.page.width), height: pointsToTwips(model.page.height), orientation: PageOrientation.PORTRAIT },

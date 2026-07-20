@@ -31,7 +31,7 @@ const config = loadConfig({ ...process.env, RDL_TEMP_ROOT: tempRoot });
 const runner = new RenderRunner(config);
 const outputs = [];
 try {
-  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_VISUAL']) {
+  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_VISUAL', 'XLSX']) {
     const rendered = await runner.render({
       rdlBuffer: buffer,
       request: { output, outputFileName: 'combined-assurance-smoke', parameters, datasets },

@@ -42,12 +42,76 @@ export function styledTextForItem(item, context) {
   }));
 }
 
+// Flattens an item's styled paragraphs into text segments, each carrying its run (or paragraph) style, and —
+// when a specific text is requested (e.g. a materialized tablix cell's already-flattened value) — slices
+// those segments to that text so per-run styling (bold / colour / font) survives the flattening. Returns
+// null when the item has no paragraphs, or when the requested text is not a contiguous slice of the item's
+// own text (a cell combining several conditional textboxes), so callers fall back to a plain single-style
+// path. Shared by the PDF, DOCX, and Excel renderers so all three honour per-run styles identically.
+export function styledSegmentsForText(item, context, requestedText) {
+  const paragraphs = styledTextForItem(item, context);
+  if (!paragraphs) return null;
+  const segments = [];
+  let fullText = '';
+  for (const [paragraphIndex, paragraph] of paragraphs.entries()) {
+    for (const run of paragraph.runs) {
+      const text = String(run.text ?? '');
+      segments.push({ text, style: run.style || item.style, paragraphStyle: paragraph.style || item.style, paragraphIndex });
+      fullText += text;
+    }
+    if (paragraphIndex < paragraphs.length - 1) {
+      segments.push({ text: '\n', style: paragraph.style || item.style, paragraphStyle: paragraph.style || item.style, paragraphIndex });
+      fullText += '\n';
+    }
+  }
+  const target = requestedText === undefined ? fullText : String(requestedText ?? '');
+  if (target.length === 0) return { text: target, segments: [] };
+  let start = 0;
+  if (target !== fullText) {
+    if (fullText.startsWith(target)) start = 0;
+    else if (fullText.endsWith(target)) start = fullText.length - target.length;
+    else start = fullText.indexOf(target);
+    // A materialized cell can combine several conditional textboxes. If the override is not a contiguous
+    // slice of this textbox, retain the plain-text path rather than assigning misleading styles.
+    if (start < 0) return null;
+  }
+  const end = start + target.length;
+  let offset = 0;
+  const sliced = [];
+  for (const segment of segments) {
+    const segmentStart = offset;
+    const segmentEnd = offset + segment.text.length;
+    offset = segmentEnd;
+    const from = Math.max(start, segmentStart);
+    const to = Math.min(end, segmentEnd);
+    if (to <= from) continue;
+    sliced.push({ ...segment, text: segment.text.slice(from - segmentStart, to - segmentStart) });
+  }
+  return { text: target, segments: sliced };
+}
+
 export function textForItem(item, context) {
   const styled = styledTextForItem(item, context);
   if (styled) return normalizeDisplayText(styled.map((paragraph) => paragraph.runs.map((run) => run.text).join('')).join('\n'));
   const value = evaluateExpression(item.value, context);
   if (value === null || value === undefined) return '';
   return normalizeDisplayText(item.style?.format ? String(formatValue(value, styleValue(item.style.format, context))) : String(value));
+}
+
+// Hard rule: the last row of a tablix must be closed with a bottom border, even when the RDL leaves the
+// tablix/last-row bottom edge as None (or the row splits across a page). Returns the declared bottom border
+// when it is already a visible rule (Solid, or a conditional expression the row may resolve), otherwise a
+// Solid border matching another declared side of the same style (so the enforced edge picks up the table's
+// own colour/width), falling back to black 1pt. Shared by the PDF (outer fragment bottom) and DOCX (last-row
+// cell borders) so both renderers close the table identically.
+export function enforcedBottomBorder(style) {
+  const sides = style?.borders || (style?.border
+    ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
+    : null);
+  const visible = (border) => border && border.style !== undefined && !/^none$/i.test(String(border.style));
+  if (visible(sides?.bottom)) return sides.bottom;
+  const template = [sides?.left, sides?.right, sides?.top].find(visible);
+  return { style: 'Solid', color: template?.color ?? '#000000', width: template?.width ?? 1 };
 }
 
 export function normalizeDatasets(model, request) {

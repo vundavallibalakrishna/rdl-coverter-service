@@ -36,7 +36,7 @@ Use it two ways, both supported and both backed by the identical pipeline:
 | Requirement | Why |
 | --- | --- |
 | **Node.js ≥ 22** | ESM, native test runner |
-| **Poppler** (`pdftoppm`) | `DOCX_VISUAL`, and chart images in `DOCX_EDITABLE`/`XLSX` — rasterizes PDF/chart pages. `brew install poppler` / `apt install poppler-utils` |
+| **Poppler** (`pdftoppm`) | `DOCX_VISUAL`, and chart images in `DOCX_EDITABLE`/XLSX `DATA` mode — rasterizes PDF/chart pages. `brew install poppler` / `apt install poppler-utils` |
 | **Licensed fonts** | Production only. See [Fonts](#fonts) |
 
 `GET /readyz` (or `readiness(config)`) reports whether all three are actually satisfied.
@@ -124,7 +124,8 @@ curl -X POST http://localhost:7070/v1/render \
 ### Response headers
 
 `Content-Type`, sanitized `Content-Disposition`, `Content-Length`, `X-Request-Id`, `X-Page-Count`,
-`X-Render-Duration-Ms`, and for DOCX responses `X-Docx-Layout-Mode` plus
+`X-Render-Duration-Ms`; XLSX responses also include `X-Xlsx-Layout-Mode`. DOCX responses use
+`X-Docx-Layout-Mode` plus
 `X-Docx-Editable-Text-Ratio`. Structured DOCX responses also include
 `X-Docx-Native-Page-Fragments`; if a profile was applied they include `X-Docx-Profile-Id` and
 `X-Docx-Profile-Certified`. The artifact is rendered completely before any header is sent, so a `200` means
@@ -268,7 +269,7 @@ guaranteed temp cleanup. That isolation is a property of the pipeline, not of th
 | `PDF` | Directly from the normalized RDL model. | Selectable | Exact |
 | `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables and text. | Editable | Unknown — Word paginates |
 | `DOCX_VISUAL` | Renders PDF, rasterizes every page at 300 DPI, one full-page floating image per Word page. | Images | Exact |
-| `XLSX` | Native Excel workbook. Tablixes become styled cell blocks (fills, borders, merges, fonts); numbers and dates are written as live typed values with a translated Excel number format; charts and the logo embed as images. | Live cells | Not paginated (`null`) |
+| `XLSX` | Native Excel workbook. The default `REPORT` layout creates one native-cell worksheet per explicit RDL section; `DATA` preserves the legacy stacked/per-tablix export. | Live cells | Not paginated (`null`) |
 
 Because Word performs `DOCX_EDITABLE` pagination itself, the service cannot know the count: the library
 returns `pageCount: null` and the HTTP layer sends `X-Page-Count: unknown`. `XLSX` is also `pageCount: null`
@@ -276,8 +277,11 @@ returns `pageCount: null` and the HTTP layer sends `X-Page-Count: unknown`. `XLS
 
 Choose `DOCX_EDITABLE` when users need normal Word table editing and reflow (Word owns pagination, so page
 breaks will not match the PDF). Choose `DOCX_VISUAL` when page-for-page fidelity matters and editing is not
-required — it is one full-page image per page. Choose `XLSX` when the goal is the data itself — filtering,
-sorting, and pivoting live numbers — rather than page fidelity.
+required — it is one full-page image per page. Choose the default XLSX `REPORT` layout for an editable,
+PDF-styled workbook without PDF pagination. It splits only at explicit RDL page breaks, keeps layout and
+tablix content in native cells, repeats grouped values instead of vertically merging them, and permits only
+declared embedded RDL images as pictures. Set `"excel": { "layoutMode": "DATA" }` for the legacy data-first
+stacked workbook; `sheetPerTablix` remains available only in that mode.
 
 `DOCX_EDITABLE` can optionally split large tablixes into multiple native Word tables using PDF-like page
 break estimates (`"docx": { "nativePageFragments": true }` on a render request; the legacy
@@ -332,6 +336,8 @@ The service fails generation if package protection or a text-edit lock is detect
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
 | `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Experimental native-table page fragmentation for certified report/data combinations. |
+| `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
+| `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
 | `outputFileName` | — | Sanitized for `Content-Disposition`; also `Globals!ReportName`. |
 
 > **`datasets` rows are keyed by the exact RDL `DataField` name — not the field `Name`.**

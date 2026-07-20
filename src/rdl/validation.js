@@ -322,11 +322,12 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
   const firstDynamic = tablix.rows.findIndex((row, index) => (
     row.cells.some((cell) => cell.items.some(itemUsesFields)) || memberPaths[index]?.some((member) => member.group)
   ));
-  let repeatingHeaderCount = 0;
-  if (firstDynamic > 0 && tablix.repeatColumnHeaders) repeatingHeaderCount = firstDynamic;
-  else if (firstDynamic > 0) {
-    while (repeatingHeaderCount < firstDynamic && memberPaths[repeatingHeaderCount]?.some((member) => member.repeatOnNewPage)) repeatingHeaderCount += 1;
-  }
+  // Hard rule: a tablix's static column-header rows (everything above the first dynamic/detail row) repeat on
+  // every page, regardless of whether the RDL sets RepeatColumnHeaders / a member's RepeatOnNewPage. SSRS
+  // leaves this opt-in, but a multi-page table whose header does not repeat is unreadable, so the service
+  // always repeats it. Both renderers key page-repeated headers off `isHeader`, so this drives PDF and DOCX
+  // (w:tblHeader) alike. When there is no dynamic row (firstDynamic < 0) there is nothing to repeat.
+  const repeatingHeaderCount = firstDynamic > 0 ? firstDynamic : 0;
   const output = [];
   const duplicateState = new Map();
   for (const [index, row] of tablix.rows.entries()) {

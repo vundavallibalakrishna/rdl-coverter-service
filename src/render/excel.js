@@ -1,9 +1,13 @@
 import ExcelJS from 'exceljs';
+import PDFDocument from 'pdfkit';
+import { ServiceError } from '../errors.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
+import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
+import { measureTextboxHeight } from './pdf.js';
 import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
 
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
@@ -235,7 +239,7 @@ async function writeItem(workbook, worksheet, model, item, request, globals, con
 
 function newSheet(workbook, model, name) {
   return workbook.addWorksheet(name, {
-    views: [{ state: 'frozen', ySplit: 0 }],
+    views: [{ state: 'normal' }],
     pageSetup: { orientation: model.page.width > model.page.height ? 'landscape' : 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 },
   });
 }
@@ -255,7 +259,7 @@ async function fillSheet(workbook, worksheet, model, items, request, globals, co
   return Math.max(0, cursor - 1);
 }
 
-export async function renderExcel(model, request, config, tempDir) {
+async function renderDataExcel(model, request, config, tempDir) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'RDL Converter Service';
   workbook.title = request.outputFileName || model.name || 'Report';
@@ -296,5 +300,578 @@ export async function renderExcel(model, request, config, tempDir) {
     layoutMode: 'spreadsheet',
     sheetCount: workbook.worksheets.length,
     rowCount,
+  };
+}
+
+const POINT_PRECISION = 4; // quarter-point geometry, matching the PDF shared-edge coordinate key
+const MAX_EXCEL_ROW_HEIGHT = 409;
+
+function point(value) {
+  return Math.round(Number(value || 0) * POINT_PRECISION) / POINT_PRECISION;
+}
+
+function visiblePageBreak(item, context) {
+  if (!item.pageBreak || isHidden(item.pageBreak.disabled, context)) return 'None';
+  return String(item.pageBreak.location || 'None');
+}
+
+export function resolveExcelLayoutMode(request = {}) {
+  const requested = request.excel?.layoutMode;
+  if (requested !== undefined && requested !== null && String(requested).trim() !== '') {
+    const mode = String(requested).trim().toUpperCase();
+    if (!['REPORT', 'DATA'].includes(mode)) throw new ServiceError('RDL_INVALID', `Unsupported Excel layoutMode: ${requested}`);
+    if (mode === 'REPORT' && request.excel?.sheetPerTablix === true) {
+      throw new ServiceError('RDL_INVALID', 'excel.sheetPerTablix is only valid with excel.layoutMode DATA');
+    }
+    return mode;
+  }
+  // Backward compatibility for callers that already explicitly selected the old per-tablix workbook.
+  if (request.excel?.sheetPerTablix === true) return 'DATA';
+  return 'REPORT';
+}
+
+function uniqueSheetName(workbook, requested, fallback) {
+  const base = sheetName(requested, fallback);
+  const existing = new Set(workbook.worksheets.map((sheet) => sheet.name.toLowerCase()));
+  if (!existing.has(base.toLowerCase())) return base;
+  for (let suffix = 2; suffix < 10_000; suffix += 1) {
+    const marker = ` (${suffix})`;
+    const candidate = `${base.slice(0, 31 - marker.length)}${marker}`;
+    if (!existing.has(candidate.toLowerCase())) return candidate;
+  }
+  throw new ServiceError('RDL_INVALID', 'Excel worksheet names could not be made unique');
+}
+
+function partitionReportSections(model, context) {
+  const items = [...(model.body.items || [])]
+    .filter((item) => !isHidden(item.hidden, context))
+    .sort((left, right) => left.top - right.top || left.left - right.left || left.zIndex - right.zIndex);
+  const sections = [];
+  let current = [];
+  const finish = () => {
+    if (current.length) sections.push(current);
+    current = [];
+  };
+  for (const item of items) {
+    const location = visiblePageBreak(item, context);
+    if (/^(Start|StartAndEnd)$/i.test(location)) finish();
+    current.push(item);
+    if (/^(End|StartAndEnd)$/i.test(location)) finish();
+  }
+  finish();
+  return sections.length ? sections : [[]];
+}
+
+function firstVisibleText(items, model, request, globals) {
+  const datasets = normalizeDatasets(model, request);
+  const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets };
+  const visit = (item) => {
+    if (item.type === 'Textbox') {
+      try {
+        const value = String(textForItem(item, context) || '').replace(/\s+/g, ' ').trim();
+        if (value) return value;
+      } catch { /* a field-scoped textbox is not a stable section title */ }
+    }
+    if (item.type === 'Tablix') {
+      try {
+        const { rows } = tablixRows(item, request, globals, model);
+        for (const row of rows.slice(0, 3)) {
+          for (const cell of row.cells) {
+            const value = cellText(cell).replace(/\s+/g, ' ').trim();
+            if (value) return value;
+          }
+        }
+      } catch { /* validation/rendering reports the real error later */ }
+    }
+    for (const child of [...(item.items || [])].sort((a, b) => a.top - b.top || a.left - b.left)) {
+      const value = visit(child);
+      if (value) return value;
+    }
+    return '';
+  };
+  for (const item of items) {
+    const value = visit(item);
+    if (value) return value;
+  }
+  return '';
+}
+
+function excelWidthFromPoints(points) {
+  const pixels = Math.max(1, points * (96 / 72));
+  return Math.max(0.2, pixels <= 12 ? pixels / 12 : (pixels - 5) / 7);
+}
+
+function tablixLayout(item, request, globals, model, cache) {
+  if (cache.has(item)) return cache.get(item);
+  const materialized = tablixRows(item, request, globals, model);
+  const layoutItem = item.hasColumnGroups
+    ? { ...item, columns: materialized.columns, width: materialized.columns.reduce((sum, width) => sum + width, 0) }
+    : { ...item, columns: materialized.columns };
+  const { columnsPt } = resolveGridColumns(layoutItem);
+  const result = { rows: materialized.rows, columns: columnsPt };
+  cache.set(item, result);
+  return result;
+}
+
+function collectXBoundaries(items, request, globals, model, tablixCache, target, parentLeft = 0) {
+  for (const item of items || []) {
+    const left = point(parentLeft + (item.left || 0));
+    const right = point(left + (item.width || 0));
+    target.add(left);
+    target.add(right);
+    if (item.type === 'Tablix') {
+      let cursor = left;
+      for (const width of tablixLayout(item, request, globals, model, tablixCache).columns) {
+        cursor = point(cursor + width);
+        target.add(cursor);
+      }
+    }
+    collectXBoundaries(item.items, request, globals, model, tablixCache, target, left);
+  }
+}
+
+function reportGrid(model, section, request, globals, tablixCache) {
+  const boundaries = new Set([0]);
+  collectXBoundaries(model.page.header?.items || [], request, globals, model, tablixCache, boundaries);
+  collectXBoundaries(section, request, globals, model, tablixCache, boundaries);
+  const maximum = Math.max(...boundaries, point(model.page.width - model.page.marginLeft - model.page.marginRight));
+  boundaries.add(maximum);
+  const values = [...boundaries].filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b);
+  if (values.length < 2) values.push(point(maximum || 100));
+  return values;
+}
+
+function boundaryIndex(boundaries, value) {
+  const expected = point(value);
+  const index = boundaries.findIndex((candidate) => candidate === expected);
+  if (index < 0) throw new ServiceError('RDL_INVALID', `Excel layout boundary is not on the section grid: ${expected}`);
+  return index;
+}
+
+function gridRange(boundaries, left, width) {
+  const start = boundaryIndex(boundaries, left);
+  const end = boundaryIndex(boundaries, left + width);
+  if (end <= start) throw new ServiceError('RDL_INVALID', 'Excel layout item has an empty grid range');
+  return { startCol: start + 1, endCol: end };
+}
+
+function excelFont(style, context) {
+  const decoration = String(styleValue(style?.textDecoration, context, 'None'));
+  return {
+    name: String(styleValue(style?.fontFamily, context, 'Arial')),
+    size: styleSize(style?.fontSize, context, 10) || 10,
+    bold: /bold|[6-9]00/i.test(String(styleValue(style?.fontWeight, context, 'Normal'))),
+    italic: /italic/i.test(String(styleValue(style?.fontStyle, context, 'Normal'))),
+    underline: /underline/i.test(decoration),
+    strike: /line.?through/i.test(decoration),
+    color: { argb: `FF${hex(styleColor(style?.color, context, '#000000'), '000000')}` },
+  };
+}
+
+function richTextValue(textbox, context, requestedText) {
+  if (!textbox?.paragraphs) return null;
+  const paragraphs = styledTextForItem(textbox, context);
+  if (!paragraphs) return null;
+  const richText = [];
+  let fullText = '';
+  paragraphs.forEach((paragraph, paragraphIndex) => {
+    paragraph.runs.forEach((run) => {
+      const text = String(run.text ?? '');
+      fullText += text;
+      if (text) richText.push({ text, font: excelFont(run.style || textbox.style, context) });
+    });
+    if (paragraphIndex < paragraphs.length - 1) {
+      fullText += '\n';
+      richText.push({ text: '\n', font: excelFont(paragraph.style || textbox.style, context) });
+    }
+  });
+  if (fullText !== String(requestedText ?? '')) return null;
+  // Keep ordinary one-run strings as normal Excel text cells. Rich text is only necessary when the RDL
+  // actually has multiple run/paragraph boundaries; this preserves normal filtering and value typing.
+  return richText.length > 1 ? { richText } : null;
+}
+
+function applyFillFontAlignment(cell, style, context) {
+  const fill = hex(styleColor(style?.backgroundColor, context, null));
+  if (fill) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
+  cell.font = excelFont(style, context);
+  const vertical = String(styleValue(style?.verticalAlign, context, 'Top'));
+  const horizontal = String(styleValue(style?.textAlign, context, 'Left'));
+  cell.alignment = {
+    vertical: /bottom/i.test(vertical) ? 'bottom' : /middle|center/i.test(vertical) ? 'middle' : 'top',
+    horizontal: /center/i.test(horizontal) ? 'center' : /right/i.test(horizontal) ? 'right' : /justify/i.test(horizontal) ? 'justify' : 'left',
+    wrapText: true,
+  };
+}
+
+function applyRegionStyle(worksheet, range, style, context) {
+  const borders = style?.borders || {};
+  for (let row = range.startRow; row <= range.endRow; row += 1) {
+    for (let column = range.startCol; column <= range.endCol; column += 1) {
+      const cell = worksheet.getCell(row, column);
+      applyFillFontAlignment(cell, style, context);
+      cell.border = {
+        top: row === range.startRow ? excelBorderSide(borders.top, context) : undefined,
+        bottom: row === range.endRow ? excelBorderSide(borders.bottom, context) : undefined,
+        left: column === range.startCol ? excelBorderSide(borders.left, context) : undefined,
+        right: column === range.endCol ? excelBorderSide(borders.right, context) : undefined,
+      };
+    }
+  }
+}
+
+function rangesOverlap(left, right) {
+  return left.startRow <= right.endRow && right.startRow <= left.endRow
+    && left.startCol <= right.endCol && right.startCol <= left.endCol;
+}
+
+function mergeSafe(worksheet, range, merges) {
+  if (range.startRow === range.endRow && range.startCol === range.endCol) return;
+  if (merges.some((existing) => rangesOverlap(existing, range))) {
+    throw new ServiceError('RDL_INVALID', 'RDL produced overlapping Excel merged-cell ranges');
+  }
+  worksheet.mergeCells(range.startRow, range.startCol, range.endRow, range.endCol);
+  merges.push(range);
+}
+
+function allocateHeightRows(worksheet, boundaries, startRow) {
+  for (let index = 0; index < boundaries.length - 1; index += 1) {
+    const height = boundaries[index + 1] - boundaries[index];
+    if (height > MAX_EXCEL_ROW_HEIGHT) throw new ServiceError('UNSUPPORTED_FEATURE', 'An Excel layout row exceeds the 409-point row-height limit');
+    worksheet.getRow(startRow + index).height = Math.max(2, height);
+  }
+  return boundaries.length - 1;
+}
+
+function collectYBoundaries(items, target, parentTop = 0) {
+  for (const item of items || []) {
+    const top = point(parentTop + (item.top || 0));
+    const bottom = point(top + (item.height || 0));
+    target.add(top);
+    target.add(bottom);
+    collectYBoundaries(item.items, target, top);
+  }
+}
+
+function freeformRows(worksheet, items, height, startRow) {
+  const boundaries = new Set([0, point(height)]);
+  collectYBoundaries(items, boundaries);
+  const values = [...boundaries].filter((value) => value >= 0 && value <= point(height)).sort((a, b) => a - b);
+  allocateHeightRows(worksheet, values, startRow);
+  return values;
+}
+
+function rowRange(boundaries, startRow, top, height) {
+  const from = boundaryIndex(boundaries, top);
+  const to = boundaryIndex(boundaries, top + height);
+  return { startRow: startRow + from, endRow: startRow + to - 1 };
+}
+
+function addEmbeddedImage(workbook, worksheet, model, item, range, context) {
+  if (item.source !== 'Embedded') return;
+  const image = model.embeddedImages?.[styleValue(item.value, context, item.value)];
+  if (!image?.data) throw new ServiceError('UNSUPPORTED_FEATURE', `Embedded Excel image is unavailable: ${item.name || 'unnamed'}`);
+  const buffer = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
+  const id = workbook.addImage({ buffer, extension: imageExtension(buffer) });
+  worksheet.addImage(id, {
+    tl: { col: range.startCol - 1, row: range.startRow - 1 },
+    br: { col: range.endCol, row: range.endRow },
+    editAs: 'oneCell',
+  });
+}
+
+function renderFreeformItem({ workbook, worksheet, model, item, context, xGrid, yGrid, startRow, merges, parentLeft = 0, parentTop = 0 }) {
+  if (isHidden(item.hidden, context)) return;
+  const left = point(parentLeft + (item.left || 0));
+  const top = point(parentTop + (item.top || 0));
+  const columns = gridRange(xGrid, left, item.width || 0);
+  const rows = rowRange(yGrid, startRow, top, item.height || 0);
+  const range = { ...columns, ...rows };
+  if (item.type === 'Chart') throw new ServiceError('UNSUPPORTED_FEATURE', 'Charts are not supported in Excel REPORT mode without drawings; use excel.layoutMode DATA');
+  if (item.type === 'Image') {
+    addEmbeddedImage(workbook, worksheet, model, item, range, context);
+    return;
+  }
+  if (item.type === 'Line') {
+    const border = item.style?.border || item.style?.borders?.top;
+    if ((item.width || 0) >= (item.height || 0)) {
+      for (let column = range.startCol; column <= range.endCol; column += 1) worksheet.getCell(range.startRow, column).border = { top: excelBorderSide(border, context) };
+    } else {
+      for (let row = range.startRow; row <= range.endRow; row += 1) worksheet.getCell(row, range.startCol).border = { left: excelBorderSide(border, context) };
+    }
+    return;
+  }
+  applyRegionStyle(worksheet, range, item.style || {}, context);
+  if (item.type === 'Textbox') {
+    mergeSafe(worksheet, range, merges);
+    const text = cellString(textForItem(item, context));
+    const target = worksheet.getCell(range.startRow, range.startCol);
+    target.value = richTextValue(item, context, text) || text;
+    applyFillFontAlignment(target, item.style || {}, context);
+    return;
+  }
+  if (item.type === 'Rectangle') {
+    for (const child of [...(item.items || [])].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
+      renderFreeformItem({ workbook, worksheet, model, item: child, context, xGrid, yGrid, startRow, merges, parentLeft: left, parentTop: top });
+    }
+  }
+}
+
+function renderFreeformBand({ workbook, worksheet, model, items, height, context, xGrid, startRow, merges }) {
+  const yGrid = freeformRows(worksheet, items, height, startRow);
+  for (const item of [...items].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
+    renderFreeformItem({ workbook, worksheet, model, item, context, xGrid, yGrid, startRow, merges });
+  }
+  return yGrid.length - 1;
+}
+
+function cellStyle(item, cell, context) {
+  const textbox = cellTextbox(cell);
+  return { textbox, style: (cell.containerWrapped ? item.style : textbox?.style) || item.style, context };
+}
+
+function resolvedOwnerBorder(owner, side) {
+  const border = owner.style?.borders?.[side];
+  if (!border || /^none$/i.test(String(styleValue(border.style, owner.context, 'None')))) return null;
+  return excelBorderSide(border, owner.context);
+}
+
+function repeatedCellBorders(gridOwners, rowIndex, columnIndex, owner) {
+  const span = owner.cell.colSpan || 1;
+  const above = rowIndex > 0 ? gridOwners[rowIndex - 1][columnIndex] : null;
+  const below = rowIndex + 1 < gridOwners.length ? gridOwners[rowIndex + 1][columnIndex] : null;
+  const left = columnIndex > 0 ? gridOwners[rowIndex][columnIndex - 1] : null;
+  const right = columnIndex + span < gridOwners[rowIndex].length ? gridOwners[rowIndex][columnIndex + span] : null;
+  return {
+    top: above === owner ? undefined : resolvedOwnerBorder(owner, 'top') || (above && resolvedOwnerBorder(above, 'bottom')) || undefined,
+    bottom: below === owner ? undefined : resolvedOwnerBorder(owner, 'bottom') || (below && resolvedOwnerBorder(below, 'top')) || undefined,
+    left: resolvedOwnerBorder(owner, 'left') || (left && resolvedOwnerBorder(left, 'right')) || undefined,
+    right: resolvedOwnerBorder(owner, 'right') || (right && resolvedOwnerBorder(right, 'left')) || undefined,
+  };
+}
+
+function renderReportTablix({ worksheet, model, item, request, globals, config, xGrid, startRow, merges, tablixCache, measureDoc }) {
+  const { rows, columns } = tablixLayout(item, request, globals, model, tablixCache);
+  const placements = computeCellPlacements(rows, columns.length);
+  const datasets = normalizeDatasets(model, request);
+  const gridOwners = rows.map(() => new Array(columns.length).fill(null));
+  const columnOffsets = [0];
+  columns.forEach((width) => columnOffsets.push(point(columnOffsets[columnOffsets.length - 1] + width)));
+
+  rows.forEach((row, rowIndex) => {
+    const context = { fields: row.fields || {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
+    row.cells.forEach((cell, cellIndex) => {
+      const start = placements[rowIndex][cellIndex];
+      if (start === undefined || start < 0) return;
+      const presentation = cellStyle(item, cell, context);
+      const owner = { cell, rowIndex, start, ...presentation };
+      for (let r = 0; r < Math.max(1, cell.rowSpan || 1) && rowIndex + r < rows.length; r += 1) {
+        for (let c = 0; c < Math.max(1, cell.colSpan || 1) && start + c < columns.length; c += 1) {
+          if (gridOwners[rowIndex + r][start + c]) throw new ServiceError('RDL_INVALID', 'RDL produced overlapping Excel tablix cells');
+          gridOwners[rowIndex + r][start + c] = owner;
+        }
+      }
+    });
+  });
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const excelRow = startRow + rowIndex;
+    let measuredHeight = rows[rowIndex].height || DEFAULT_ROW_POINTS;
+    for (let columnIndex = 0; columnIndex < columns.length;) {
+      const owner = gridOwners[rowIndex][columnIndex];
+      if (!owner) { columnIndex += 1; continue; }
+      if (columnIndex !== owner.start) { columnIndex += 1; continue; }
+      const span = Math.max(1, owner.cell.colSpan || 1);
+      const left = point((item.left || 0) + columnOffsets[columnIndex]);
+      const width = point(columnOffsets[columnIndex + span] - columnOffsets[columnIndex]);
+      const columnsRange = gridRange(xGrid, left, width);
+      const range = { startRow: excelRow, endRow: excelRow, ...columnsRange };
+      // The section-wide coordinate grid also contains boundaries from unrelated report items (for example,
+      // a logo edge can fall inside a tablix column). A single logical RDL cell may therefore cover several
+      // physical Excel columns even when its ColSpan is 1. Merge the occupied Excel region, not merely RDL
+      // spans, or the extra grid slices appear as blank gaps inside the table.
+      if (range.startCol !== range.endCol) mergeSafe(worksheet, range, merges);
+      const target = worksheet.getCell(excelRow, range.startCol);
+      const { value, numFmt } = excelCellValue(owner.cell, owner.context);
+      const display = cellText(owner.cell);
+      target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
+      if (numFmt) target.numFmt = numFmt;
+      applyFillFontAlignment(target, owner.style || {}, owner.context);
+      target.border = repeatedCellBorders(gridOwners, rowIndex, columnIndex, owner);
+      if (owner.textbox && display) {
+        const textHeight = measureTextboxHeight(measureDoc, config, owner.textbox, owner.context, display, width)
+          + styleSize(owner.style?.paddingTop, owner.context, 2) + styleSize(owner.style?.paddingBottom, owner.context, 2);
+        measuredHeight = Math.max(measuredHeight, textHeight);
+      }
+      columnIndex += span;
+    }
+    if (measuredHeight > MAX_EXCEL_ROW_HEIGHT) throw new ServiceError('UNSUPPORTED_FEATURE', 'Rendered Excel cell text exceeds the 409-point row-height limit');
+    worksheet.getRow(excelRow).height = Math.max(2, measuredHeight);
+  }
+
+  const headerRows = rows.filter((row) => row.isHeader).length;
+  const tableRange = gridRange(xGrid, point(item.left || 0), columnOffsets[columnOffsets.length - 1]);
+  const fixedLogicalColumns = Math.min(
+    item.rowHeaderColumns?.length || 0,
+    (item.rowMemberPaths || []).filter((path) => path.some((member) => member.fixedData)).length,
+  );
+  const fixedColumnsSplit = fixedLogicalColumns > 0
+    ? gridRange(xGrid, point(item.left || 0), columnOffsets[fixedLogicalColumns]).endCol
+    : 0;
+  return {
+    rowsConsumed: rows.length,
+    startRow,
+    endRow: startRow + rows.length - 1,
+    headerRows,
+    dynamic: rows.some((row) => !row.isHeader && !row.isStatic),
+    fixedColumnsSplit,
+    ...tableRange,
+  };
+}
+
+function addGapRows(worksheet, startRow, points) {
+  let remaining = Math.max(0, points);
+  let rows = 0;
+  while (remaining > 0.5) {
+    const height = Math.min(MAX_EXCEL_ROW_HEIGHT, remaining);
+    worksheet.getRow(startRow + rows).height = Math.max(2, height);
+    remaining -= height;
+    rows += 1;
+  }
+  return rows;
+}
+
+function footerText(model, request, globals, reportWidth) {
+  const slots = { left: [], center: [], right: [] };
+  const datasets = normalizeDatasets(model, request);
+  const footerGlobals = { ...globals, PageNumber: '&P', TotalPages: '&N' };
+  const context = { parameters: request.parameters || {}, globals: footerGlobals, fields: {}, dataset: [], datasets };
+  const visit = (item, parentLeft = 0) => {
+    if (item.type === 'Textbox' && !isHidden(item.hidden, context)) {
+      const center = parentLeft + (item.left || 0) + (item.width || 0) / 2;
+      const slot = center < reportWidth / 3 ? 'left' : center > reportWidth * 2 / 3 ? 'right' : 'center';
+      const value = String(textForItem(item, context) || '').trim();
+      if (value) slots[slot].push(value);
+    }
+    for (const child of item.items || []) visit(child, parentLeft + (item.left || 0));
+  };
+  for (const item of model.page.footer?.items || []) visit(item);
+  return `&L${slots.left.join(' | ')}&C${slots.center.join(' | ')}&R${slots.right.join(' | ')}`;
+}
+
+function configureReportSheet(worksheet, model, request, globals, usedRows, usedColumns, detailRegions, headerBandRows, reportWidth) {
+  const candidate = detailRegions.length === 1 ? detailRegions[0] : null;
+  const ySplit = candidate?.headerRows > 0 ? candidate.startRow + candidate.headerRows - 1 : 0;
+  const xSplit = candidate?.fixedColumnsSplit || 0;
+  if (xSplit > 0 || ySplit > 0) {
+    const topLeftCell = worksheet.getCell(ySplit + 1, xSplit + 1).address;
+    worksheet.views = [{ state: 'frozen', xSplit: xSplit || undefined, ySplit: ySplit || undefined, topLeftCell, showGridLines: false }];
+    if (ySplit > 0) worksheet.pageSetup.printTitlesRow = `${candidate.startRow}:${ySplit}`;
+  } else {
+    worksheet.views = [{ state: 'normal', showGridLines: false }];
+    if (headerBandRows > 0) worksheet.pageSetup.printTitlesRow = `1:${headerBandRows}`;
+  }
+  if (candidate?.headerRows > 0) {
+    worksheet.autoFilter = {
+      from: { row: ySplit, column: candidate.startCol },
+      to: { row: candidate.endRow, column: candidate.endCol },
+    };
+  }
+  worksheet.pageSetup.orientation = model.page.width > model.page.height ? 'landscape' : 'portrait';
+  worksheet.pageSetup.paperSize = 9; // ISO A4
+  worksheet.pageSetup.fitToPage = true;
+  worksheet.pageSetup.fitToWidth = 1;
+  worksheet.pageSetup.fitToHeight = 0;
+  worksheet.pageSetup.margins = {
+    left: model.page.marginLeft / 72,
+    right: model.page.marginRight / 72,
+    top: model.page.marginTop / 72,
+    bottom: model.page.marginBottom / 72,
+    header: 0.1,
+    footer: 0.1,
+  };
+  if (usedRows > 0 && usedColumns > 0) worksheet.pageSetup.printArea = `A1:${worksheet.getColumn(usedColumns).letter}${usedRows}`;
+  const footer = footerText(model, request, globals, reportWidth);
+  worksheet.headerFooter = { oddFooter: footer, evenFooter: footer };
+}
+
+async function renderReportExcel(model, request, config) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'RDL Converter Service';
+  workbook.title = request.outputFileName || model.name || 'Report';
+  workbook.calcProperties.fullCalcOnLoad = true;
+  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
+  const datasets = normalizeDatasets(model, request);
+  const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets };
+  const sections = partitionReportSections(model, context);
+  const tablixCache = new Map();
+  const measureDoc = new PDFDocument({ autoFirstPage: false });
+  // PDFKit's colour/font state is page-backed even when no bytes are being collected. A private measuring
+  // page gives XLSX the exact PDF text metrics without producing or embedding a PDF artifact.
+  measureDoc.addPage({ size: [1000, 1000], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+  let rowCount = 0;
+
+  for (let index = 0; index < sections.length; index += 1) {
+    const section = sections[index];
+    const title = firstVisibleText(section, model, request, globals);
+    const name = uniqueSheetName(workbook, title, `Section ${index + 1}`);
+    const worksheet = workbook.addWorksheet(name);
+    const xGrid = reportGrid(model, section, request, globals, tablixCache);
+    for (let column = 0; column < xGrid.length - 1; column += 1) {
+      worksheet.getColumn(column + 1).width = excelWidthFromPoints(xGrid[column + 1] - xGrid[column]);
+    }
+    const merges = [];
+    let cursor = 1;
+    let headerBandRows = 0;
+    if (model.page.header?.items?.length) {
+      headerBandRows = renderFreeformBand({
+        workbook, worksheet, model, items: model.page.header.items, height: model.page.header.height,
+        context, xGrid, startRow: cursor, merges,
+      });
+      cursor += headerBandRows;
+    }
+    const detailRegions = [];
+    let previousDesignBottom = null;
+    for (const item of section) {
+      const gap = previousDesignBottom === null ? 0 : Math.max(0, (item.top || 0) - previousDesignBottom);
+      cursor += addGapRows(worksheet, cursor, gap);
+      if (item.type === 'Tablix') {
+        const region = renderReportTablix({ worksheet, model, item, request, globals, config, xGrid, startRow: cursor, merges, tablixCache, measureDoc });
+        cursor += region.rowsConsumed;
+        if (region.dynamic) detailRegions.push(region);
+      } else if (item.type === 'Chart') {
+        throw new ServiceError('UNSUPPORTED_FEATURE', 'Charts are not supported in Excel REPORT mode without drawings; use excel.layoutMode DATA');
+      } else {
+        const height = Math.max(2, item.height || DEFAULT_ROW_POINTS);
+        const rows = renderFreeformBand({ workbook, worksheet, model, items: [{ ...item, top: 0 }], height, context, xGrid, startRow: cursor, merges });
+        cursor += rows;
+      }
+      previousDesignBottom = Math.max(previousDesignBottom ?? 0, (item.top || 0) + (item.height || 0));
+    }
+    const usedRows = Math.max(1, cursor - 1);
+    rowCount += usedRows;
+    configureReportSheet(worksheet, model, request, globals, usedRows, xGrid.length - 1, detailRegions, headerBandRows, xGrid[xGrid.length - 1]);
+  }
+  if (!workbook.worksheets.length) workbook.addWorksheet('Section 1', { views: [{ state: 'normal', showGridLines: false }] });
+  const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+  measureDoc.end();
+  return {
+    buffer,
+    pageCount: null,
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    extension: 'xlsx',
+    layoutMode: 'report-sections',
+    sheetCount: workbook.worksheets.length,
+    rowCount,
+  };
+}
+
+export async function renderExcel(model, request, config, tempDir) {
+  const mode = resolveExcelLayoutMode(request);
+  if (mode === 'REPORT') return renderReportExcel(model, request, config);
+  const rendered = await renderDataExcel(model, request, config, tempDir);
+  return {
+    ...rendered,
+    layoutMode: request.excel?.sheetPerTablix === true ? 'data-per-tablix' : 'data-stacked',
   };
 }

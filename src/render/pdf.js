@@ -1,6 +1,6 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
-import { color, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, styledTextForItem, tablixRows, textForItem, cellText, cellTextbox } from './common.js';
+import { color, enforcedBottomBorder, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem, cellText, cellTextbox } from './common.js';
 import { pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -38,6 +38,20 @@ function drawBorderEdge(doc, x, y, width, height, side, border, context = {}) {
     bottom: [x, y + height, x + width, y + height], left: [x, y, x, y + height],
   };
   const [x1, y1, x2, y2] = segments[side];
+  // Double: two parallel strands with a gap between them (line + gap + line, each ~1/3 of the nominal width —
+  // the CSS/OOXML double-border model). PDFKit has no double line style, so it is drawn explicitly. This
+  // keeps the PDF in parity with the editable DOCX (which maps Double -> a real double rule) and with SSRS,
+  // which renders Double as two rules rather than one thick line. Solid/dashed/dotted are unaffected.
+  if (/double/i.test(borderStyle)) {
+    const strand = Math.max(0.25, borderWidth / 3);
+    const vertical = x1 === x2;
+    const [ox, oy] = vertical ? [strand, 0] : [0, strand]; // offset perpendicular to the edge
+    doc.save().lineWidth(strand).strokeColor(borderColor).lineCap('square').lineJoin('miter');
+    doc.moveTo(x1 - ox, y1 - oy).lineTo(x2 - ox, y2 - oy).stroke();
+    doc.moveTo(x1 + ox, y1 + oy).lineTo(x2 + ox, y2 + oy).stroke();
+    doc.restore();
+    return;
+  }
   doc.save().lineWidth(Math.max(borderWidth, borderWidthFloor)).strokeColor(borderColor);
   if (/dash/i.test(borderStyle)) doc.dash(Math.max(2, borderWidth * 3));
   else if (/dot/i.test(borderStyle)) doc.dash(Math.max(1, borderWidth), { space: Math.max(1, borderWidth * 2) });
@@ -66,54 +80,6 @@ function renderedTextHeight(doc, text, width) {
   const lineHeight = doc.currentLineHeight(true);
   return lines.reduce((total, line) => total
     + (line.includes(' ') ? doc.heightOfString(line, { width, lineGap: 0 }) : lineHeight), 0);
-}
-
-function styledSegmentsForText(item, context, requestedText) {
-  const paragraphs = styledTextForItem(item, context);
-  if (!paragraphs) return null;
-  const segments = [];
-  let fullText = '';
-  for (const [paragraphIndex, paragraph] of paragraphs.entries()) {
-    for (const run of paragraph.runs) {
-      const text = String(run.text ?? '');
-      segments.push({ text, style: run.style || item.style, paragraphStyle: paragraph.style || item.style, paragraphIndex });
-      fullText += text;
-    }
-    if (paragraphIndex < paragraphs.length - 1) {
-      segments.push({
-        text: '\n',
-        style: paragraph.style || item.style,
-        paragraphStyle: paragraph.style || item.style,
-        paragraphIndex,
-      });
-      fullText += '\n';
-    }
-  }
-
-  const target = requestedText === undefined ? fullText : String(requestedText ?? '');
-  if (target.length === 0) return { text: target, segments: [] };
-  let start = 0;
-  if (target !== fullText) {
-    if (fullText.startsWith(target)) start = 0;
-    else if (fullText.endsWith(target)) start = fullText.length - target.length;
-    else start = fullText.indexOf(target);
-    // A materialized cell can combine several conditional textboxes. If its override is not a contiguous
-    // slice of this textbox, retain the existing plain-text path rather than assigning misleading styles.
-    if (start < 0) return null;
-  }
-  const end = start + target.length;
-  let offset = 0;
-  const sliced = [];
-  for (const segment of segments) {
-    const segmentStart = offset;
-    const segmentEnd = offset + segment.text.length;
-    offset = segmentEnd;
-    const from = Math.max(start, segmentStart);
-    const to = Math.min(end, segmentEnd);
-    if (to <= from) continue;
-    sliced.push({ ...segment, text: segment.text.slice(from - segmentStart, to - segmentStart) });
-  }
-  return { text: target, segments: sliced };
 }
 
 function lineHeightForStyle(doc, config, style, context) {
@@ -287,7 +253,9 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
   }
 }
 
-function textHeight(doc, config, textbox, context, text, width) {
+// Shared by the native XLSX report renderer so wrapped row heights derive from the same font metrics and
+// rich-text run boundaries as PDF rather than a character-count approximation.
+export function measureTextboxHeight(doc, config, textbox, context, text, width) {
   if (!textbox || !text) return 0;
   const innerWidth = Math.max(1, width - styleSize(textbox.style.paddingLeft, context, 2) - styleSize(textbox.style.paddingRight, context, 2));
   const styledLayout = layoutStyledText(doc, config, textbox, context, text, innerWidth);
@@ -300,13 +268,13 @@ function splitTextForHeight(doc, config, textbox, context, text, width, height) 
   const value = String(text || '');
   if (!value || !textbox) return { head: value, tail: '' };
   const available = Math.max(1, height - styleSize(textbox.style.paddingTop, context, 2) - styleSize(textbox.style.paddingBottom, context, 2));
-  if (textHeight(doc, config, textbox, context, value, width) <= available) return { head: value, tail: '' };
+  if (measureTextboxHeight(doc, config, textbox, context, value, width) <= available) return { head: value, tail: '' };
   let low = 1;
   let high = value.length;
   let best = 0;
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
-    if (textHeight(doc, config, textbox, context, value.slice(0, middle), width) <= available) {
+    if (measureTextboxHeight(doc, config, textbox, context, value.slice(0, middle), width) <= available) {
       best = middle;
       low = middle + 1;
     } else high = middle - 1;
@@ -435,7 +403,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (firstFragment) collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'top', item.style?.borders?.top, outerContext);
     collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'left', item.style?.borders?.left, outerContext);
     collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'right', item.style?.borders?.right, outerContext);
-    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'bottom', item.style?.borders?.bottom, outerContext);
+    // Hard rule: always close the fragment (and hence the table's last row) with a bottom border, even when
+    // the RDL leaves it None or the row overflows onto the next page.
+    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'bottom', enforcedBottomBorder(item.style), outerContext);
     firstFragment = false;
     flushEdges(); // draw this page fragment's borders as merged, single strokes
   };
@@ -454,7 +424,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
 
   const measureRow = (row, texts) => layoutsForRow(row, texts).reduce((height, layout) => Math.max(
     height,
-    textHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
+    measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
       + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
   ), row.height);
   const measuredHeights = rows.map((row) => measureRow(row));
@@ -534,6 +504,15 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     let measured = measureRow(row, remainingTexts);
     const repeatedHeaderHeight = headers.reduce((sum, header) => sum + measureRow(header), 0);
     const freshPageCapacity = pageBottom - addPage.bodyTop - repeatedHeaderHeight;
+    // KeepTogether is best-effort: when a physical data row does not fit in the current remainder, move it
+    // before splitting any cell text. If an oversized row is already at the fresh-page content boundary, it
+    // must split there; attempting another break would create an endless blank-page loop. Repeating headers
+    // use their existing pagination path and must not recursively request a continuation page themselves.
+    const atFreshContentStart = y <= addPage.bodyTop + repeatedHeaderHeight + 0.5;
+    if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart) {
+      startContinuationPage();
+      measured = measureRow(row, remainingTexts);
+    }
     const rowIndex = rowIndexes.get(row);
     const protectedHeight = row.cells.reduce((maximum, cell) => Math.max(
       maximum,

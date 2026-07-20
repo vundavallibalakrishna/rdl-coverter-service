@@ -199,7 +199,7 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 | `PDF` | Directly from the normalized RDL model. Selectable text. | Exact |
 | `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables, real text. | Unknown (`null` / `X-Page-Count: unknown`) — Word paginates |
 | `DOCX_VISUAL` | PDF rasterized at 300 DPI, one full-page floating image per Word page. | Exact |
-| `XLSX` | Native Excel workbook. Each tablix is a block of styled cells (fills, borders, merges, fonts); numeric and date fields are written as **live typed values** with a translated number format, not text. Charts and the logo embed as images. | Not paginated (`null`) — Excel owns print layout |
+| `XLSX` | Native Excel workbook. Default `REPORT` mode uses native-cell worksheets split at explicit RDL page breaks; legacy `DATA` mode keeps stacked/per-tablix data blocks. Numeric and date fields remain live typed values. | Not paginated (`null`) — Excel owns print layout |
 
 `DOCX_EDITABLE` is editable but Word owns final layout, so its pagination will not match the PDF exactly.
 `POST /v1/analyze` returns `structuredEditable` with native-DOCX drift risks and the
@@ -211,17 +211,26 @@ rendering keys.
 `DOCX_VISUAL` is the exact-page contract: one full-page image per page, not editable — use it when page
 fidelity matters more than editing.
 
-`XLSX` is a data-first export. By default every tablix is stacked as a row block in one worksheet with
-autofit column widths; because the columns are shared, blocks with different column counts will not align —
-Excel is a grid, not a page. Set `excel.sheetPerTablix: true` on the render request to put each tablix on its
-own worksheet (`Table 1`, `Table 2`, …) with its own columns, and collect the title band, charts, and
-free-form text onto a leading `Overview` sheet — best when the goal is filtering/pivoting each table.
+`XLSX` defaults to case-insensitive `excel.layoutMode: "REPORT"`. Visible report items are partitioned into
+worksheets only at resolved explicit RDL page breaks. Each section gets an independent coordinate-derived
+grid: title bands, textboxes, rectangles, lines, tablixes, fills, per-side borders, alignment, fonts, and
+horizontal headings remain native editable cells. Group values that span PDF rows are repeated in ordinary
+cells instead of vertically merged, so selection, copying, sorting, and filtering remain normal. Declared
+embedded RDL images may be pictures; report layout, tables, and text are never rasterized or emitted as
+shapes. Visible charts fail with `UNSUPPORTED_FEATURE` in REPORT mode rather than disappearing.
+
+Set `excel.layoutMode: "DATA"` for the legacy data-first renderer. It stacks tablixes on one worksheet by
+default; `excel.sheetPerTablix: true` puts each tablix on its own worksheet and collects other content on an
+`Overview` sheet. For compatibility, an existing request with `sheetPerTablix: true` and no `layoutMode`
+automatically selects DATA. `sheetPerTablix` combined with explicit REPORT is `RDL_INVALID`.
 
 Values that resolve to a number (including `=Format(Fields!X.Value, "N2")`, whose number is recovered behind
 the format) are written as live numbers so they stay summable/pivotable; multi-run, conditional, and
 genuinely textual cells stay text. Untrusted cell text is stored as typed strings that Excel never evaluates
 as formulas — no apostrophe-escaping is applied because, unlike CSV, an XLSX string cell carries an explicit
-type. The page footer (page numbers/dates) is omitted as it has no meaning in a continuous sheet.
+type. REPORT mode translates safe page/footer fields into native Excel header/footer fields. Responses use
+`X-Xlsx-Layout-Mode: report-sections`, `data-stacked`, or `data-per-tablix`; the DOCX layout header is never
+emitted for XLSX.
 
 ## Certification status
 

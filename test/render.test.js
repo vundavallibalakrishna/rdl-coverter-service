@@ -367,6 +367,36 @@ test('keeps page-dependent non-final RDL header content visible in the reusable 
   assert.doesNotMatch(headerXml, /ALWAYS_HIDDEN_HEADER/);
 });
 
+test('preserves nested page-dependent footer content without unhiding literal-hidden content', async () => {
+  const footerModel = structuredClone(model);
+  const pageDependent = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
+  pageDependent.name = 'PageDependentFooterText';
+  pageDependent.value = 'PAGE_DEPENDENT_FOOTER_DATA';
+  pageDependent.paragraphs = [['PAGE_DEPENDENT_FOOTER_DATA']];
+  pageDependent.hidden = false;
+  const alwaysHidden = structuredClone(pageDependent);
+  alwaysHidden.name = 'AlwaysHiddenFooterText';
+  alwaysHidden.value = 'ALWAYS_HIDDEN_FOOTER_DATA';
+  alwaysHidden.paragraphs = [['ALWAYS_HIDDEN_FOOTER_DATA']];
+  alwaysHidden.hidden = true;
+  footerModel.page.footer = {
+    height: 30,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [{
+      type: 'Rectangle', name: 'PageConditionalFooterContainer', left: 0, top: 0, width: 500, height: 25,
+      zIndex: 0, hidden: '=IIF(Globals!PageNumber < 4, True, False)', style: {},
+      items: [pageDependent, alwaysHidden],
+    }],
+  };
+
+  const result = await renderEditableDocx(footerModel, request);
+  const zip = await JSZip.loadAsync(result.buffer);
+  const footerXml = await zip.file('word/footer1.xml').async('string');
+  assert.match(footerXml, /PAGE_DEPENDENT_FOOTER_DATA/);
+  assert.doesNotMatch(footerXml, /ALWAYS_HIDDEN_FOOTER_DATA/);
+});
+
 test('preserves tablix-level outer borders in editable DOCX', async () => {
   const borderedModel = structuredClone(model);
   const tablix = borderedModel.body.items.find((item) => item.type === 'Tablix');

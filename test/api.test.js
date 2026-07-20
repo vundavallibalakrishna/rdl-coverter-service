@@ -185,6 +185,33 @@ test('renders all DOCX modes through the public API with explicit layout and edi
   assert.deepEqual(await fs.readdir(tempRoot), []);
 });
 
+test('renders XLSX with an Excel-only layout header and DATA compatibility modes', async (context) => {
+  const { app, tempRoot } = await application(context);
+  const cases = [
+    { excel: undefined, expected: 'report-sections' },
+    { excel: { layoutMode: 'data' }, expected: 'data-stacked' },
+    { excel: { sheetPerTablix: true }, expected: 'data-per-tablix' },
+  ];
+  for (const entry of cases) {
+    const response = await app.inject({
+      method: 'POST', url: '/v1/render',
+      payload: { ...renderOptions, output: 'XLSX', excel: entry.excel, rdlBase64: fixture.toString('base64') },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.headers['x-xlsx-layout-mode'], entry.expected);
+    assert.equal(response.headers['x-docx-layout-mode'], undefined);
+    assert.equal(response.headers['x-page-count'], 'unknown');
+    assert.equal(response.rawPayload.subarray(0, 2).toString(), 'PK');
+  }
+  const conflict = await app.inject({
+    method: 'POST', url: '/v1/render',
+    payload: { ...renderOptions, output: 'XLSX', excel: { layoutMode: 'REPORT', sheetPerTablix: true }, rdlBase64: fixture.toString('base64') },
+  });
+  assert.equal(conflict.statusCode, 400);
+  assert.equal(conflict.json().error.code, 'RDL_INVALID');
+  assert.deepEqual(await fs.readdir(tempRoot), []);
+});
+
 test('renders structured DOCX with applied profile headers', async (context) => {
   const profilePath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-profile-render-')), 'profiles.json');
   context.after(() => fs.rm(path.dirname(profilePath), { recursive: true, force: true }));

@@ -71,7 +71,7 @@ export async function buildApp(options = {}) {
       output: renderRequest.output,
       outputBytes: rendered.buffer.length,
       pageCount: rendered.pageCount,
-      docxLayoutMode: rendered.layoutMode,
+      layoutMode: rendered.layoutMode,
       editableTextRatio: rendered.editableTextRatio,
       docxProfileId: rendered.docxProfile?.id,
       docxProfileCertified: rendered.docxProfile?.certified,
@@ -85,7 +85,8 @@ export async function buildApp(options = {}) {
       .header('X-Request-Id', request.id)
       .header('X-Page-Count', rendered.pageCount ?? 'unknown')
       .header('X-Render-Duration-Ms', durationMs);
-    if (rendered.layoutMode) reply.header('X-Docx-Layout-Mode', rendered.layoutMode);
+    if (rendered.layoutMode && renderRequest.output === 'XLSX') reply.header('X-Xlsx-Layout-Mode', safeHeaderValue(rendered.layoutMode));
+    else if (rendered.layoutMode && /^DOCX_/.test(renderRequest.output)) reply.header('X-Docx-Layout-Mode', safeHeaderValue(rendered.layoutMode));
     if (rendered.editableTextRatio !== undefined) reply.header('X-Docx-Editable-Text-Ratio', rendered.editableTextRatio);
     if (rendered.docxProfile?.id) {
       reply.header('X-Docx-Profile-Id', safeHeaderValue(rendered.docxProfile.id));

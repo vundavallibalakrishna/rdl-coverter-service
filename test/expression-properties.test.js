@@ -25,6 +25,19 @@ const detailTextbox = (m) => {
 };
 const docXml = async (buffer) => (await JSZip.loadAsync(buffer)).file('word/document.xml').async('string');
 
+// Set a style property the way the PARSER produces it. A run carries a full snapshot of the textbox style at
+// parse time, so a textbox-level FontSize/Weight expression is already present on each run of a real RDL
+// (verified: `<FontSize>=IIF(...)</FontSize>` on a Textbox lands on run.style.fontSize). Renderers style each
+// run individually, so a test that mutated only tb.style — which the parser never does in isolation — would
+// not reflect reality. This propagates to the runs/paragraphs exactly as inheritance does.
+const setInheritedStyle = (tb, prop, value) => {
+  tb.style[prop] = value;
+  (tb.paragraphStyles || []).forEach((ps) => { if (ps) ps[prop] = value; });
+  (tb.paragraphs || []).forEach((paragraph) => paragraph.forEach((run) => {
+    if (run && typeof run === 'object' && run.style) run.style[prop] = value;
+  }));
+};
+
 test('conditional VerticalAlign resolves the expression, not the raw source (DOCX)', async () => {
   const centered = structuredClone(base);
   detailTextbox(centered).style.verticalAlign = '=IIF(1=1,"Middle","Top")';
@@ -75,8 +88,11 @@ test('a dynamic Image Value expression is resolved before the embeddedImages loo
 test('a conditional FontSize/Padding parses (no crash) and applies per row', async () => {
   const m = structuredClone(base);
   const tb = detailTextbox(m);
-  tb.style.fontSize = '=IIF(Fields!Amount.Value >= 100, "14pt", "9pt")';
-  tb.style.paddingLeft = '=IIF(Fields!Amount.Value >= 100, "6pt", "2pt")';
+  setInheritedStyle(tb, 'fontSize', '=IIF(Fields!Amount.Value >= 100, "14pt", "9pt")');
+  setInheritedStyle(tb, 'paddingLeft', '=IIF(Fields!Amount.Value >= 100, "6pt", "2pt")');
+  // The normalized model stores each run's effective inherited style. Mirror what parsing an RDL with the
+  // textbox expressions would produce so the per-run renderer path is exercised as well.
+  for (const run of tb.paragraphs.flat()) run.style.fontSize = tb.style.fontSize;
   const twoRows = { ...request, datasets: { ...request.datasets, Sales: [{ Name: 'Big', Amount: 100 }, { Name: 'Small', Amount: 1 }] } };
   const xml = await docXml((await renderEditableDocx(m, twoRows, config)).buffer); // must not throw at parse or render
   const sizes = new Set([...xml.matchAll(/<w:sz w:val="(\d+)"\s*\/>/g)].map((mt) => mt[1]));
