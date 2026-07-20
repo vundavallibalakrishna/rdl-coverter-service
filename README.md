@@ -70,8 +70,8 @@ npx rdl-converter-service            # if installed as a dependency
 | --- | --- | --- |
 | `GET` | `/healthz` | Process liveness. |
 | `GET` | `/readyz` | Writable temp storage, required font variants, PDFKit, and Poppler readiness. `503` when not ready. |
-| `POST` | `/v1/analyze` | Namespace, page settings, parameters, exact dataset fields, fonts, detected constructs, structured-DOCX drift risks, fixed-editable compatibility/limits, and fail-closed errors. **Does not render.** |
-| `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, `DOCX_FIXED_EDITABLE`, `DOCX_VISUAL`, or `XLSX` artifact. |
+| `POST` | `/v1/analyze` | Namespace, page settings, parameters, exact dataset fields, fonts, detected constructs, structured-DOCX drift risks and fail-closed errors. **Does not render.** |
+| `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, or `XLSX` artifact. |
 
 ### Analyze before you render
 
@@ -99,7 +99,7 @@ curl -X POST http://localhost:7070/v1/render \
 // request.json
 {
   "rdlBase64": "PD94bWwg…",
-  "output": "PDF",                      // PDF | DOCX_EDITABLE | DOCX_FIXED_EDITABLE | DOCX_VISUAL | XLSX
+  "output": "PDF",                      // PDF | DOCX_EDITABLE | DOCX_VISUAL | XLSX
   "outputFileName": "combined-assurance",
   "parameters": { "ReportYear": 2026 },
   "datasets": {
@@ -131,7 +131,7 @@ curl -X POST http://localhost:7070/v1/render \
 a finished file.
 
 `DOCX_EDITABLE` returns `X-Page-Count: unknown` — Word performs its own final pagination. `PDF`,
-`DOCX_FIXED_EDITABLE`, and `DOCX_VISUAL` return exact canonical counts.
+`DOCX_VISUAL` returns exact page counts.
 
 ---
 
@@ -170,7 +170,7 @@ const converter = await createConverter();
 try {
   const rendered = await converter.render({
     rdl: await fs.readFile('report.rdl'),   // Buffer | Uint8Array | string
-    output: 'PDF',                          // PDF | DOCX_EDITABLE | DOCX_FIXED_EDITABLE | DOCX_VISUAL | XLSX
+    output: 'PDF',                          // PDF | DOCX_EDITABLE | DOCX_VISUAL | XLSX
     parameters: { ReportYear: 2026 },
     datasets: {
       MainDataset: [{ RiskName: 'Vendor concentration', Rating: 3 }],
@@ -267,7 +267,6 @@ guaranteed temp cleanup. That isolation is a property of the pipeline, not of th
 | --- | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. | Selectable | Exact |
 | `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables and text. | Editable | Unknown — Word paginates |
-| `DOCX_FIXED_EDITABLE` | Generates the canonical PDF unchanged, extracts a page scene with `pdfjs-dist`, then writes page-positioned Word text boxes, shapes, lines, and images. No full-page screenshot. | Editable; render fails if report text cannot remain editable | Exact canonical page count |
 | `DOCX_VISUAL` | Renders PDF, rasterizes every page at 300 DPI, one full-page floating image per Word page. | Images | Exact |
 | `XLSX` | Native Excel workbook. Tablixes become styled cell blocks (fills, borders, merges, fonts); numbers and dates are written as live typed values with a translated Excel number format; charts and the logo embed as images. | Live cells | Not paginated (`null`) |
 
@@ -275,11 +274,10 @@ Because Word performs `DOCX_EDITABLE` pagination itself, the service cannot know
 returns `pageCount: null` and the HTTP layer sends `X-Page-Count: unknown`. `XLSX` is also `pageCount: null`
 (a spreadsheet is continuous; Excel decides print pagination). The other modes return numeric page counts.
 
-Choose `DOCX_EDITABLE` when users need normal Word table editing and reflow. Choose
-`DOCX_FIXED_EDITABLE` when page-for-page PDF resemblance is the priority and edits are expected to fit
-inside fixed-position text boxes. Choose `DOCX_VISUAL` only when editability is not required. Large edits can
-overflow fixed text boxes; the fixed contract deliberately does not reflow or repaginate. Choose `XLSX` when
-the goal is the data itself — filtering, sorting, and pivoting live numbers — rather than page fidelity.
+Choose `DOCX_EDITABLE` when users need normal Word table editing and reflow (Word owns pagination, so page
+breaks will not match the PDF). Choose `DOCX_VISUAL` when page-for-page fidelity matters and editing is not
+required — it is one full-page image per page. Choose `XLSX` when the goal is the data itself — filtering,
+sorting, and pivoting live numbers — rather than page fidelity.
 
 `DOCX_EDITABLE` can optionally split large tablixes into multiple native Word tables using PDF-like page
 break estimates (`"docx": { "nativePageFragments": true }` on a render request; the legacy
@@ -330,7 +328,7 @@ The service fails generation if package protection or a text-edit lock is detect
 | Field | Required | Notes |
 | --- | --- | --- |
 | `rdlBase64` | JSON only | The RDL. Multipart uses the `rdl` file part instead. |
-| `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_FIXED_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
+| `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
 | `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Experimental native-table page fragmentation for certified report/data combinations. |
@@ -379,10 +377,6 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_WORKER_MEMORY_MB` | `512` | V8 heap cap per worker. |
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
-| `RDL_MAX_FIXED_PAGES` | `250` | Maximum canonical pages in `DOCX_FIXED_EDITABLE`. |
-| `RDL_MAX_FIXED_OBJECTS` | `50000` | Maximum positioned objects across a fixed DOCX. |
-| `RDL_MAX_FIXED_IMAGES` | `2000` | Maximum embedded images across a fixed DOCX. |
-| `RDL_MAX_FIXED_TEXT_RUNS` | `50000` | Maximum editable text runs across a fixed DOCX. |
 | `RDL_DOCX_NATIVE_PAGE_FRAGMENTS` | `false` | Experimental: split large `DOCX_EDITABLE` tablixes into native table fragments at PDF-like break estimates. Certify per RDL before enabling. |
 | `RDL_DOCX_PROFILE_PATH` | unset | Optional JSON file containing certified structured-DOCX profiles matched by RDL hash/name/namespace. |
 | `RDL_DOCX_PROFILE_AUTO` | `false` | Automatically apply the first matching structured-DOCX profile. Keep off unless every profile is release-certified. |
@@ -468,7 +462,7 @@ npm run audit:schema   # tmp/output/rdl-2016-capability-catalogue.json
 ```
 
 Of the 695 declared names in Microsoft's 2016 schema (691 elements, 4 attributes): **160** `SUPPORTED`,
-**59** `METADATA_ONLY`, **476** `REJECTED`. The default is `REJECTED`.
+**62** `METADATA_ONLY`, **473** `REJECTED`. The default is `REJECTED`.
 
 > **Accuracy language.** *Implemented* = the code path and tests exist. *Smoke-tested* = the supplied RDL
 > renders in all modes with clean temporary storage. *SSRS-certified* = output passed comparison against the
@@ -572,10 +566,9 @@ src/
     format.js       .NET format-string engine
   render/
     pdf.js          PDF renderer (PDFKit)
-    docx.js         Native OpenXML renderer
-    fixedDocx.js    PDF-matched positioned-object OpenXML renderer
-    pdfScene.js     Strict PDF.js operator-to-page-scene extraction
+    docx.js         Native OpenXML renderer (editable)
     visualDocx.js   Rasterized full-page DOCX
+    excel.js        Native XLSX renderer
     chart.js        Vector charts
     fonts.js        Font resolution + strict-font enforcement
   worker/

@@ -1,6 +1,6 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
-import { color, isHidden, normalizeDatasets, styleColor, styleValue, tablixRows, textForItem, cellText, cellTextbox } from './common.js';
+import { color, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, styledTextForItem, tablixRows, textForItem, cellText, cellTextbox } from './common.js';
 import { pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -23,22 +23,24 @@ function collectDocument(doc) {
 function applyFont(doc, config, style, context = {}) {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
-  doc.font(pdfFont(config, styleValue(style.fontFamily, context, 'Arial'), bold, italic)).fontSize(Number(styleValue(style.fontSize, context, 10)) || 10).fillColor(styleColor(style.color, context));
+  doc.font(pdfFont(config, styleValue(style.fontFamily, context, 'Arial'), bold, italic)).fontSize(styleSize(style.fontSize, context, 10) || 10).fillColor(styleColor(style.color, context));
 }
 
 function drawBorderEdge(doc, x, y, width, height, side, border, context = {}) {
   if (!border) return;
   const borderStyle = String(styleValue(border.style, context, 'None'));
   const borderColor = styleColor(border.color, context, null);
-  if (/^none$/i.test(borderStyle) || !borderColor) return;
+  const borderWidth = styleSize(border.width, context, 1);
+  // A conditional width of 0 (e.g. =IIF(rn=1,"1pt","0pt")) means the border is intentionally absent.
+  if (/^none$/i.test(borderStyle) || !borderColor || borderWidth <= 0) return;
   const segments = {
     top: [x, y, x + width, y], right: [x + width, y, x + width, y + height],
     bottom: [x, y + height, x + width, y + height], left: [x, y, x, y + height],
   };
   const [x1, y1, x2, y2] = segments[side];
-  doc.save().lineWidth(Math.max(border.width || 1, borderWidthFloor)).strokeColor(borderColor);
-  if (/dash/i.test(borderStyle)) doc.dash(Math.max(2, (border.width || 1) * 3));
-  else if (/dot/i.test(borderStyle)) doc.dash(Math.max(1, border.width || 1), { space: Math.max(1, (border.width || 1) * 2) });
+  doc.save().lineWidth(Math.max(borderWidth, borderWidthFloor)).strokeColor(borderColor);
+  if (/dash/i.test(borderStyle)) doc.dash(Math.max(2, borderWidth * 3));
+  else if (/dot/i.test(borderStyle)) doc.dash(Math.max(1, borderWidth), { space: Math.max(1, borderWidth * 2) });
   // Solid edges use a projecting (square) cap so each per-side segment overlaps its neighbours by half the
   // line width, closing the hairline notches/nicks that a butt cap leaves at cell corners, T-junctions and
   // fragment seams (visible only at high zoom). Dashed/dotted keep the butt cap so gaps stay open.
@@ -66,6 +68,137 @@ function renderedTextHeight(doc, text, width) {
     + (line.includes(' ') ? doc.heightOfString(line, { width, lineGap: 0 }) : lineHeight), 0);
 }
 
+function styledSegmentsForText(item, context, requestedText) {
+  const paragraphs = styledTextForItem(item, context);
+  if (!paragraphs) return null;
+  const segments = [];
+  let fullText = '';
+  for (const [paragraphIndex, paragraph] of paragraphs.entries()) {
+    for (const run of paragraph.runs) {
+      const text = String(run.text ?? '');
+      segments.push({ text, style: run.style || item.style, paragraphStyle: paragraph.style || item.style, paragraphIndex });
+      fullText += text;
+    }
+    if (paragraphIndex < paragraphs.length - 1) {
+      segments.push({
+        text: '\n',
+        style: paragraph.style || item.style,
+        paragraphStyle: paragraph.style || item.style,
+        paragraphIndex,
+      });
+      fullText += '\n';
+    }
+  }
+
+  const target = requestedText === undefined ? fullText : String(requestedText ?? '');
+  if (target.length === 0) return { text: target, segments: [] };
+  let start = 0;
+  if (target !== fullText) {
+    if (fullText.startsWith(target)) start = 0;
+    else if (fullText.endsWith(target)) start = fullText.length - target.length;
+    else start = fullText.indexOf(target);
+    // A materialized cell can combine several conditional textboxes. If its override is not a contiguous
+    // slice of this textbox, retain the existing plain-text path rather than assigning misleading styles.
+    if (start < 0) return null;
+  }
+  const end = start + target.length;
+  let offset = 0;
+  const sliced = [];
+  for (const segment of segments) {
+    const segmentStart = offset;
+    const segmentEnd = offset + segment.text.length;
+    offset = segmentEnd;
+    const from = Math.max(start, segmentStart);
+    const to = Math.min(end, segmentEnd);
+    if (to <= from) continue;
+    sliced.push({ ...segment, text: segment.text.slice(from - segmentStart, to - segmentStart) });
+  }
+  return { text: target, segments: sliced };
+}
+
+function lineHeightForStyle(doc, config, style, context) {
+  applyFont(doc, config, style, context);
+  return doc.currentLineHeight(true);
+}
+
+function layoutStyledText(doc, config, item, context, text, width) {
+  const source = styledSegmentsForText(item, context, text);
+  if (!source) return null;
+  if (source.text.length === 0) return { lines: [], height: 0 };
+  const lines = [];
+  let line = null;
+  const startLine = (style, paragraphStyle) => ({
+    runs: [],
+    width: 0,
+    height: lineHeightForStyle(doc, config, style || item.style, context),
+    paragraphStyle: paragraphStyle || item.style,
+    paragraphEnd: false,
+  });
+  const finishLine = (paragraphEnd = false) => {
+    if (!line) line = startLine(item.style, item.style);
+    line.paragraphEnd = paragraphEnd;
+    lines.push(line);
+    line = null;
+  };
+  const addToken = (token, segment) => {
+    if (!line) line = startLine(segment.style, segment.paragraphStyle);
+    const whitespace = /^\s+$/.test(token);
+    applyFont(doc, config, segment.style, context);
+    const tokenWidth = doc.widthOfString(token);
+    const tokenHeight = doc.currentLineHeight(true);
+    if (line.runs.length > 0 && line.width + tokenWidth > width) {
+      finishLine(false);
+      line = startLine(segment.style, segment.paragraphStyle);
+      // Wrapping consumes the separating whitespace, matching PDFKit's normal word-wrap behaviour.
+      if (whitespace) return;
+    }
+    line.runs.push({ text: token, style: segment.style, width: tokenWidth });
+    line.width += tokenWidth;
+    line.height = Math.max(line.height, tokenHeight);
+  };
+
+  for (const segment of source.segments) {
+    const parts = segment.text.split(/(\n)/);
+    for (const part of parts) {
+      if (part === '') continue;
+      if (part === '\n') {
+        if (!line) line = startLine(segment.style, segment.paragraphStyle);
+        finishLine(true);
+        continue;
+      }
+      const tokens = part.match(/[^\S\n]+|[^\s\n]+/g) || [];
+      for (const token of tokens) addToken(token, segment);
+    }
+  }
+  // PDFKit ignores one trailing empty line. Preserve empty lines between paragraphs, but not a terminal one.
+  if (line?.runs.length || lines.length === 0) finishLine(true);
+  return { lines, height: lines.reduce((sum, current) => sum + current.height, 0) };
+}
+
+function drawStyledText(doc, config, item, context, layout, x, y, width) {
+  let lineY = y;
+  for (const line of layout.lines) {
+    const alignment = String(styleValue(line.paragraphStyle?.textAlign ?? item.style?.textAlign, context, 'left')).toLowerCase();
+    let lineX = x;
+    if (alignment === 'center') lineX += Math.max(0, (width - line.width) / 2);
+    else if (alignment === 'right') lineX += Math.max(0, width - line.width);
+    const spaces = line.runs.reduce((count, run) => count + ((run.text.match(/ /g) || []).length), 0);
+    const justifyExtra = alignment === 'justify' && !line.paragraphEnd && spaces > 0
+      ? Math.max(0, width - line.width) / spaces
+      : 0;
+    for (const run of line.runs) {
+      applyFont(doc, config, run.style, context);
+      doc.text(run.text, lineX, lineY, {
+        lineBreak: false,
+        underline: /underline/i.test(String(styleValue(run.style?.textDecoration, context, 'None'))),
+        strike: /line.?through/i.test(String(styleValue(run.style?.textDecoration, context, 'None'))),
+      });
+      lineX += run.width + justifyExtra * ((run.text.match(/ /g) || []).length);
+    }
+    lineY += line.height;
+  }
+}
+
 function drawTextbox(doc, config, item, x, y, context, override = {}) {
   if (isHidden(item.hidden, context)) return;
   const style = item.style;
@@ -76,40 +209,53 @@ function drawTextbox(doc, config, item, x, y, context, override = {}) {
   // Tablix cells resolve their borders against neighbouring cells (SSRS shared-edge model) and draw
   // them separately, so they ask drawTextbox to skip its own per-cell border.
   if (!override.skipBorder) drawBorder(doc, x, y, width, height, style, context);
-  applyFont(doc, config, style, context);
   const text = override.text ?? textForItem(item, context);
-  const paddingLeft = style.paddingLeft + (override.padLeft || 0);
-  const innerWidth = Math.max(1, width - paddingLeft - style.paddingRight);
-  const innerHeight = Math.max(1, height - style.paddingTop - style.paddingBottom);
-  const measuredHeight = renderedTextHeight(doc, text, innerWidth);
-  let textY = y + style.paddingTop;
-  if (/middle/i.test(style.verticalAlign)) textY = y + Math.max(style.paddingTop, (height - measuredHeight) / 2);
-  if (/bottom/i.test(style.verticalAlign)) textY = y + Math.max(style.paddingTop, height - measuredHeight - style.paddingBottom);
+  // Padding is an RdlSize ExpressionType — resolve per row via styleSize (a literal passes straight through).
+  const padTop = styleSize(style.paddingTop, context, 2);
+  const padRight = styleSize(style.paddingRight, context, 2);
+  const padBottom = styleSize(style.paddingBottom, context, 2);
+  const paddingLeft = styleSize(style.paddingLeft, context, 2) + (override.padLeft || 0);
+  const innerWidth = Math.max(1, width - paddingLeft - padRight);
+  const innerHeight = Math.max(1, height - padTop - padBottom);
+  const styledLayout = layoutStyledText(doc, config, item, context, text, innerWidth);
+  if (!styledLayout) applyFont(doc, config, style, context);
+  const measuredHeight = styledLayout?.height ?? renderedTextHeight(doc, text, innerWidth);
+  // VerticalAlign can be an expression; resolve it before matching, otherwise the regex tests the raw
+  // expression source (e.g. `=IIF(c,"Middle","Top")` always contains "Middle").
+  const verticalAlign = String(styleValue(style.verticalAlign, context, 'top')).toLowerCase();
+  let textY = y + padTop;
+  if (/middle|center/.test(verticalAlign)) textY = y + Math.max(padTop, (height - measuredHeight) / 2);
+  if (/bottom/.test(verticalAlign)) textY = y + Math.max(padTop, height - measuredHeight - padBottom);
   // Clip text to the cell box so it can never bleed into an adjacent cell or, when the cell is
   // clamped at the page/footer boundary, into the reserved footer band. Background and borders are
   // drawn above (unclipped) so their edges stay crisp.
   doc.save().rect(x, y, width, height).clip();
-  doc.text(text, x + paddingLeft, textY, {
-    width: innerWidth,
-    height: innerHeight,
-    align: String(styleValue(style.textAlign, context, 'left')).toLowerCase(),
-    lineBreak: true,
-    ellipsis: !item.canGrow,
-    underline: /underline/i.test(String(styleValue(style.textDecoration, context, 'None'))),
-    strike: /line.?through/i.test(String(styleValue(style.textDecoration, context, 'None'))),
-  });
+  if (styledLayout) drawStyledText(doc, config, item, context, styledLayout, x + paddingLeft, textY, innerWidth);
+  else {
+    doc.text(text, x + paddingLeft, textY, {
+      width: innerWidth,
+      height: innerHeight,
+      align: String(styleValue(style.textAlign, context, 'left')).toLowerCase(),
+      lineBreak: true,
+      ellipsis: !item.canGrow,
+      underline: /underline/i.test(String(styleValue(style.textDecoration, context, 'None'))),
+      strike: /line.?through/i.test(String(styleValue(style.textDecoration, context, 'None'))),
+    });
+  }
   doc.restore();
 }
 
-function drawImage(doc, model, item, x, y) {
+function drawImage(doc, model, item, x, y, context = {}) {
   if (item.source !== 'Embedded') return;
-  const image = model.embeddedImages[item.value];
+  // Image Value and Sizing can be expressions (e.g. Value=`=Fields!Logo.Value`); resolve before use, or
+  // the raw expression string misses the embeddedImages map and the image is silently dropped.
+  const image = model.embeddedImages[styleValue(item.value, context, item.value)];
   if (!image?.data) return;
   const data = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
   // Honour the RDL Image Sizing. FitProportional (the RDL default) scales to fit the box while keeping
   // aspect; Fit stretches to fill the box exactly (SSRS behaviour — the box, not the source, wins);
   // Clip draws at native size clipped to the box; AutoSize draws at native size.
-  const sizing = String(item.sizing || 'FitProportional');
+  const sizing = String(styleValue(item.sizing, context, 'FitProportional') || 'FitProportional');
   if (/^Fit$/i.test(sizing)) {
     doc.image(data, x, y, { width: item.width, height: item.height });
   } else if (/^Clip$/i.test(sizing)) {
@@ -129,8 +275,8 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
   else if (item.type === 'Chart') {
     const data = materializeChart(item, context.datasets || {}, context.parameters || {}, context.globals || {});
     drawChart(doc, config, item, data, x, y, item.width, item.height, context);
-  } else if (item.type === 'Image') drawImage(doc, model, item, x, y);
-  else if (item.type === 'Line') doc.save().lineWidth(item.style.border.width || 1).strokeColor(color(item.style.border.color)).moveTo(x, y).lineTo(x + item.width, y + item.height).stroke().restore();
+  } else if (item.type === 'Image') drawImage(doc, model, item, x, y, context);
+  else if (item.type === 'Line') doc.save().lineWidth(styleSize(item.style?.border?.width, context, 1) || 1).strokeColor(styleColor(item.style?.border?.color, context, '#000000')).moveTo(x, y).lineTo(x + item.width, y + item.height).stroke().restore();
   else if (item.type === 'Rectangle') {
     const backgroundColor = styleColor(item.style.backgroundColor, context, null);
     if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
@@ -143,15 +289,17 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
 
 function textHeight(doc, config, textbox, context, text, width) {
   if (!textbox || !text) return 0;
+  const innerWidth = Math.max(1, width - styleSize(textbox.style.paddingLeft, context, 2) - styleSize(textbox.style.paddingRight, context, 2));
+  const styledLayout = layoutStyledText(doc, config, textbox, context, text, innerWidth);
+  if (styledLayout) return styledLayout.height;
   applyFont(doc, config, textbox.style, context);
-  const innerWidth = Math.max(1, width - textbox.style.paddingLeft - textbox.style.paddingRight);
   return doc.heightOfString(text, { width: innerWidth, lineGap: 0 });
 }
 
 function splitTextForHeight(doc, config, textbox, context, text, width, height) {
   const value = String(text || '');
   if (!value || !textbox) return { head: value, tail: '' };
-  const available = Math.max(1, height - textbox.style.paddingTop - textbox.style.paddingBottom);
+  const available = Math.max(1, height - styleSize(textbox.style.paddingTop, context, 2) - styleSize(textbox.style.paddingBottom, context, 2));
   if (textHeight(doc, config, textbox, context, value, width) <= available) return { head: value, tail: '' };
   let low = 1;
   let high = value.length;
@@ -240,7 +388,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const vertical = side === 'left' || side === 'right';
     const pos = vertical ? (side === 'right' ? x + width : x) : (side === 'bottom' ? y + height : y);
     const [a, b] = vertical ? [y, y + height] : [x, x + width];
-    const sig = `${styleValue(border.style, context, 'None')}|${styleColor(border.color, context, null)}|${border.width || 1}`;
+    const sig = `${styleValue(border.style, context, 'None')}|${styleColor(border.color, context, null)}|${styleSize(border.width, context, 1)}`;
     pendingEdges.push({ orient: vertical ? 'V' : 'H', pos, a, b, border, context, sig });
   };
   const flushEdges = () => {
@@ -307,7 +455,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const measureRow = (row, texts) => layoutsForRow(row, texts).reduce((height, layout) => Math.max(
     height,
     textHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
-      + (layout.textbox?.style.paddingTop || 0) + (layout.textbox?.style.paddingBottom || 0),
+      + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
   ), row.height);
   const measuredHeights = rows.map((row) => measureRow(row));
 

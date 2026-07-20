@@ -46,9 +46,6 @@ test('health, readiness, and analysis do not expose RDL queries', async (context
   assert.equal(analysis.json().structuredEditable.exactPageParity, false);
   assert.equal(Array.isArray(analysis.json().structuredEditable.risks), true);
   assert.equal(analysis.json().structuredEditable.nativePageFragments.supported, true);
-  assert.equal(typeof analysis.json().fixedEditable.compatible, 'boolean');
-  assert.deepEqual(analysis.json().fixedEditable.unsupportedPdfOperators, []);
-  assert.equal(Number.isInteger(analysis.json().fixedEditable.estimatedObjectCount), true);
 });
 
 test('DOCX profile analysis and render reject missing or mismatched profile ids cleanly', async (context) => {
@@ -153,18 +150,18 @@ test('returns stable validation errors without leaking input', async (context) =
 
 test('reports rejected XML paths during analysis and blocks rendering fail-closed', async (context) => {
   const { app, tempRoot } = await application(context);
-  const unsupported = Buffer.from(fixture.toString().replace('<CanGrow>true</CanGrow>', '<CanGrow>true</CanGrow><ToolTip>not rendered</ToolTip>'));
+  const unsupported = Buffer.from(fixture.toString().replace('<CanGrow>true</CanGrow>', '<CanGrow>true</CanGrow><UnsupportedTextboxProp>x</UnsupportedTextboxProp>'));
   const analysis = await app.inject({ method: 'POST', url: '/v1/analyze', payload: { rdlBase64: unsupported.toString('base64') } });
   assert.equal(analysis.statusCode, 200);
   assert.equal(analysis.json().compatible, false);
-  assert.equal(analysis.json().capabilities.rejected.some(({ path }) => path.endsWith('.Textbox.ToolTip')), true);
+  assert.equal(analysis.json().capabilities.rejected.some(({ path }) => path.endsWith(".Textbox.UnsupportedTextboxProp")), true);
 
   const render = await app.inject({
     method: 'POST', url: '/v1/render', payload: { ...renderOptions, rdlBase64: unsupported.toString('base64') },
   });
   assert.equal(render.statusCode, 400);
   assert.equal(render.json().error.code, 'UNSUPPORTED_FEATURE');
-  assert.equal(render.json().error.details.features.some((feature) => feature.endsWith('.Textbox.ToolTip')), true);
+  assert.equal(render.json().error.details.features.some((feature) => feature.endsWith(".Textbox.UnsupportedTextboxProp")), true);
   assert.deepEqual(await fs.readdir(tempRoot), []);
 });
 
@@ -172,7 +169,6 @@ test('renders all DOCX modes through the public API with explicit layout and edi
   const { app, tempRoot } = await application(context);
   const expected = {
     DOCX_EDITABLE: { layout: 'structured', ratio: '1', numericPages: false },
-    DOCX_FIXED_EDITABLE: { layout: 'fixed-editable', ratio: '1', numericPages: true },
     DOCX_VISUAL: { layout: 'visual', ratio: '0', numericPages: true },
   };
   for (const output of Object.keys(expected)) {

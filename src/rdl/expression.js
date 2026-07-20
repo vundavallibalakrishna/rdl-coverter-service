@@ -355,6 +355,24 @@ function vbEqual(left, right) {
   return left === right || String(left) === String(right);
 }
 
+// VB relational comparison for `< > <= >=`. Two differences from raw JS comparison: (1) numeric-looking
+// operands compare NUMERICALLY even when the caller supplied them as strings (a query field typed as a
+// number but delivered as "80" must satisfy `>= 9`, not lose to lexical order), and (2) Nothing coerces to
+// the other operand's default (0 for numbers), consistent with vbEqual and VB arithmetic. Returns -1/0/1.
+function vbCompare(left, right) {
+  const l = left === null || left === undefined ? 0 : left;
+  const r = right === null || right === undefined ? 0 : right;
+  const isNumeric = (v) => !(typeof v === 'string' && v.trim() === '') && Number.isFinite(Number(v));
+  if (isNumeric(l) && isNumeric(r)) {
+    const ln = Number(l);
+    const rn = Number(r);
+    return ln < rn ? -1 : ln > rn ? 1 : 0;
+  }
+  const ls = String(l);
+  const rs = String(r);
+  return ls < rs ? -1 : ls > rs ? 1 : 0;
+}
+
 function vbLike(text, pattern) {
   let regex = '^';
   for (let index = 0; index < pattern.length; index += 1) {
@@ -422,10 +440,10 @@ export function evaluateExpression(input, context = {}) {
       case 'like': return vbLike(`${left ?? ''}`, `${right ?? ''}`);
       case '<>': return !vbEqual(left, right);
       case '=': return vbEqual(left, right);
-      case '>=': return left >= right;
-      case '<=': return left <= right;
-      case '>': return left > right;
-      case '<': return left < right;
+      case '>=': return vbCompare(left, right) >= 0;
+      case '<=': return vbCompare(left, right) <= 0;
+      case '>': return vbCompare(left, right) > 0;
+      case '<': return vbCompare(left, right) < 0;
       case '&': return `${left ?? ''}${right ?? ''}`;
       case '+': return Number.isFinite(Number(left)) && Number.isFinite(Number(right)) ? Number(left) + Number(right) : `${left ?? ''}${right ?? ''}`;
       case '-': return Number(left) - Number(right);

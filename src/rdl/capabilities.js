@@ -49,6 +49,9 @@ const SUPPORTED_ELEMENTS = new Set([
 
 const METADATA_ELEMENTS = new Set([
   'Description', 'Author', 'AutoRefresh', 'Label', 'LabelField', 'ValueField',
+  // Interactive/navigation text (expression-capable) — acknowledged so a report using them is not rejected;
+  // static PDF/DOCX/XLSX output does not surface tooltips/bookmarks/document-map labels.
+  'ToolTip', 'Bookmark', 'DocumentMapLabel',
   // Advisory grouping hints acknowledged but not acted on (the group renders its natural instances).
   'DomainScope', 'NaturalGroup',
   'DataElementName', 'DataElementOutput', 'DataElementStyle',
@@ -110,6 +113,41 @@ export const EXPRESSION_FUNCTION_CAPABILITIES = Object.freeze({
   // Registry-backed functions (string / math / conversion / date / formatting / inspection) are added by
   // their category modules and classified SUPPORTED here automatically.
   ...Object.fromEntries(FUNCTION_NAMES.map((name) => [name, CapabilityStatus.SUPPORTED])),
+});
+
+// The second capability axis the element-name catalogue lacks: which PROPERTIES are ExpressionType (a
+// literal OR an =expression evaluated per row). Keyed by `<owner>.<property>` because a bare local name is
+// ambiguous (`Style` is a container and a Border child; `Width` is geometry and a Border child). `handled`
+// records that the renderers resolve the expression form at render time (styleValue/styleColor/styleSize/
+// isHidden). This exists so /v1/analyze can report expression-driven properties and so a completeness test
+// can enforce that every one has a handler — converting "found one property at a time" into "enumerated".
+const BORDER_OWNERS = ['Border', 'TopBorder', 'RightBorder', 'BottomBorder', 'LeftBorder'];
+export const EXPRESSION_PROPERTIES = Object.freeze({
+  'Style.Color': { valueType: 'RdlColor', handled: true },
+  'Style.BackgroundColor': { valueType: 'RdlColor', handled: true },
+  'Style.FontFamily': { valueType: 'String', handled: true },
+  'Style.FontSize': { valueType: 'RdlSize', handled: true },
+  'Style.FontWeight': { valueType: 'Enum', handled: true },
+  'Style.FontStyle': { valueType: 'Enum', handled: true },
+  'Style.TextDecoration': { valueType: 'Enum', handled: true },
+  'Style.TextAlign': { valueType: 'Enum', handled: true },
+  'Style.VerticalAlign': { valueType: 'Enum', handled: true },
+  'Style.Format': { valueType: 'String', handled: true },
+  'Style.PaddingLeft': { valueType: 'RdlSize', handled: true },
+  'Style.PaddingRight': { valueType: 'RdlSize', handled: true },
+  'Style.PaddingTop': { valueType: 'RdlSize', handled: true },
+  'Style.PaddingBottom': { valueType: 'RdlSize', handled: true },
+  // LineHeight is parsed (kept as an expression) but not yet applied to output — reported as unhandled so
+  // /v1/analyze can tell an integrator a custom line-height expression will not affect the rendered result.
+  'Style.LineHeight': { valueType: 'RdlSize', handled: false },
+  'Visibility.Hidden': { valueType: 'Boolean', handled: true },
+  'Image.Value': { valueType: 'String', handled: true },
+  'Image.Sizing': { valueType: 'Enum', handled: true },
+  ...Object.fromEntries(BORDER_OWNERS.flatMap((owner) => [
+    [`${owner}.Style`, { valueType: 'Enum', handled: true }],
+    [`${owner}.Color`, { valueType: 'RdlColor', handled: true }],
+    [`${owner}.Width`, { valueType: 'RdlSize', handled: true }],
+  ])),
 });
 
 function localName(name) {
@@ -191,6 +229,7 @@ function expressionFunctions(value) {
 export function inspectRdlCapabilities(parsed, namespace) {
   const entries = new Map();
   const detectedFunctions = new Map();
+  const expressionProperties = new Map();
   let customCodeDetected = false;
 
   function record(path, kind, status) {
@@ -230,6 +269,13 @@ export function inspectRdlCapabilities(parsed, namespace) {
       const childPath = path ? `${path}.${name}` : name;
       const status = classifyElement(childPath, name, parentStatus);
       record(childPath, 'ELEMENT', status);
+      // Second axis: is this an ExpressionType property carrying an actual =expression in this RDL?
+      const childText = typeof child === 'string' ? child : (child && typeof child === 'object' && '#text' in child ? child['#text'] : null);
+      if (typeof childText === 'string' && childText.trim().startsWith('=')) {
+        const propertyKey = `${localName(path.split('.').at(-1) || '')}.${localName(name)}`;
+        const spec = EXPRESSION_PROPERTIES[propertyKey];
+        if (spec) expressionProperties.set(childPath, { path: childPath, property: propertyKey, valueType: spec.valueType, handled: spec.handled });
+      }
       visit(child, childPath, status);
     }
   }
@@ -268,6 +314,10 @@ export function inspectRdlCapabilities(parsed, namespace) {
       catalogue: Object.entries(EXPRESSION_FUNCTION_CAPABILITIES).map(([name, status]) => ({ name, status })),
       detected: functions,
       rejected: functions.filter((entry) => entry.status === CapabilityStatus.REJECTED),
+      // Which expression-DRIVEN properties this RDL uses, and whether the renderers handle the expression
+      // form. `unhandled` is the actionable list — an expression-driven property we do not yet resolve.
+      properties: [...expressionProperties.values()].sort((left, right) => left.path.localeCompare(right.path)),
+      unhandledProperties: [...expressionProperties.values()].filter((entry) => !entry.handled),
     },
   };
 }

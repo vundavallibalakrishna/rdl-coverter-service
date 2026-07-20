@@ -355,7 +355,7 @@ export function analyzeStructuredEditableCompatibility(model, config = {}, reque
       selected: profile.selected,
     },
     recommendation: riskLevel === 'high'
-      ? 'Use DOCX_EDITABLE for maximum normal Word editability, then certify page-by-page. If PDF resemblance is more important than table editing, compare DOCX_FIXED_EDITABLE.'
+      ? 'Use DOCX_EDITABLE for editable Word output and certify page-by-page; when exact page fidelity matters more than editing, use DOCX_VISUAL.'
       : 'Use DOCX_EDITABLE for the client-facing editable document and certify with a Word-exported PDF comparison.',
   };
 }

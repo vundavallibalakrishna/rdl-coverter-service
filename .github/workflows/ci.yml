@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_libreoffice:
+        description: 'Install LibreOffice and run the XLSX round-trip test'
+        type: boolean
+        default: true
+
+# Cancel superseded runs on the same ref so a rapid push sequence doesn't queue stale jobs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Node 22, Poppler + LibreOffice)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Always needed: poppler-utils (pdftoppm / pdftotext / pdfinfo) to rasterize and read back PDFs, and
+      # fonts-liberation so substitution fonts (RDL_STRICT_FONTS=false) render real glyphs.
+      - name: Install core render tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils fonts-liberation
+
+      # Optional: LibreOffice provides headless `soffice`, which the XLSX round-trip test uses to open the
+      # generated workbook and convert it to PDF (test-only — the service never invokes LibreOffice). It is a
+      # ~400 MB install, so it can be turned off two ways, and the round-trip test then skips cleanly:
+      #   - manual run:  Actions -> Run workflow -> untick "run_libreoffice"
+      #   - repo-wide:   set repository variable SKIP_LIBREOFFICE = true
+      - name: Install LibreOffice (optional, for the XLSX round-trip)
+        if: ${{ vars.SKIP_LIBREOFFICE != 'true' && (github.event_name != 'workflow_dispatch' || inputs.run_libreoffice) }}
+        run: sudo apt-get install -y --no-install-recommends libreoffice-calc
+
+      - name: Verify tools
+        run: |
+          pdftoppm -v
+          pdftotext -v
+          soffice --version || echo "LibreOffice not installed — XLSX round-trip will skip"
+
+      - name: Install packages
+        run: npm ci
+
+      # The XLSX round-trip auto-detects soffice: it runs when LibreOffice is installed and skips otherwise.
+      # Sample-backed tests also skip in CI, since client samples live outside the repo (tmp/samples).
+      - name: Run tests
+        run: npm test

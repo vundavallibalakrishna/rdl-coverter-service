@@ -1,6 +1,6 @@
 import ExcelJS from 'exceljs';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleValue, tablixRows, textForItem } from './common.js';
+import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
@@ -128,14 +128,18 @@ function writeTablix(worksheet, model, item, request, globals, startRow, columnM
       if (fill) target.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
       target.font = {
         name: String(styleValue(style.fontFamily, context, 'Arial')),
-        size: Number(styleValue(style.fontSize, context, 10)) || 10,
+        size: styleSize(style.fontSize, context, 10) || 10,
         bold: /bold|[6-9]00/i.test(String(styleValue(style.fontWeight, context, 'Normal'))),
         italic: /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal'))),
         color: { argb: `FF${hex(styleColor(style.color, context, '#000000'), '000000')}` },
       };
+      // VerticalAlign/TextAlign can be expressions; resolve before matching so the regex does not test the
+      // raw expression source (`=IIF(x,"Right","Left")` contains "Right").
+      const vAlign = String(styleValue(style.verticalAlign, context, '') || '');
+      const hAlign = String(styleValue(style.textAlign, context, '') || '');
       target.alignment = {
-        vertical: /bottom/i.test(style.verticalAlign) ? 'bottom' : /middle|center/i.test(style.verticalAlign) ? 'middle' : 'top',
-        horizontal: /center/i.test(style.textAlign) ? 'center' : /right/i.test(style.textAlign) ? 'right' : /justify/i.test(style.textAlign) ? 'justify' : 'left',
+        vertical: /bottom/i.test(vAlign) ? 'bottom' : /middle|center/i.test(vAlign) ? 'middle' : 'top',
+        horizontal: /center/i.test(hAlign) ? 'center' : /right/i.test(hAlign) ? 'right' : /justify/i.test(hAlign) ? 'justify' : 'left',
         wrapText: true,
       };
       const borders = style.borders || {};
@@ -196,14 +200,15 @@ async function writeItem(workbook, worksheet, model, item, request, globals, con
     columnMaxChars[0] = Math.max(columnMaxChars[0] || 0, ...text.split('\n').map((line) => line.length));
     target.font = {
       name: String(styleValue(item.style?.fontFamily, context, 'Arial')),
-      size: Number(styleValue(item.style?.fontSize, context, 10)) || 10,
+      size: styleSize(item.style?.fontSize, context, 10) || 10,
       bold: /bold|[6-9]00/i.test(String(styleValue(item.style?.fontWeight, context, 'Normal'))),
       color: { argb: `FF${hex(styleColor(item.style?.color, context, '#000000'), '000000')}` },
     };
     return { rows: 1, chartIndex };
   }
   if (item.type === 'Image') {
-    const image = model.embeddedImages?.[item.value];
+    // Image Value can be an expression (=Fields!Logo.Value); resolve before the embeddedImages lookup.
+    const image = model.embeddedImages?.[styleValue(item.value, context, item.value)];
     if (!image?.data) return { rows: 0, chartIndex };
     const buffer = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
     return { rows: embedImage(workbook, worksheet, buffer, cursor, item.width || 100, item.height || 40), chartIndex };

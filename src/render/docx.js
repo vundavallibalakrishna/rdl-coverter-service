@@ -7,7 +7,7 @@ import PDFDocument from 'pdfkit';
 import { ServiceError } from '../errors.js';
 import { pointsToDisplayPixels, pointsToTwips } from '../units.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleValue, tablixRows, textForItem } from './common.js';
+import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { cellGridWidth, computeDocxTableGeometry } from './docxTableLayout.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { materializeChart } from './chartData.js';
@@ -15,8 +15,9 @@ import { renderChartPng } from './chartImage.js';
 import { pdfFont } from './fonts.js';
 import { resolveStructuredDocxOptions } from './structuredCompatibility.js';
 
-function alignment(value) {
-  const normalized = String(value || '').toLowerCase();
+function alignment(value, context = {}) {
+  // TextAlign can be an expression; resolve before matching so an `=IIF(...)` is not compared literally.
+  const normalized = String(styleValue(value, context, '') || '').toLowerCase();
   if (normalized === 'center') return AlignmentType.CENTER;
   if (normalized === 'right') return AlignmentType.RIGHT;
   if (normalized === 'justify') return AlignmentType.JUSTIFIED;
@@ -100,17 +101,17 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
   const backgroundColor = styleColor(style.backgroundColor, context, null);
   let effectiveText = overrideText;
   if (effectiveText === undefined && options.clipToBox) {
-    const lineHeight = Number(styleValue(style.fontSize, context, 10)) * 1.2;
-    const availableHeight = Math.max(1, item.height - (style.paddingTop || 0) - (style.paddingBottom || 0));
+    const lineHeight = (styleSize(style.fontSize, context, 10) || 10) * 1.2;
+    const availableHeight = Math.max(1, item.height - styleSize(style.paddingTop, context, 2) - styleSize(style.paddingBottom, context, 2));
     const maxLines = Math.max(1, Math.floor(availableHeight / Math.max(1, lineHeight)));
     const lines = String(textForItem(item, context) ?? '').split('\n');
     if (lines.length > maxLines) effectiveText = lines.slice(0, maxLines).join('\n');
   }
   const runProps = {
     font: styleValue(style.fontFamily, context, 'Arial'),
-    // fontSize may be an expression (e.g. =IIF(Sev="High",14,10)); resolve it like every other style
-    // property. Using it raw produced NaN half-points and threw inside the docx library.
-    size: Math.max(2, Math.round((Number(styleValue(style.fontSize, context, 10)) || 10) * 2)),
+    // fontSize may be an expression (e.g. =IIF(Sev="High",14,10)); resolve via styleSize (a literal passes
+    // through). Using it raw produced NaN half-points and threw inside the docx library.
+    size: Math.max(2, Math.round((styleSize(style.fontSize, context, 10) || 10) * 2)),
     bold: /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal'))),
     italics: /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal'))),
     underline: /underline/i.test(String(styleValue(style.textDecoration, context, 'None'))) ? {} : undefined,
@@ -118,7 +119,7 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
     color: styleColor(style.color, context, '#000000').replace('#', ''),
   };
   return new Paragraph({
-    alignment: alignment(style.textAlign),
+    alignment: alignment(style.textAlign, context),
     shading: !options.suppressShading && backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
     spacing: {
       before: 0,
@@ -139,8 +140,9 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
   });
 }
 
-function verticalAlignment(value) {
-  const normalized = String(value || '').toLowerCase();
+function verticalAlignment(value, context = {}) {
+  // VerticalAlign can be an expression; resolve before matching.
+  const normalized = String(styleValue(value, context, '') || '').toLowerCase();
   if (normalized === 'middle' || normalized === 'center') return VerticalAlignTable.CENTER;
   if (normalized === 'bottom') return VerticalAlignTable.BOTTOM;
   return VerticalAlignTable.TOP;
@@ -155,11 +157,13 @@ function borderFor(style, context) {
     // SSRS defaults an omitted BorderColor to Black, so a Solid border with no explicit colour must still
     // be drawn — resolving to null previously dropped the whole side. Width may be an expression too.
     const configuredColor = styleColor(border?.color, context, '#000000') || '#000000';
+    const width = styleSize(border?.width, context, 1);
+    // A conditional width of 0 (=IIF(rn=1,"1pt","0pt")) means the side is intentionally absent.
+    if (width <= 0) return { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
     const docxStyle = /dash/i.test(configuredStyle) ? BorderStyle.DASHED
       : /dot/i.test(configuredStyle) ? BorderStyle.DOTTED
       : /double/i.test(configuredStyle) ? BorderStyle.DOUBLE
       : BorderStyle.SINGLE;
-    const width = Number(styleValue(border?.width, context, 1)) || 1;
     return { style: docxStyle, size: Math.max(1, Math.round(width * 8)), color: configuredColor.replace('#', '') };
   };
   return { top: convert(sides.top), right: convert(sides.right), bottom: convert(sides.bottom), left: convert(sides.left) };
@@ -201,14 +205,15 @@ function naturalImageSize(buffer) {
   return null;
 }
 
-function imageParagraph(model, item, floating = false, origin = null) {
-  const image = model.embeddedImages[item.value];
+function imageParagraph(model, item, floating = false, origin = null, context = {}, align = undefined) {
+  // Image Value and Sizing can be expressions; resolve before use or the raw expression misses the map.
+  const image = model.embeddedImages[styleValue(item.value, context, item.value)];
   if (!image?.data) return null;
   const buffer = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
   // Match the PDF renderer's Sizing handling. Fit (SSRS behaviour) stretches to fill the box; the box,
   // not the source aspect ratio, wins. FitProportional/Clip/AutoSize keep the source aspect ratio,
   // contained within the box, so the image is never distorted.
-  const sizing = String(item.sizing || 'FitProportional');
+  const sizing = String(styleValue(item.sizing, context, 'FitProportional') || 'FitProportional');
   let width = item.width;
   let height = item.height;
   if (!/^Fit$/i.test(sizing)) {
@@ -230,12 +235,17 @@ function imageParagraph(model, item, floating = false, origin = null) {
       allowOverlap: true,
     },
   } : {};
-  return new Paragraph({ children: [new ImageRun({
-    data: buffer,
-    type: detectImageType(buffer),
-    transformation: { width: pointsToDisplayPixels(width), height: pointsToDisplayPixels(height) },
-    ...floatingOpts,
-  })] });
+  return new Paragraph({
+    // Absolutely-positioned (floating) images carry their own coordinates; a flowed image is placed
+    // horizontally by paragraph alignment derived from its box position.
+    alignment: floating ? undefined : align,
+    children: [new ImageRun({
+      data: buffer,
+      type: detectImageType(buffer),
+      transformation: { width: pointsToDisplayPixels(width), height: pointsToDisplayPixels(height) },
+      ...floatingOpts,
+    })],
+  });
 }
 
 function positionedShapeParagraph(item, context, origin, children = [], wordZIndex = null) {
@@ -244,8 +254,9 @@ function positionedShapeParagraph(item, context, origin, children = [], wordZInd
   const border = item.style?.border;
   const borderStyle = String(styleValue(border?.style, context, 'None'));
   const borderColor = styleColor(border?.color, context, null);
-  const verticalAnchor = /bottom/i.test(item.style?.verticalAlign) ? VerticalAnchor.BOTTOM
-    : /middle|center/i.test(item.style?.verticalAlign) ? VerticalAnchor.CENTER : VerticalAnchor.TOP;
+  const resolvedVerticalAlign = String(styleValue(item.style?.verticalAlign, context, '') || '');
+  const verticalAnchor = /bottom/i.test(resolvedVerticalAlign) ? VerticalAnchor.BOTTOM
+    : /middle|center/i.test(resolvedVerticalAlign) ? VerticalAnchor.CENTER : VerticalAnchor.TOP;
   const hasBorder = !/^none$/i.test(borderStyle) && Boolean(borderColor);
   const makeShape = ({ fill, outline, shapeChildren, zOffset = 0 }) => new WpsShapeRun({
     type: 'wps',
@@ -262,8 +273,8 @@ function positionedShapeParagraph(item, context, origin, children = [], wordZInd
     outline,
     bodyProperties: {
       margins: {
-        top: pointToEmu(item.style?.paddingTop || 0), right: pointToEmu(item.style?.paddingRight || 0),
-        bottom: pointToEmu(item.style?.paddingBottom || 0), left: pointToEmu(item.style?.paddingLeft || 0),
+        top: pointToEmu(styleSize(item.style?.paddingTop, context, 0)), right: pointToEmu(styleSize(item.style?.paddingRight, context, 0)),
+        bottom: pointToEmu(styleSize(item.style?.paddingBottom, context, 0)), left: pointToEmu(styleSize(item.style?.paddingLeft, context, 0)),
       },
       verticalAnchor,
       // Page-section items are positioned in a fixed RDL band. Allowing Word to auto-grow them changes
@@ -273,7 +284,7 @@ function positionedShapeParagraph(item, context, origin, children = [], wordZInd
     children: shapeChildren?.length ? shapeChildren : [new Paragraph({ spacing: { before: 0, after: 0 }, children: [] })],
   });
   const borderOutline = hasBorder
-    ? { type: 'solidFill', solidFillType: 'rgb', value: borderColor.replace('#', ''), width: pointToEmu(border?.width || 1) }
+    ? { type: 'solidFill', solidFillType: 'rgb', value: borderColor.replace('#', ''), width: pointToEmu(styleSize(border?.width, context, 1) || 1) }
     : backgroundColor ? undefined : { type: 'noFill' };
   // `docx` emits a shape that has both fill and outline in an invalid DrawingML property order
   // (`noFill`, line, then `solidFill`). Word keeps the line but ignores the late fill. Keep the visual
@@ -291,6 +302,126 @@ function positionedShapeParagraph(item, context, origin, children = [], wordZInd
   });
 }
 
+// An empty, exact-height paragraph that reproduces vertical whitespace from RDL Top coordinates when flowing
+// free-form (coordinate-positioned) content, so a coordinate-designed page is not crammed against the top.
+// Stays editable — it is just a blank line the user can adjust.
+function spacerParagraph(points) {
+  return new Paragraph({
+    spacing: { before: 0, after: 0, line: Math.max(1, pointsToTwips(points)), lineRule: LineRuleType.EXACT },
+    children: [],
+  });
+}
+
+// Horizontal placement for a flowed free-form item, derived from where its box sits in the container: a box
+// with roughly equal left/right margins is centred, one flush to the right edge is right-aligned, else left.
+// Generic — driven by the item's Left/Width, never by which item it is. Textboxes keep their own TextAlign;
+// this is for items (images) that have no text-alignment of their own.
+function flowAlignment(item, containerWidth) {
+  const width = item.width || 0;
+  if (!containerWidth || !width) return undefined;
+  const left = item.left || 0;
+  const right = containerWidth - (left + width);
+  const tolerance = Math.max(6, containerWidth * 0.03);
+  if (Math.abs(left - right) <= tolerance) return AlignmentType.CENTER;
+  if (right <= tolerance && left > tolerance) return AlignmentType.RIGHT;
+  return undefined;
+}
+
+// A flowed free-form Textbox whose fill/border should NOT span the whole text column — a narrower-than-
+// container shaded or bordered box (e.g. a small date chip on a cover) — becomes a fixed-width single-cell
+// table so the shading/border is confined to the RDL Width and the box is horizontally placed from its
+// Left. Returns null when the box has no visible fill/border or is effectively full width, so a plain
+// paragraph (or a full-width shaded bar) keeps the simpler path unchanged. Generic: width, position, fill,
+// and border all come from the model, nothing keyed to a specific report. A minimal separator paragraph
+// trails the table so an adjacent flowed box is not merged into it by Word.
+function shadedBoxTable(child, context, containerWidth) {
+  const width = child.width || 0;
+  if (!width || !containerWidth) return null;
+  const tolerance = Math.max(6, containerWidth * 0.03);
+  if (width >= containerWidth - tolerance) return null; // full-width bar: paragraph shading is fine
+  const backgroundColor = styleColor(child.style?.backgroundColor, context, null);
+  const resolved = borderFor(child.style, context);
+  const hasBorder = resolved && Object.values(resolved).some((side) => side.style !== BorderStyle.NONE);
+  if (!backgroundColor && !hasBorder) return null; // nothing to confine; alignment/text handles placement
+  // Explicit no-border set: borderFor returns undefined when the RDL declares no border, and the docx
+  // library then draws its OWN default single-line grid — a border the report never asked for.
+  const none = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
+  const borders = {
+    top: resolved?.top || none, bottom: resolved?.bottom || none, left: resolved?.left || none,
+    right: resolved?.right || none, insideHorizontal: none, insideVertical: none,
+  };
+  const align = flowAlignment(child, containerWidth);
+  const indentTwips = align ? 0 : pointsToTwips(child.left || 0); // left-aligned box sits at its Left offset
+  const table = new Table({
+    layout: TableLayoutType.FIXED,
+    width: { size: pointsToTwips(width), type: WidthType.DXA },
+    columnWidths: [pointsToTwips(width)],
+    alignment: align === AlignmentType.CENTER ? AlignmentType.CENTER : align === AlignmentType.RIGHT ? AlignmentType.RIGHT : undefined,
+    indent: indentTwips > 0 ? { size: indentTwips, type: WidthType.DXA } : undefined,
+    borders,
+    rows: [new TableRow({
+      height: { value: Math.max(1, pointsToTwips(child.height || 0)), rule: HeightRule.ATLEAST },
+      children: [new TableCell({
+        width: { size: pointsToTwips(width), type: WidthType.DXA },
+        verticalAlign: verticalAlignment(child.style?.verticalAlign, context),
+        shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
+        margins: {
+          top: pointsToTwips(styleSize(child.style?.paddingTop, context, 2)),
+          right: pointsToTwips(styleSize(child.style?.paddingRight, context, 2)),
+          bottom: pointsToTwips(styleSize(child.style?.paddingBottom, context, 2)),
+          left: pointsToTwips(styleSize(child.style?.paddingLeft, context, 2)),
+        },
+        children: [paragraphForTextbox(child, context, undefined, { suppressShading: true })],
+      })],
+    })],
+  });
+  return [table, spacerParagraph(0)];
+}
+
+// Flows a free-form container's children top-to-bottom. Each child reserves its full RDL box HEIGHT (not
+// just its text height) with its vertical alignment applied as top/bottom padding — otherwise Word collapses
+// an oversized or vertically-centred textbox to its text and the whitespace below it disappears, making the
+// gaps uneven. Images are horizontally aligned from their box position. Gaps between boxes and the remaining
+// container height are emitted as editable spacer lines.
+function flowChildrenWithSpacing(model, items, context, containerHeight, containerWidth, zOrder) {
+  const out = [];
+  let flowBottom = 0;
+  for (const child of [...items].sort((a, b) => (a.top || 0) - (b.top || 0) || (a.left || 0) - (b.left || 0))) {
+    if (isHidden(child.hidden, context)) continue;
+    const gap = (child.top || 0) - flowBottom;
+    if (gap > 0.5) out.push(spacerParagraph(gap));
+    const boxHeight = child.height || 0;
+    const boxed = child.type === 'Textbox' && boxHeight > 0 ? shadedBoxTable(child, context, containerWidth) : null;
+    if (boxed) {
+      // A narrower-than-container shaded/bordered box: fixed-width single-cell table. Its row height already
+      // reserves the full box height, so no valign-padding spacers are needed.
+      out.push(...boxed);
+    } else if (child.type === 'Textbox' && boxHeight > 0) {
+      // Estimate the rendered text height, then split the leftover box height per VerticalAlign so the box
+      // keeps the internal padding it has in the PDF.
+      const fontSize = styleSize(child.style?.fontSize, context, 10) || 10;
+      const lineCount = Math.max(1, String(textForItem(child, context) ?? '').split('\n').length);
+      const textHeight = Math.min(boxHeight, lineCount * fontSize * 1.25);
+      const slack = Math.max(0, boxHeight - textHeight);
+      const verticalAlign = String(styleValue(child.style?.verticalAlign, context, 'top')).toLowerCase();
+      const topPad = /middle|center/.test(verticalAlign) ? slack / 2 : /bottom/.test(verticalAlign) ? slack : 0;
+      const bottomPad = /middle|center/.test(verticalAlign) ? slack / 2 : /bottom/.test(verticalAlign) ? 0 : slack;
+      if (topPad > 0.5) out.push(spacerParagraph(topPad));
+      out.push(...childrenForItems(model, [child], context, false, null, zOrder));
+      if (bottomPad > 0.5) out.push(spacerParagraph(bottomPad));
+    } else if (child.type === 'Image') {
+      const paragraph = imageParagraph(model, child, false, null, context, flowAlignment(child, containerWidth));
+      if (paragraph) out.push(paragraph);
+    } else {
+      out.push(...childrenForItems(model, [child], context, false, null, zOrder));
+    }
+    flowBottom = Math.max(flowBottom, (child.top || 0) + boxHeight);
+  }
+  const trailing = (containerHeight || 0) - flowBottom;
+  if (trailing > 0.5) out.push(spacerParagraph(trailing));
+  return out;
+}
+
 function childrenForItems(model, items, context, floating = false, origin = null, zOrder = { value: 1 }) {
   const children = [];
   const nextZIndex = () => {
@@ -305,22 +436,34 @@ function childrenForItems(model, items, context, floating = false, origin = null
       else children.push(paragraphForTextbox(item, context));
     }
     else if (item.type === 'Image') {
-      const paragraph = imageParagraph(model, item, floating, origin);
+      const paragraph = imageParagraph(model, item, floating, origin, context);
       if (paragraph) children.push(paragraph);
     } else if (item.type === 'Rectangle') {
-      if (floating && (item.style?.backgroundColor || !/^none$/i.test(String(item.style?.border?.style)))) children.push(positionedShapeParagraph(item, context, origin, [], nextZIndex()));
-      const childOrigin = floating ? { x: origin.x + item.left, y: origin.y + item.top } : origin;
-      children.push(...childrenForItems(model, item.items || [], context, floating, childOrigin, zOrder));
+      // Resolve BackgroundColor and Border/Style before gating — an expression string is always truthy and
+      // always fails `^none$`, so a raw test would draw/omit the shape opposite to its evaluated result.
+      const rectBg = styleColor(item.style?.backgroundColor, context, null);
+      const rectBorderStyle = String(styleValue(item.style?.border?.style, context, 'None'));
+      if (floating && (rectBg || !/^none$/i.test(rectBorderStyle))) children.push(positionedShapeParagraph(item, context, origin, [], nextZIndex()));
+      if (floating) {
+        const childOrigin = { x: origin.x + item.left, y: origin.y + item.top };
+        children.push(...childrenForItems(model, item.items || [], context, true, childOrigin, zOrder));
+      } else {
+        // Body (flow) Rectangle: preserve its internal vertical layout with spacers, and place its children
+        // horizontally from their box positions — so a coordinate-designed cover keeps its layout.
+        children.push(...flowChildrenWithSpacing(model, item.items || [], context, item.height, item.width, zOrder));
+      }
     } else if (item.type === 'Line') {
+      const lineWidth = styleSize(item.style?.border?.width, context, 1) || 1;
+      const lineColor = styleColor(item.style?.border?.color, context, '#000000');
       if (floating) {
         const line = {
           ...item,
-          width: Math.max(item.width, item.style?.border?.width || 1),
-          height: Math.max(item.height, item.style?.border?.width || 1),
-          style: { ...item.style, backgroundColor: color(item.style?.border?.color), border: { style: 'None' }, paddingTop: 0, paddingRight: 0, paddingBottom: 0, paddingLeft: 0 },
+          width: Math.max(item.width, lineWidth),
+          height: Math.max(item.height, lineWidth),
+          style: { ...item.style, backgroundColor: lineColor, border: { style: 'None' }, paddingTop: 0, paddingRight: 0, paddingBottom: 0, paddingLeft: 0 },
         };
         children.push(positionedShapeParagraph(line, context, origin, [], nextZIndex()));
-      } else children.push(new Paragraph({ border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: color(item.style?.border?.color).replace('#', '') } } }));
+      } else children.push(new Paragraph({ border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: lineColor.replace('#', '') } } }));
     }
   }
   return children;
@@ -330,7 +473,7 @@ function applyMeasurementFont(doc, config, style, context) {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
   const family = styleValue(style.fontFamily, context, 'Arial');
-  doc.font(pdfFont(config, family, bold, italic)).fontSize(Number(styleValue(style.fontSize, context, 10)) || 10);
+  doc.font(pdfFont(config, family, bold, italic)).fontSize(styleSize(style.fontSize, context, 10) || 10);
 }
 
 function measureRows(rows, geometry, request, globals, datasets, datasetName, config, measurementDoc) {
@@ -351,10 +494,10 @@ function measureRows(rows, geometry, request, globals, datasets, datasetName, co
       const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1) / 20;
       const context = contexts[index];
       applyMeasurementFont(measurementDoc, config, textbox.style, context);
-      const innerWidth = Math.max(1, width - textbox.style.paddingLeft - textbox.style.paddingRight);
+      const innerWidth = Math.max(1, width - styleSize(textbox.style.paddingLeft, context, 2) - styleSize(textbox.style.paddingRight, context, 2));
       const text = cellText(cell);
       const textHeight = text ? measurementDoc.heightOfString(text, { width: innerWidth, lineGap: 0 }) : 0;
-      return textHeight + textbox.style.paddingTop + textbox.style.paddingBottom;
+      return textHeight + styleSize(textbox.style.paddingTop, context, 2) + styleSize(textbox.style.paddingBottom, context, 2);
     });
     return {
       height: Math.max(row.height, ...heights),
@@ -474,10 +617,10 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
           columnSpan: cell.colSpan || 1,
           rowSpan: cell.rowSpan > 1 ? cell.rowSpan : undefined,
           width: { size: width, type: WidthType.DXA },
-          verticalAlign: verticalAlignment(style.verticalAlign),
+          verticalAlign: verticalAlignment(style.verticalAlign, context),
           borders: borderFor(borderStyle, context),
           shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
-          margins: { top: pointsToTwips(style.paddingTop), right: pointsToTwips(style.paddingRight), bottom: pointsToTwips(style.paddingBottom), left: pointsToTwips(style.paddingLeft) },
+          margins: { top: pointsToTwips(styleSize(style.paddingTop, context, 2)), right: pointsToTwips(styleSize(style.paddingRight, context, 2)), bottom: pointsToTwips(styleSize(style.paddingBottom, context, 2)), left: pointsToTwips(styleSize(style.paddingLeft, context, 2)) },
           children: textbox && !cell.hidden ? [paragraphForTextbox(textbox, context,
             hasPageFieldExpression(textbox) ? undefined : cellText(cell), {
             pageBreakBefore: index === 0 && rowIndex === 0 && fragmentIndex > 0,

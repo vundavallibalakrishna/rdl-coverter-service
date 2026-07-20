@@ -65,7 +65,7 @@ try {
   if (!ready) throw new Error('Container did not become ready');
 
   const results = [];
-  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_FIXED_EDITABLE', 'DOCX_VISUAL']) {
+  for (const output of ['PDF', 'DOCX_EDITABLE', 'DOCX_VISUAL']) {
     const response = await fetch(`${baseUrl}/v1/render`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

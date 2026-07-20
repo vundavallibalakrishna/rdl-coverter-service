@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { checkFonts } from './render/fonts.js';
+import { checkFonts, fontAvailability } from './render/fonts.js';
 import PDFDocument from 'pdfkit';
 
 const execFileAsync = promisify(execFile);
@@ -19,7 +19,10 @@ export async function readiness(config) {
   } catch {
     checks.temporaryStorage = { ready: false };
   }
-  checks.fonts = checkFonts(config);
+  // `ready` still gates only on the always-required base families (Arial, Times New Roman). The catalogue is
+  // informational: it shows which other licensed faces the host actually has, so ops can see at a glance that
+  // an optional-but-report-consumed family such as Segoe UI is present before a report that needs it arrives.
+  checks.fonts = { ...checkFonts(config), catalogue: fontAvailability(config, ['Arial', 'Times New Roman', 'Segoe UI', 'Segoe UI Symbol']) };
   try {
     await execFileAsync(config.pdftoppmPath, ['-v'], { timeout: 5_000, maxBuffer: 64 * 1024 });
     checks.pdftoppm = { ready: true };

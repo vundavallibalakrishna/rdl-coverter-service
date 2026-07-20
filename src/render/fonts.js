@@ -27,14 +27,23 @@ function styleKey(family, bold, italic) {
 }
 
 function systemDirectories(fontDir) {
-  return [
-    fontDir,
+  const directories = [fontDir];
+  // Windows font locations: machine-wide %SystemRoot%\Fonts (e.g. C:\Windows\Fonts) and the per-user
+  // %LOCALAPPDATA%\Microsoft\Windows\Fonts. These env vars are set only on Windows, so on Linux/macOS the
+  // branches are skipped entirely (and guarding on the variable also keeps path.join from ever receiving
+  // undefined). Windows installs Segoe UI / Arial under exactly the filenames FILE_CANDIDATES expects
+  // (segoeui.ttf, arial.ttf, ...), so a normally-installed font now resolves here with no mount required.
+  if (process.env.SystemRoot) directories.push(path.join(process.env.SystemRoot, 'Fonts'));
+  if (process.env.LOCALAPPDATA) directories.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'Windows', 'Fonts'));
+  // macOS and Linux system font locations. Non-existent entries are harmlessly skipped by the existsSync
+  // check in resolveFontFile, so listing all platforms' paths together is safe.
+  directories.push(
     '/Library/Fonts',
     '/System/Library/Fonts',
     '/System/Library/Fonts/Supplemental',
     '/usr/share/fonts/truetype/msttcorefonts',
-    '/usr/share/fonts/truetype/msttcorefonts',
-  ];
+  );
+  return directories;
 }
 
 export function resolveFontFile(fontDir, family, bold = false, italic = false) {
@@ -67,4 +76,27 @@ export function checkFonts(config, families = ['Arial', 'Times New Roman']) {
     [false, false, 'regular'], [true, false, 'bold'], [false, true, 'italic'], [true, true, 'bolditalic'],
   ].filter(([bold, italic]) => !resolveFontFile(config.fontDir, family, bold, italic)).map(([, , style]) => `${family}:${style}`));
   return { ready: !config.strictFonts || missing.length === 0, missing, strict: config.strictFonts };
+}
+
+const VARIANTS = [[false, false, 'regular'], [true, false, 'bold'], [false, true, 'italic'], [true, true, 'bolditalic']];
+
+// Per-family availability of the actual licensed font files on THIS server, for the families a report
+// declares. `available` means every variant resolves to a file we could embed in a PDF; when it is false
+// the PDF silently falls back (Helvetica/Times base-14) in non-strict mode or fails closed in strict mode,
+// and a named-font DOCX/Excel defers the family to whatever the opening application substitutes — so this
+// surfaces the exact "the declared font is not on the render host" condition that otherwise passes silently.
+// Generic: driven only by the RDL's declared family list, nothing report-specific.
+export function fontAvailability(config, families = []) {
+  return [...new Set(families)].map((family) => {
+    const missingVariants = VARIANTS
+      .filter(([bold, italic]) => !resolveFontFile(config.fontDir, family, bold, italic))
+      .map(([, , style]) => style);
+    return {
+      family,
+      available: missingVariants.length === 0,
+      missingVariants,
+      // strict render would reject a report that consumes an unavailable family (PDF must embed it).
+      blocksStrictRender: config.strictFonts && missingVariants.length > 0,
+    };
+  });
 }

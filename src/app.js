@@ -7,8 +7,8 @@ import { analyzeParsedRdl, parseRdl } from './rdl/parser.js';
 import { readInput, sanitizedFilename } from './request.js';
 import { readiness } from './readiness.js';
 import { RenderRunner } from './worker/runner.js';
-import { analyzeFixedEditableCompatibility } from './render/fixedCompatibility.js';
 import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
+import { fontAvailability } from './render/fonts.js';
 
 function safeHeaderValue(value) {
   return String(value ?? '').replace(/[\r\n\t]/g, ' ').replace(/[^\x20-\x7E]/g, '?').trim().slice(0, 200);
@@ -40,7 +40,9 @@ export async function buildApp(options = {}) {
     const model = parseRdl(rdlBuffer, { maxRdlBytes: config.maxRdlBytes, maxXmlNodes: config.maxXmlNodes, maxXmlDepth: config.maxXmlDepth });
     const result = analyzeParsedRdl(model);
     result.structuredEditable = analyzeStructuredEditableCompatibility(model, config, options);
-    result.fixedEditable = analyzeFixedEditableCompatibility(model, config);
+    // Surface which of the report's declared consumed fonts are actually present on this render host, so an
+    // absent licensed face (e.g. Segoe UI) is visible instead of silently substituted at render time.
+    result.fontAvailability = fontAvailability(config, model.fonts);
     request.log.info({ requestId: request.id, rdlBytes: rdlBuffer.length, durationMs: Date.now() - startedAt, compatible: result.compatible }, 'RDL analysis completed');
     return reply.header('X-Request-Id', request.id).send(result);
   });
@@ -74,9 +76,6 @@ export async function buildApp(options = {}) {
       docxProfileId: rendered.docxProfile?.id,
       docxProfileCertified: rendered.docxProfile?.certified,
       docxNativePageFragments: rendered.docxNativePageFragments,
-      fixedObjectCount: rendered.sceneStats?.objectCount,
-      fixedTextRuns: rendered.sceneStats?.textRuns,
-      fixedImages: rendered.sceneStats?.images,
       durationMs,
     }, 'RDL rendering completed');
     reply

@@ -43,8 +43,15 @@ async function sofficeAvailable(soffice) {
 }
 
 const soffice = resolveSoffice();
-const available = await sofficeAvailable(soffice);
-const skip = available ? false : 'LibreOffice (soffice) is not installed; XLSX round-trip verification skipped';
+// An explicit opt-out for anyone who has LibreOffice installed but wants a faster run (local or CI):
+// RDL_SKIP_ROUNDTRIP=1 skips these without uninstalling anything. Otherwise they run when soffice exists.
+const forceSkip = /^(1|true|yes)$/i.test(process.env.RDL_SKIP_ROUNDTRIP || '');
+const available = !forceSkip && await sofficeAvailable(soffice);
+const skip = forceSkip
+  ? 'RDL_SKIP_ROUNDTRIP is set; XLSX round-trip verification skipped'
+  : available
+    ? false
+    : 'LibreOffice (soffice) is not installed; XLSX round-trip verification skipped';
 
 const model = parseRdl(await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url)));
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });

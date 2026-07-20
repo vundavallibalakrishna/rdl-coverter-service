@@ -1,22 +1,50 @@
 import { evaluateExpression, formatValue } from '../rdl/expression.js';
 import { materializeTablixColumns, materializeTablixRows } from '../rdl/validation.js';
 import { normalizeDisplayText, renderMarkupText } from '../rdl/text.js';
+import { toPoints } from '../units.js';
 
 export function isHidden(expression, context) {
   const result = evaluateExpression(expression, context);
   return result === true || String(result).toLowerCase() === 'true';
 }
 
-export function textForItem(item, context) {
-  if (item.paragraphs) {
-    return normalizeDisplayText(item.paragraphs.map((runs) => runs.map((run) => {
+// Resolves a size that may be a literal number, a unit string ("1pt"), or a conditional expression
+// (=IIF(...,"1pt","0pt")) into points. Border widths and similar sizes can be data-dependent, so they are
+// kept as expressions by the parser and resolved here per row/scope.
+export function styleSize(value, context, fallback = 0) {
+  if (typeof value === 'number') return value;
+  const resolved = styleValue(value, context, undefined);
+  if (typeof resolved === 'number') return resolved;
+  if (resolved === undefined || resolved === null || resolved === '') return fallback;
+  try {
+    return toPoints(String(resolved), fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+export function styledTextForItem(item, context) {
+  if (!item.paragraphs) return null;
+  return item.paragraphs.map((runs, paragraphIndex) => ({
+    style: item.paragraphStyles?.[paragraphIndex] || item.style,
+    runs: runs.map((run) => {
       const definition = run && typeof run === 'object' ? run : { value: run, markupType: 'None' };
       const value = evaluateExpression(definition.value, context);
-      if (value === null || value === undefined) return '';
-      const formatted = item.style?.format ? String(formatValue(value, styleValue(item.style.format, context))) : String(value);
-      return renderMarkupText(formatted, definition.markupType);
-    }).join('')).join('\n'));
-  }
+      const runStyle = definition.style || item.style;
+      if (value === null || value === undefined) return { text: '', style: runStyle };
+      const format = styleValue(runStyle?.format ?? item.style?.format, context, null);
+      const formatted = format ? String(formatValue(value, format)) : String(value);
+      return {
+        text: normalizeDisplayText(renderMarkupText(formatted, definition.markupType)),
+        style: runStyle,
+      };
+    }),
+  }));
+}
+
+export function textForItem(item, context) {
+  const styled = styledTextForItem(item, context);
+  if (styled) return normalizeDisplayText(styled.map((paragraph) => paragraph.runs.map((run) => run.text).join('')).join('\n'));
   const value = evaluateExpression(item.value, context);
   if (value === null || value === undefined) return '';
   return normalizeDisplayText(item.style?.format ? String(formatValue(value, styleValue(item.style.format, context))) : String(value));

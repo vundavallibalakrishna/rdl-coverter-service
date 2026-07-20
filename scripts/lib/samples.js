@@ -3,13 +3,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Client RDLs, request fixtures, and row data are client property: they carry real report definitions,
-// queries, and row values, so they must never enter version control. They live under tmp/ (git-ignored in
-// full) rather than in the repo, which means a fresh clone legitimately does not have them — tests and
-// scripts that need them must skip rather than fail. RDL_SAMPLES_DIR overrides the location for a machine
-// that keeps them elsewhere.
+// queries, and row values, so they must never enter version control. They live directly in the repo-root
+// tmp/ working directory (git-ignored in full) alongside other generated artifacts — no dedicated subfolder,
+// matching the "write into tmp/, no subdirectories" rule — which means a fresh clone legitimately does not
+// have them, so tests and scripts that need them must skip rather than fail. RDL_SAMPLES_DIR overrides the
+// location for a machine that keeps them elsewhere.
 const serviceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-export const samplesRoot = path.resolve(process.env.RDL_SAMPLES_DIR || path.join(serviceRoot, 'tmp', 'samples'));
+export const samplesRoot = path.resolve(process.env.RDL_SAMPLES_DIR || path.join(serviceRoot, 'tmp'));
 
 export function samplePath(...segments) {
   return path.join(samplesRoot, ...segments);

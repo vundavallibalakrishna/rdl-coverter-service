@@ -7,7 +7,6 @@ import { PDFDocument } from 'pdf-lib';
 import JSZip from 'jszip';
 import { loadConfig } from '../src/config.js';
 import { renderEditableDocx } from '../src/render/docx.js';
-import { renderFixedEditableDocx } from '../src/render/fixedDocx.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { STRESS_OVERFLOW_LINES, STRESS_ROW_COUNT, createStressScenario } from './lib/stressScenario.js';
 
@@ -21,8 +20,6 @@ const reportPath = path.join(outputRoot, 'stress-certification.json');
 const directPdfPath = path.join(pdfOutputDir, 'rdl-table-stress-direct.pdf');
 const editableDocxPath = path.join(docxOutputDir, 'rdl-table-stress-editable.docx');
 const editablePdfPath = path.join(pdfOutputDir, 'rdl-table-stress-editable-rendered.pdf');
-const fixedDocxPath = path.join(docxOutputDir, 'rdl-table-stress-fixed-editable.docx');
-const fixedPdfPath = path.join(pdfOutputDir, 'rdl-table-stress-fixed-editable-rendered.pdf');
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
 const { model, request } = createStressScenario();
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-stress-certification-'));
@@ -80,59 +77,36 @@ async function convertDocxToPdf(docxPath, pdfPath, label) {
   await fs.copyFile(converted, pdfPath);
 }
 
-function pageDimensions(document) {
-  return document.getPages().map((page) => ({ width: page.getWidth(), height: page.getHeight() }));
-}
-
-// OOXML page dimensions are integer twips (1/20 pt). A PDF can encode finer values, so one twip is the
-// strictest portable comparison without changing the canonical PDF (for A4 the observed delta is 0.028 pt).
-function dimensionsMatch(left, right, tolerance = 0.05) {
-  return left.length === right.length && left.every((page, index) => (
-    Math.abs(page.width - right[index].width) <= tolerance
-    && Math.abs(page.height - right[index].height) <= tolerance
-  ));
-}
-
 try {
   await Promise.all([
     fs.mkdir(pdfOutputDir, { recursive: true }),
     fs.mkdir(docxOutputDir, { recursive: true }),
   ]);
-  const [directPdf, editableDocx, fixedDocx] = await Promise.all([
+  const [directPdf, editableDocx] = await Promise.all([
     renderPdf(model, request, config),
     renderEditableDocx(model, request),
-    renderFixedEditableDocx(model, request, config),
   ]);
   await Promise.all([
     fs.writeFile(directPdfPath, directPdf.buffer),
     fs.writeFile(editableDocxPath, editableDocx.buffer),
-    fs.writeFile(fixedDocxPath, fixedDocx.buffer),
   ]);
   await convertDocxToPdf(editableDocxPath, editablePdfPath, 'structured');
-  await convertDocxToPdf(fixedDocxPath, fixedPdfPath, 'fixed');
 
-  const [directPdfDocument, editablePdfDocument, fixedPdfDocument, directText, editableText, fixedText, zip, fixedZip] = await Promise.all([
+  const [directPdfDocument, editablePdfDocument, directText, editableText, zip] = await Promise.all([
     PDFDocument.load(await fs.readFile(directPdfPath)),
     PDFDocument.load(await fs.readFile(editablePdfPath)),
-    PDFDocument.load(await fs.readFile(fixedPdfPath)),
     textFromPdf(directPdfPath, 'direct.txt'),
     textFromPdf(editablePdfPath, 'editable.txt'),
-    textFromPdf(fixedPdfPath, 'fixed.txt'),
     JSZip.loadAsync(await fs.readFile(editableDocxPath)),
-    JSZip.loadAsync(await fs.readFile(fixedDocxPath)),
   ]);
   const documentXml = await zip.file('word/document.xml').async('string');
-  const fixedDocumentXml = await fixedZip.file('word/document.xml').async('string');
   const directPageCount = directPdfDocument.getPageCount();
   const editablePageCount = editablePdfDocument.getPageCount();
-  const fixedPageCount = fixedPdfDocument.getPageCount();
-  const directDimensions = pageDimensions(directPdfDocument);
-  const fixedDimensions = pageDimensions(fixedPdfDocument);
   const report = {
     passed: false,
     targetPages: { minimum: 30, maximum: 40, structuredDocxAdvisoryOnly: true },
     inputs: { rows: STRESS_ROW_COUNT, giantOverflowLines: STRESS_OVERFLOW_LINES, groups: 13, subgroupsPerGroup: 4 },
-    artifacts: { directPdfPath, editableDocxPath, editablePdfPath, fixedDocxPath, fixedPdfPath },
+    artifacts: { directPdfPath, editableDocxPath, editablePdfPath },
     directPdf: {
       pages: directPageCount,
       pageRangePassed: directPageCount >= 30 && directPageCount <= 40,
@@ -153,22 +127,6 @@ try {
         horizontalMergedHeaderCells: count(documentXml, /<w:gridSpan w:val="2"\/>/g),
         verticalMergedHeaderStarts: count(documentXml, /<w:vMerge w:val="restart"\/>/g),
         verticalMergedHeaderContinuations: count(documentXml, /<w:vMerge w:val="continue"\/>/g),
-      },
-    },
-    fixedEditableDocx: {
-      sourcePages: fixedDocx.pageCount,
-      renderedPages: fixedPageCount,
-      pageCountMatchesPdf: fixedDocx.pageCount === directPageCount && fixedPageCount === directPageCount,
-      pageDimensionsMatchPdf: dimensionsMatch(directDimensions, fixedDimensions),
-      pageDimensionTolerancePt: 0.05,
-      editableTextRatio: fixedDocx.editableTextRatio,
-      rowMarkers: markerAudit(fixedText),
-      overflow: overflowAudit(fixedText),
-      endMarkerCount: count(fixedText, /STRESS_DOCUMENT_END/g),
-      openXml: {
-        nativeTables: count(fixedDocumentXml, /<w:tbl>/g),
-        positionedShapes: count(fixedDocumentXml, /<wps:wsp>/g),
-        forcedPageBreaks: count(fixedDocumentXml, /w:type="page"/g),
       },
     },
     combinations: {
@@ -196,16 +154,7 @@ try {
     && report.editableDocx.openXml.atomicHeaderRows === 3
     && report.editableDocx.openXml.horizontalMergedHeaderCells === 5
     && report.editableDocx.openXml.verticalMergedHeaderStarts === 6
-    && report.editableDocx.openXml.verticalMergedHeaderContinuations === 6
-    && report.fixedEditableDocx.pageCountMatchesPdf
-    && report.fixedEditableDocx.pageDimensionsMatchPdf
-    && report.fixedEditableDocx.editableTextRatio === 1
-    && report.fixedEditableDocx.rowMarkers.passed
-    && report.fixedEditableDocx.overflow.passed
-    && report.fixedEditableDocx.endMarkerCount === 1
-    && report.fixedEditableDocx.openXml.nativeTables === 0
-    && report.fixedEditableDocx.openXml.positionedShapes > 0
-    && report.fixedEditableDocx.openXml.forcedPageBreaks === directPageCount - 1;
+    && report.editableDocx.openXml.verticalMergedHeaderContinuations === 6;
   await fs.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify({ reportPath, ...report }, null, 2)}\n`);
   if (process.argv.includes('--require-pass') && !report.passed) process.exitCode = 1;

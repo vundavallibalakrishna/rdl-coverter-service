@@ -78,7 +78,8 @@ function evaluateItemText(item, context) {
     const definition = run && typeof run === 'object' ? run : { value: run, markupType: 'None' };
     const value = evaluateExpression(definition.value, context);
     if (value === null || value === undefined) return '';
-    const formatted = item.style?.format ? String(formatValue(value, item.style.format)) : String(value);
+    const format = expressionValue(definition.style?.format ?? item.style?.format, context);
+    const formatted = format ? String(formatValue(value, format)) : String(value);
     return renderMarkupText(formatted, definition.markupType);
   }).join('')).join('\n'));
 }

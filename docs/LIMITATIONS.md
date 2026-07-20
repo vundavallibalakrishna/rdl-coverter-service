@@ -153,8 +153,8 @@ output** for the same RDL and rows. This is report logic, not rendering — the 
 
 Word performs final layout, so page breaks land differently. `KeepTogether` and row spans are honoured via
 `cantSplit`/`keepNext`, which keeps content coherent, but exact page parity is not achievable in an editable
-reflowing document. Use `DOCX_FIXED_EDITABLE` for editable page-for-page canonical geometry, or
-`DOCX_VISUAL` for a non-editable raster copy.
+reflowing document — that is a Word limitation, not an implementation gap. When page-for-page fidelity
+matters more than editing, use `DOCX_VISUAL` (a non-editable full-page image per page).
 
 The experimental `docx.nativePageFragments` render option (legacy alias: `docxNativePageFragments`) keeps
 content as native Word tables while splitting large tablixes at PDF-like page break estimates. It can improve
@@ -173,13 +173,6 @@ The service rejects malformed profile files instead of guessing: duplicate IDs, 
 definition hashes, and unknown DOCX rendering keys return `CONFIG_INVALID` when a profile is requested or
 auto-apply is enabled.
 
-### DOCX_FIXED_EDITABLE is positioned, not reflowing
-
-Every canonical PDF text line is an independent positioned Word text box. This keeps page count, page size,
-headers, footers, lines, fills, images, and text anchors tied to the PDF, but large user edits can overflow a
-box instead of pushing later rows or pages. Unsupported PDF operators and any text that cannot remain
-editable fail with `UNSUPPORTED_FEATURE`; the renderer never hides raster text beneath editable overlays.
-
 ### Border thickness varies slightly between cells
 
 Sub-pixel rasterization in the PDF viewer, not stroke width. Each grid line is stroked exactly once
@@ -197,5 +190,5 @@ Machine-readable, generated from Microsoft's published schema:
 npm run audit:schema   # tmp/output/rdl-2016-capability-catalogue.json
 ```
 
-Current classification of the 695 declared names: **160** `SUPPORTED`, **59** `METADATA_ONLY`, **476**
+Current classification of the 695 declared names: **160** `SUPPORTED`, **62** `METADATA_ONLY`, **473**
 `REJECTED`. To check a specific RDL rather than the whole schema, use `POST /v1/analyze`.

@@ -69,10 +69,10 @@ test('classifies every encountered XML path and fails closed for unconsumed elem
   const metadata = fixture.toString().replace('<Description>Basic Report</Description>', '<Description>Basic Report</Description><Author>Test</Author>');
   assert.equal(analyzeRdl(metadata).compatible, true);
 
-  const element = fixture.toString().replace('<CanGrow>true</CanGrow>', '<CanGrow>true</CanGrow><ToolTip>ignored text</ToolTip>');
+  const element = fixture.toString().replace('<CanGrow>true</CanGrow>', '<CanGrow>true</CanGrow><UnsupportedTextboxProp>x</UnsupportedTextboxProp>');
   const elementAnalysis = analyzeRdl(element);
   assert.equal(elementAnalysis.compatible, false);
-  assert.equal(elementAnalysis.capabilities.rejected.some(({ path }) => path.endsWith('.Textbox.ToolTip')), true);
+  assert.equal(elementAnalysis.capabilities.rejected.some(({ path }) => path.endsWith(".Textbox.UnsupportedTextboxProp")), true);
 
   const attribute = fixture.toString().replace('<Textbox Name="TitleBox">', '<Textbox Name="TitleBox" UnsupportedAttribute="true">');
   const attributeAnalysis = analyzeRdl(attribute);

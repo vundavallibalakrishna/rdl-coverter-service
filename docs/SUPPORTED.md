@@ -40,8 +40,8 @@ It currently classifies **695 declared names** — 691 elements and 4 attributes
 | Status | Count |
 | --- | --- |
 | `SUPPORTED` | 160 |
-| `METADATA_ONLY` | 59 |
-| `REJECTED` | 476 |
+| `METADATA_ONLY` | 62 |
+| `REJECTED` | 473 |
 
 `POST /v1/analyze` classifies *your* RDL against this catalogue and returns every construct it uses, so you
 never have to guess whether a report will render — ask the service.
@@ -198,7 +198,6 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. Selectable text. | Exact |
 | `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables, real text. | Unknown (`null` / `X-Page-Count: unknown`) — Word paginates |
-| `DOCX_FIXED_EDITABLE` | Canonical PDF parsed into positioned editable text boxes, Word shapes, lines, and images. No page screenshot. | Exact canonical count |
 | `DOCX_VISUAL` | PDF rasterized at 300 DPI, one full-page floating image per Word page. | Exact |
 | `XLSX` | Native Excel workbook. Each tablix is a block of styled cells (fills, borders, merges, fonts); numeric and date fields are written as **live typed values** with a translated number format, not text. Charts and the logo embed as images. | Not paginated (`null`) — Excel owns print layout |
 
@@ -209,8 +208,8 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 Certified structured-DOCX profiles may be mounted and matched by `identity.definitionSha256`; auto-apply is
 off by default. Profile files fail closed on duplicate/unsafe IDs, malformed match hashes, or unknown DOCX
 rendering keys.
-`DOCX_FIXED_EDITABLE` locks pagination and geometry while keeping every report text line editable; large
-user edits can overflow their positioned text boxes. `DOCX_VISUAL` is the non-editable raster contract.
+`DOCX_VISUAL` is the exact-page contract: one full-page image per page, not editable — use it when page
+fidelity matters more than editing.
 
 `XLSX` is a data-first export. By default every tablix is stacked as a row block in one worksheet with
 autofit column widths; because the columns are shared, blocks with different column counts will not align —

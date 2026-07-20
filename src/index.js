@@ -5,7 +5,6 @@ import fs from 'node:fs/promises';
 import { loadConfig } from './config.js';
 import { ServiceError } from './errors.js';
 import { analyzeParsedRdl, analyzeRdl, parseRdl } from './rdl/parser.js';
-import { analyzeFixedEditableCompatibility } from './render/fixedCompatibility.js';
 import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
 import { RenderRunner } from './worker/runner.js';
 
@@ -62,14 +61,13 @@ export async function createConverter(options = {}) {
       });
       const result = analyzeParsedRdl(model);
       result.structuredEditable = analyzeStructuredEditableCompatibility(model, config);
-      result.fixedEditable = analyzeFixedEditableCompatibility(model, config);
       return result;
     },
 
     /**
      * Renders one artifact. Rejects with a ServiceError carrying a stable `code` and `statusCode`.
      *
-     * @param {{ rdl: Buffer|Uint8Array|string, output: 'PDF'|'DOCX_EDITABLE'|'DOCX_FIXED_EDITABLE'|'DOCX_VISUAL'|'XLSX',
+     * @param {{ rdl: Buffer|Uint8Array|string, output: 'PDF'|'DOCX_EDITABLE'|'DOCX_VISUAL'|'XLSX',
      *   parameters?: object, datasets?: object, signal?: AbortSignal }} request
      *   `datasets` values are arrays of row objects keyed by exact RDL `DataField` names.
      * @returns {Promise<{ buffer: Buffer, mimeType: string, extension: string,

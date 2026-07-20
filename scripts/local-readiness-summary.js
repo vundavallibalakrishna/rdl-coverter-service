@@ -75,8 +75,6 @@ const summary = {
     directPdfPages: stress.directPdf?.pages,
     structuredDocxPages: stress.editableDocx?.renderedPages,
     structuredDocxPageRangeAdvisoryPassed: stress.editableDocx?.pageRangeAdvisoryPassed,
-    fixedEditablePages: stress.fixedEditableDocx?.renderedPages,
-    fixedEditableMatchesPdf: stress.fixedEditableDocx?.pageCountMatchesPdf,
     nativeTables: stress.editableDocx?.openXml?.nativeTables,
     rowMarkersPassed: stress.editableDocx?.rowMarkers?.passed,
     overflowPassed: stress.editableDocx?.overflow?.passed,

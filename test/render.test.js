@@ -13,8 +13,6 @@ import { loadConfig } from '../src/config.js';
 import { parseRdl } from '../src/rdl/parser.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { renderEditableDocx } from '../src/render/docx.js';
-import { renderFixedEditableDocx } from '../src/render/fixedDocx.js';
-import { extractPdfScene } from '../src/render/pdfScene.js';
 import { renderVisualDocx } from '../src/render/visualDocx.js';
 import { cellGridWidth, computeDocxTableGeometry } from '../src/render/docxTableLayout.js';
 import { analyzeStructuredEditableCompatibility, resolveStructuredDocxOptions } from '../src/render/structuredCompatibility.js';
@@ -505,92 +503,6 @@ test('renders visual DOCX with one page image per PDF page', async (context) => 
   assert.equal((documentXml.match(/<a:blip r:embed=/g) || []).length, result.pageCount);
   assert.equal((documentXml.match(/<wp:anchor/g) || []).length, result.pageCount);
   assert.equal((documentXml.match(/w:type="page"/g) || []).length, result.pageCount - 1);
-});
-
-test('renders fixed editable DOCX from the canonical PDF scene with one fixed Word page and editable text', async () => {
-  const result = await renderFixedEditableDocx(model, request, config);
-  assert.equal(result.buffer.subarray(0, 2).toString(), 'PK');
-  assert.equal(result.pageCount, 1);
-  assert.equal(result.layoutMode, 'fixed-editable');
-  assert.equal(result.editableTextRatio, 1);
-  const zip = await JSZip.loadAsync(result.buffer);
-  const documentXml = await zip.file('word/document.xml').async('string');
-  const settingsXml = await zip.file('word/settings.xml').async('string');
-  assert.doesNotMatch(documentXml, /<w:tbl>/);
-  assert.match(documentXml, /<wps:wsp>/);
-  assert.match(documentXml, /Sales/);
-  assert.match(documentXml, /North/);
-  assert.equal((documentXml.match(/North/g) || []).length, 1);
-  assert.equal(Object.keys(zip.files).some((name) => /^word\/media\/.*\.png$/.test(name)), false);
-  assert.match(documentXml, /<w:pgSz[^>]*w:w="12240"[^>]*w:h="15840"/);
-  assert.doesNotMatch(settingsXml, /<w:(?:documentProtection|writeProtection)\b/);
-  assert.doesNotMatch(documentXml, /\blocked="1"|\bnoTextEdit\b/);
-  assert.equal((documentXml.match(/locked="0"/g) || []).length > 0, true);
-  assert.doesNotMatch(documentXml, /<a:noFill\/><a:ln(?:(?!<\/wps:spPr>)[\s\S])*?<a:solidFill>/);
-  assert.match(documentXml, /<a:alpha val="0"\/>/);
-  const drawingIds = [...documentXml.matchAll(/<wp:docPr\b[^>]*\bid="(\d+)"/g)].map((match) => match[1]);
-  assert.equal(new Set(drawingIds).size, drawingIds.length);
-
-  const canonicalPdf = await renderPdf(model, request, config);
-  const canonicalScene = await extractPdfScene(canonicalPdf.buffer, config, { defaultFontFamily: model.defaultFontFamily });
-  const firstText = canonicalScene.pages[0].objects.find((object) => object.type === 'text');
-  assert.equal(documentXml.includes(`<wp:posOffset>${Math.round(firstText.left * 12700)}</wp:posOffset>`), true);
-  assert.equal(documentXml.includes(`<wp:posOffset>${Math.round(firstText.top * 12700)}</wp:posOffset>`), true);
-
-  // Editing the OOXML text changes the visible value itself. There is no screenshot copy underneath it.
-  const editedXml = documentXml.replace('North', 'East');
-  assert.notEqual(editedXml, documentXml);
-  zip.file('word/document.xml', editedXml);
-  const editedPackage = await zip.generateAsync({ type: 'nodebuffer' });
-  const editedZip = await JSZip.loadAsync(editedPackage);
-  const roundTrippedXml = await editedZip.file('word/document.xml').async('string');
-  assert.doesNotMatch(roundTrippedXml, /North/);
-  assert.equal((roundTrippedXml.match(/East/g) || []).length, 1);
-  assert.equal(Object.keys(editedZip.files).some((name) => /^word\/media\/.*\.png$/.test(name)), false);
-});
-
-test('locks fixed editable Word pagination to every canonical PDF page', async () => {
-  const pagedModel = structuredClone(model);
-  const source = pagedModel.body.items.find((item) => item.type === 'Textbox');
-  pagedModel.body.items = [source];
-  for (let page = 2; page <= 3; page += 1) {
-    const textbox = structuredClone(source);
-    textbox.name = `FixedPage${page}`;
-    textbox.value = `FIXED_PAGE_${page}`;
-    textbox.paragraphs = [[`FIXED_PAGE_${page}`]];
-    textbox.pageBreak = { location: 'Start', disabled: 'false' };
-    pagedModel.body.items.push(textbox);
-  }
-  const [pdf, fixed] = await Promise.all([
-    renderPdf(pagedModel, request, config),
-    renderFixedEditableDocx(pagedModel, request, config),
-  ]);
-  assert.equal(pdf.pageCount, 3);
-  assert.equal(fixed.pageCount, pdf.pageCount);
-  const zip = await JSZip.loadAsync(fixed.buffer);
-  const documentXml = await zip.file('word/document.xml').async('string');
-  assert.equal((documentXml.match(/w:type="page"/g) || []).length, pdf.pageCount - 1);
-  for (let page = 2; page <= 3; page += 1) {
-    assert.equal((documentXml.match(new RegExp(`FIXED_PAGE_${page}`, 'g')) || []).length, 1);
-  }
-});
-
-test('extracts every canonical PDF text line once and records only supported drawing operators', async () => {
-  const pdf = await renderPdf(model, request, config);
-  const scene = await extractPdfScene(pdf.buffer, config, { defaultFontFamily: model.defaultFontFamily });
-  assert.deepEqual(scene.unsupportedPdfOperators, []);
-  assert.equal(scene.pageCount, pdf.pageCount);
-  const text = scene.pages.flatMap((page) => page.objects.filter((object) => object.type === 'text').map((object) => object.text));
-  for (const expected of ['Sales', 'Name', 'Amount', 'North', '1,234.50', 'South', '99.00']) {
-    assert.equal(text.filter((value) => value === expected).length, 1);
-  }
-});
-
-test('fixed editable DOCX fails closed when its configured object limit is exceeded', async () => {
-  await assert.rejects(
-    renderFixedEditableDocx(model, request, { ...config, maxFixedObjects: 2 }),
-    (error) => error.code === 'UNSUPPORTED_FEATURE' && error.statusCode === 413,
-  );
 });
 
 test('structured footer materializes PAGE and NUMPAGES as real Word fields', async () => {

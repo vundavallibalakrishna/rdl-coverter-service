@@ -16,12 +16,22 @@ const SUPPORTED_REQUIRED_NAMESPACES = new Set([
 ]);
 const ITEM_NAMES = ['Textbox', 'Tablix', 'Rectangle', 'Line', 'Image', 'Subreport', 'Chart', 'Map', 'GaugePanel', 'CustomReportItem'];
 
+// A size that may be a conditional expression (e.g. a border width of
+// =IIF(Fields!Row_Number_1.Value = 1, "1pt", "0pt")). Such a value depends on row data and cannot be
+// converted to points until render time, so keep the raw expression string; literal sizes convert now.
+function sizeOrExpression(value, fallback) {
+  if (typeof value === 'number') return value;
+  const text = textValue(value, '');
+  if (text.startsWith('=')) return text;
+  return toPoints(text || `${fallback}pt`, fallback);
+}
+
 function borderOf(border, fallback = {}) {
   const width = firstDefined(border?.Width, fallback.width, '1pt');
   return {
     style: textValue(firstDefined(border?.Style, border?.['rd:Style'], fallback.style), 'None'),
     color: textValue(firstDefined(border?.Color, fallback.color), '#000000'),
-    width: typeof width === 'number' ? width : toPoints(textValue(width, '1pt'), 1),
+    width: sizeOrExpression(width, 1),
   };
 }
 
@@ -31,17 +41,20 @@ function styleOf(style = {}, defaultFontFamily = 'Arial') {
     color: textValue(style.Color, '#000000'),
     backgroundColor: textValue(style.BackgroundColor, null),
     fontFamily: textValue(style.FontFamily, defaultFontFamily),
-    fontSize: toPoints(textValue(style.FontSize, '10pt'), 10),
+    // FontSize / Padding / LineHeight are RdlSize ExpressionType — a literal OR an =expression evaluated per
+    // row. Keep expressions raw (sizeOrExpression); the renderers resolve them via styleSize at render time.
+    fontSize: sizeOrExpression(style.FontSize, 10),
     fontWeight: textValue(style.FontWeight, 'Normal'),
     fontStyle: textValue(style.FontStyle, 'Normal'),
     textDecoration: textValue(style.TextDecoration, 'None'),
     textAlign: textValue(style.TextAlign, 'Left'),
     verticalAlign: textValue(style.VerticalAlign, 'Top'),
     format: textValue(style.Format, null),
-    paddingLeft: toPoints(textValue(style.PaddingLeft, '2pt'), 2),
-    paddingRight: toPoints(textValue(style.PaddingRight, '2pt'), 2),
-    paddingTop: toPoints(textValue(style.PaddingTop, '2pt'), 2),
-    paddingBottom: toPoints(textValue(style.PaddingBottom, '2pt'), 2),
+    paddingLeft: sizeOrExpression(style.PaddingLeft, 2),
+    paddingRight: sizeOrExpression(style.PaddingRight, 2),
+    paddingTop: sizeOrExpression(style.PaddingTop, 2),
+    paddingBottom: sizeOrExpression(style.PaddingBottom, 2),
+    lineHeight: style.LineHeight === undefined ? null : sizeOrExpression(style.LineHeight, 0),
     border,
     borders: {
       top: borderOf(style.TopBorder, border),
@@ -52,13 +65,36 @@ function styleOf(style = {}, defaultFontFamily = 'Arial') {
   };
 }
 
-function textboxParagraphs(textbox) {
+function textboxParagraphs(textbox, defaultFontFamily) {
   const paragraphs = asArray(textbox.Paragraphs?.Paragraph);
-  if (paragraphs.length === 0) return [[{ value: textValue(textbox.Value, ''), markupType: 'None' }]];
+  if (paragraphs.length === 0) return [[{
+    value: textValue(textbox.Value, ''),
+    markupType: 'None',
+    style: styleOf(textbox.Style, defaultFontFamily),
+  }]];
   return paragraphs.map((paragraph) => asArray(paragraph.TextRuns?.TextRun).map((run) => ({
     value: textValue(run.Value, ''),
     markupType: textValue(run.MarkupType, 'None'),
+    // TextRun styles are independent within a textbox. Preserve their effective inherited style instead
+    // of flattening every run to the first run's font. Renderers can then switch weight, size, family,
+    // colour, and decoration at the exact run boundary declared by the RDL.
+    style: styleOf({
+      ...(textbox.Style || {}),
+      ...(paragraph.Style || {}),
+      ...(run.Style || {}),
+      Border: textbox.Style?.Border,
+    }, defaultFontFamily),
   })));
+}
+
+function textboxParagraphStyles(textbox, defaultFontFamily) {
+  const paragraphs = asArray(textbox.Paragraphs?.Paragraph);
+  if (paragraphs.length === 0) return [styleOf(textbox.Style, defaultFontFamily)];
+  return paragraphs.map((paragraph) => styleOf({
+    ...(textbox.Style || {}),
+    ...(paragraph.Style || {}),
+    Border: textbox.Style?.Border,
+  }, defaultFontFamily));
 }
 
 function textboxStyle(textbox, defaultFontFamily) {
@@ -289,12 +325,13 @@ function parseItem(type, value, defaultFontFamily) {
   if (type === 'Chart') return parseChart(value, defaultFontFamily);
   const item = baseItem(type, value, defaultFontFamily);
   if (type === 'Textbox') {
-    const paragraphs = textboxParagraphs(value);
+    const paragraphs = textboxParagraphs(value, defaultFontFamily);
     return {
       ...item,
       style: textboxStyle(value, defaultFontFamily),
       value: paragraphs.map((runs) => runs.map((run) => run.value).join('')).join('\n'),
       paragraphs,
+      paragraphStyles: textboxParagraphStyles(value, defaultFontFamily),
       hideDuplicates: textValue(value.HideDuplicates, null),
       canGrow: parseBoolean(value.CanGrow, true),
       canShrink: parseBoolean(value.CanShrink),

@@ -9,7 +9,6 @@ import JSZip from 'jszip';
 import { parseRdl } from '../src/rdl/parser.js';
 import { loadConfig } from '../src/config.js';
 import { renderEditableDocx } from '../src/render/docx.js';
-import { renderFixedEditableDocx } from '../src/render/fixedDocx.js';
 
 const model = parseRdl(await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url)));
 const request = { parameters: { Title: 'T', Choice: 'A' }, datasets: { Sales: [{ Name: 'North', Amount: 1 }], Choices: [{ Value: 'A' }] } };
@@ -95,11 +94,74 @@ test('a visible chart that cannot be rendered fails closed instead of silently v
   );
 });
 
-test('fixed-editable renders a genuinely empty page instead of failing closed', async () => {
+test('a free-form body Rectangle preserves its children vertical spacing (not crammed to the top)', async () => {
+  // A coordinate-designed cover: a body Rectangle whose children sit at absolute Top offsets. The editable
+  // DOCX must translate those gaps into vertical whitespace (exact-height spacer paragraphs), not collapse
+  // everything to the top of the page.
   const m = structuredClone(model);
-  const textbox = m.body.items.find((item) => item.type === 'Textbox');
-  m.body.items = [{ ...structuredClone(textbox), value: '', paragraphs: [['']], top: 0, left: 0 }];
-  const result = await renderFixedEditableDocx(m, request, config); // previously threw "contains no positioned objects"
-  assert.equal(result.buffer.subarray(0, 2).toString(), 'PK');
-  assert.equal(result.pageCount, 1);
+  const tb = (name, top, text) => ({ type: 'Textbox', name, top, left: 0, width: 400, height: 20, hidden: 'false',
+    style: { paddingLeft: 2, paddingRight: 2, paddingTop: 2, paddingBottom: 2 }, paragraphs: [[text]] });
+  m.body.items = [{
+    type: 'Rectangle', name: 'Cover', top: 0, left: 0, width: 400, height: 300, hidden: 'false', style: {},
+    items: [tb('T1', 0, 'TOP'), tb('T2', 120, 'MIDDLE')], // T1 bottom = 0+20; T2 top = 120 => 100pt whitespace
+  }];
+  const zip = await JSZip.loadAsync((await renderEditableDocx(m, request, config)).buffer);
+  const xml = await zip.file('word/document.xml').async('string');
+  // 100pt whitespace (T2.top - T1.bottom) => a 2000-twip exact-height spacer paragraph between the lines.
+  assert.match(xml, /w:line="2000" w:lineRule="exact"/);
+  assert.match(xml, /TOP/);
+  assert.match(xml, /MIDDLE/);
+});
+
+test('a centered free-form image is horizontally centered from its box position (generic, not per-report)', async () => {
+  const { PNG } = await import('pngjs');
+  const png = new PNG({ width: 4, height: 4 });
+  png.data.fill(0x80);
+  for (let i = 3; i < png.data.length; i += 4) png.data[i] = 0xFF;
+  const data = PNG.sync.write(png).toString('base64');
+
+  const m = structuredClone(model);
+  m.embeddedImages = { ...(m.embeddedImages || {}), LOGO: { data, mimeType: 'image/png' } };
+  // Container width 400; image at left=150 width=100 => right margin also 150 => centered by position.
+  m.body.items = [{
+    type: 'Rectangle', name: 'Cover', top: 0, left: 0, width: 400, height: 200, hidden: 'false', style: {},
+    items: [{ type: 'Image', name: 'L', source: 'Embedded', value: 'LOGO', sizing: 'FitProportional', top: 0, left: 150, width: 100, height: 60, style: {} }],
+  }];
+  const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
+  // The image's paragraph must carry centre justification (derived from Left/Width), and the image embeds.
+  assert.match(xml, /<w:jc w:val="center"\/>[\s\S]*?<w:drawing>/);
+});
+
+test('a narrow shaded free-form box confines its fill to the RDL Width (single-cell table), not full column', async () => {
+  // A small shaded date chip on a cover: box Width 120 inside a 400-wide container. Paragraph shading would
+  // fill the whole text column; it must instead become a fixed-width single-cell table of the box Width.
+  const m = structuredClone(model);
+  m.body.items = [{
+    type: 'Rectangle', name: 'Cover', top: 0, left: 0, width: 400, height: 200, hidden: 'false', style: {},
+    items: [{ type: 'Textbox', name: 'Chip', top: 20, left: 140, width: 120, height: 24, hidden: 'false',
+      style: { backgroundColor: '#D9D9D9', paddingLeft: 2, paddingRight: 2, paddingTop: 2, paddingBottom: 2 },
+      paragraphs: [['July 2026']] }],
+  }];
+  const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
+  // A table of the box width (120pt -> 2400 twips) carrying the fill on its cell, not a full-width w:p shading.
+  assert.match(xml, /<w:tblW w:type="dxa" w:w="2400"\/>/);
+  assert.match(xml, /<w:shd[^>]*w:fill="D9D9D9"/);
+  // No report-declared border => the box must have an explicit no-border table, not the docx default grid.
+  assert.doesNotMatch(xml, /<w:tblBorders>[\s\S]*?w:val="single"[\s\S]*?<\/w:tblBorders>/);
+  assert.match(xml, /July 2026/);
+});
+
+test('a full-width shaded free-form bar stays a paragraph (no fixed-width table regression)', async () => {
+  // A shaded bar as wide as the container must NOT be wrapped — it keeps paragraph shading.
+  const m = structuredClone(model);
+  m.body.items = [{
+    type: 'Rectangle', name: 'Cover', top: 0, left: 0, width: 400, height: 200, hidden: 'false', style: {},
+    items: [{ type: 'Textbox', name: 'Bar', top: 0, left: 0, width: 400, height: 24, hidden: 'false',
+      style: { backgroundColor: '#003366', paddingLeft: 2, paddingRight: 2, paddingTop: 2, paddingBottom: 2 },
+      paragraphs: [['TITLE']] }],
+  }];
+  const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
+  assert.doesNotMatch(xml, /<w:tblW w:w="8000" w:type="dxa"/); // 400pt = 8000 twips: no fixed-width table
+  assert.match(xml, /<w:shd[^>]*w:fill="003366"/); // shading survives on the paragraph
+  assert.match(xml, /TITLE/);
 });
