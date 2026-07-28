@@ -74,6 +74,8 @@ structure, not SSRS/VB runtime semantics. That distinction is also the origin of
 `Image` with `Source=External` or `Source=Database` is rejected (`ImageSource:<source>`) — the service does
 not fetch remote resources or read databases.
 
+See [Supplying subreports](./SUBREPORTS.md) for the shared HTTP and library request contract.
+
 ## Tablix
 
 Flat tables, grouped tables, and matrices (cross-tabs).

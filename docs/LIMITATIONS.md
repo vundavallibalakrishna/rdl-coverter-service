@@ -98,6 +98,9 @@ unused definitions are rejected. Child queries are metadata and are never execut
 `DOCX_EDITABLE` and `XLSX` still reject bundled subreports because their native nested-grid composition has
 not been implemented. This prevents a child from being silently flattened or omitted.
 
+See [Supplying subreports](./SUBREPORTS.md) for the exact HTTP/library request contract, invocation matching,
+empty-result handling, and nested child/grandchild example.
+
 ### Maps and gauges
 
 `Map*` (≈60 elements: shapefiles, spatial data, tile layers, projections, viewports) and `Gauge*`

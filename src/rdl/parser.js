@@ -470,9 +470,9 @@ function collectItemDatasets(items, target = new Set()) {
   return target;
 }
 
-// Subreports are intentionally not rendered yet: their definitions and invocation-specific datasets live
-// outside the parent RDL. Preserve their complete caller-facing dependency metadata in the normalized model
-// so /v1/analyze can identify exactly what must be supplied without resolving a report-server path.
+// A bare subreport cannot render because its definition and invocation-specific datasets live outside the
+// parent RDL. Preserve complete caller-facing dependency metadata so /v1/analyze can identify what a
+// render-time bundle must supply without resolving a report-server path.
 function collectSubreports(items, target = []) {
   const visitMembers = (members) => {
     for (const member of members || []) {

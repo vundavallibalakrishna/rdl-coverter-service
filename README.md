@@ -20,6 +20,7 @@ Use it two ways, both supported and both backed by the identical pipeline:
 - [Which option should I use?](#which-option-should-i-use)
 - [Output modes](#output-modes)
 - [The request](#the-request)
+- [Supplying subreports](./docs/SUBREPORTS.md)
 - [Errors](#errors)
 - [Configuration](#configuration)
 - [Fonts](#fonts)
@@ -110,6 +111,10 @@ curl -X POST http://localhost:7070/v1/render \
 }
 ```
 
+For a parent RDL containing `Subreport` items, the request must also carry each child RDL and
+invocation-scoped child rows. See [Supplying subreports](./docs/SUBREPORTS.md) for the complete HTTP JSON,
+multipart, nested-grandchild, and validation contract.
+
 ### Render (multipart)
 
 Avoids base64 inflation on large RDLs.
@@ -185,6 +190,10 @@ try {
 }
 ```
 
+The library accepts the same `subreports` object as the HTTP API. Child RDL bytes are base64 inside that
+object even though the library accepts the parent `rdl` directly as a `Buffer`. See
+[Supplying subreports](./docs/SUBREPORTS.md#library-example).
+
 ### Check compatibility first
 
 ```js
@@ -215,7 +224,7 @@ try {
 | Export | Description |
 | --- | --- |
 | `createConverter({ config, env })` | Creates a converter. Resolves temp storage and owns a worker pool. |
-| `converter.render({ rdl, output, parameters, datasets, signal })` | → `{ buffer, mimeType, extension, pageCount, size, totalRows }` |
+| `converter.render({ rdl, output, parameters, datasets, subreports, signal })` | → `{ buffer, mimeType, extension, pageCount, size, totalRows }` |
 | `converter.analyze(rdl)` | → compatibility report. Synchronous. |
 | `converter.close()` | Terminates in-flight workers. Call on shutdown. |
 | `converter.config` | The resolved, frozen config. |
@@ -335,7 +344,7 @@ The service fails generation if package protection or a text-edit lock is detect
 | `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
-| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF` and `DOCX_VISUAL`; no catalogue, query, or filesystem resolution occurs. |
+| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF` and `DOCX_VISUAL`; see [Supplying subreports](./docs/SUBREPORTS.md). |
 | `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, places “Continued from previous page” above the next table fragment for renderer-confirmed logical-row continuations. |
 | `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Experimental native-table page fragmentation for certified report/data combinations. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
@@ -368,6 +377,10 @@ For a parent containing `<ReportName>/Shared/Child</ReportName>`, supply every c
 Child rows follow the same exact-`DataField` rule. Missing or duplicate invocation parameters, unused
 definitions, cycles, excessive nesting, unsupported child body items, and absent child datasets fail closed.
 The service never executes the child RDL query or resolves `ReportName` outside this request.
+
+The short example above shows the shape only. The complete guide explains parameter type canonicalization,
+empty child datasets, reusing signatures, multipart calls, library calls, and child-to-grandchild reports:
+[Supplying subreports](./docs/SUBREPORTS.md).
 
 ## Errors
 
