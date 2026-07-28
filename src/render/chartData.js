@@ -89,7 +89,12 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
       const numeric = raw === null || raw === undefined || raw === '' ? null : Number(raw);
       const y = Number.isFinite(numeric) ? numeric : null;
       const color = grouped ? seriesColor : pointColor(seriesDef.color, first, base, categoryIndex);
-      return { y, color, label: pointLabel(seriesDef.dataLabel, y, first, base) };
+      return {
+        y,
+        color,
+        label: pointLabel(seriesDef.dataLabel, y, first, base),
+        labelPosition: seriesDef.dataLabel?.position || 'Auto',
+      };
     });
     return { label: group.label ?? seriesDef.name, color: seriesColor, points };
   });

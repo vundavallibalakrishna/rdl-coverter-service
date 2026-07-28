@@ -75,11 +75,28 @@ risk report, it fails closed. Use a supported aggregate (`Sum`, `Avg`, `Count`, 
 
 ### Subreports
 
-`Subreport` is `REJECTED`. A subreport is a *reference to another report on a report server*, which the
-renderer would have to resolve and execute with its own datasets. This service has no report server, no
-catalogue, and no data access. Nothing it could do here would be correct.
+An unresolved `Subreport` remains `REJECTED`. A bare subreport is a *reference to another report on a report
+server*, and this service deliberately has no report server, catalogue, filesystem lookup, or data access.
 
-**Workaround:** render the subreport as its own request and assemble the results caller-side.
+`POST /v1/analyze` still reports each normalized dependency in `subreports`, including its RDL
+`ReportName`, item name, parameter names and value expressions, `KeepTogether`, `MergeTransactions`, and
+`OmitBorderOnPageBreak`. Analysis cannot declare that dependency renderable because it has no render-time
+bundle.
+
+`PDF` and `DOCX_VISUAL` rendering can resolve the dependency only when the same request supplies:
+
+- the exact child RDL as `rdlBase64`;
+- one invocation record for each evaluated child parameter signature; and
+- caller-supplied rows, keyed by exact child `DataField`, for every child rendering dataset.
+
+The current child-body contract is tablix-only. Child grids are composed into parent tablix cells, including
+group row-header cells, and an oversized child in an ordinary parent cell may paginate. A child synchronized
+with a row-spanned parent cell cannot itself exceed every available page segment and fails closed.
+Definitions are capped, recursion is cycle/depth checked, all parent/child row and request limits apply, and
+unused definitions are rejected. Child queries are metadata and are never executed.
+
+`DOCX_EDITABLE` and `XLSX` still reject bundled subreports because their native nested-grid composition has
+not been implemented. This prevents a child from being silently flattened or omitted.
 
 ### Maps and gauges
 
@@ -107,12 +124,13 @@ These have no fundamental obstacle. They need a parser, a renderer, tests, and c
 | Gauges | `REJECTED` | Large renderer, no blocker |
 | Chart types beyond bar/column/line/area/scatter/pie/doughnut | `REJECTED` | e.g. funnel, polar, range, candlestick |
 | `Image` `Source=External`/`Database` | `REJECTED` | Blocked on security grounds above, but a caller-supplied image byte channel could be added |
-| Non-`Textbox` tablix cell content | `REJECTED` | See below |
+| Tablix-cell images and lines | `REJECTED` | See below |
 
 ### Tablix cell content
 
-A tablix cell may contain a `Textbox`, optionally wrapped in container `Rectangle`s. Anything else — an
-`Image`, a `Line`, a nested `Tablix` — fails closed as `TablixCellContent:<Type>`.
+A tablix cell may contain a `Textbox`, nested `Tablix`, or caller-bundled `Subreport`, optionally wrapped in
+container `Rectangle`s. `Image`, `Line`, and other unhandled cell items fail closed as
+`TablixCellContent:<Type>`. Bundled subreports are additionally output-gated as described above.
 
 ### A note on how support gaps happen
 

@@ -1,18 +1,19 @@
 import {
   AlignmentType, BorderStyle, Document, Footer, Header, HeightRule, HorizontalPositionRelativeFrom, ImageRun, LineRuleType,
-  PageOrientation, Packer, Paragraph, ShadingType, SimpleField, Table, TableCell, TableLayoutType, TableRow, TextRun,
-  TextWrappingType, VerticalAlignTable, VerticalAnchor, VerticalPositionRelativeFrom, WidthType, WpsShapeRun,
+  ImportedXmlComponent, PageOrientation, Packer, Paragraph, ShadingType, Table, TableCell, TableLayoutType, TableRow, TextRun,
+  TextDirection, TextWrappingType, VerticalAlignTable, VerticalAnchor, VerticalPositionRelativeFrom, WidthType, WpsShapeRun,
 } from 'docx';
 import PDFDocument from 'pdfkit';
 import { ServiceError } from '../errors.js';
 import { pointsToDisplayPixels, pointsToTwips } from '../units.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, styledSegmentsForText, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { cellGridWidth, computeDocxTableGeometry } from './docxTableLayout.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { pdfFont } from './fonts.js';
+import { measureTextboxHeight } from './pdf.js';
 import { resolveStructuredDocxOptions } from './structuredCompatibility.js';
 
 function alignment(value, context = {}) {
@@ -69,26 +70,54 @@ function hasPageFieldExpression(item) {
   )));
 }
 
+function fieldElement(name, attributes = {}) {
+  return new ImportedXmlComponent(name, attributes);
+}
+
+function styledComplexField(instruction, cachedValue, runProps) {
+  // Keep every component of a live field in an explicitly styled run. Word may replace a simple field's
+  // cached result when opening or printing a document; for fields inside a floating header/footer textbox,
+  // that refresh can inherit the document/theme font despite a styled cached child. A conventional complex
+  // field gives the instruction, separator, result, and terminator their own identical RDL run properties,
+  // so both the cached display and every Word-generated refresh stay grounded in the declared font.
+  // PAGE and NUMPAGES are recalculated by Word as pagination changes. Do not mark them dirty: on some
+  // Word versions a dirty complex field inside a floating footer textbox triggers the misleading
+  // "fields may refer to other files" update prompt even though the instruction is entirely internal.
+  const begin = fieldElement('w:fldChar', { 'w:fldCharType': 'begin' });
+  const fieldCode = fieldElement('w:instrText', { 'xml:space': 'preserve' });
+  fieldCode.push(instruction);
+  const separate = fieldElement('w:fldChar', { 'w:fldCharType': 'separate' });
+  const end = fieldElement('w:fldChar', { 'w:fldCharType': 'end' });
+  return [
+    new TextRun({ ...runProps, children: [begin] }),
+    new TextRun({ ...runProps, children: [fieldCode] }),
+    new TextRun({ ...runProps, children: [separate] }),
+    new TextRun({ ...runProps, text: cachedValue }),
+    new TextRun({ ...runProps, children: [end] }),
+  ];
+}
+
 function fieldAwareChildren(item, context, runProps, overrideText) {
   if (overrideText !== undefined) return textRuns(overrideText, runProps);
   if (!hasPageFieldExpression(item)) return textRuns(textForItem(item, context), runProps);
   const values = (item.paragraphs || []).flatMap((paragraph, paragraphIndex) => paragraph.flatMap((run, runIndex) => {
     const source = run?.value ?? run;
+    const effectiveRunProps = run?.style ? runPropsFor(run.style, context) : runProps;
     const children = [];
-    if (paragraphIndex > 0 && runIndex === 0) children.push(new TextRun({ ...runProps, text: '', break: 1 }));
+    if (paragraphIndex > 0 && runIndex === 0) children.push(new TextRun({ ...effectiveRunProps, text: '', break: 1 }));
     if (typeof source !== 'string' || !/^=/.test(source) || !/Globals!(PageNumber|TotalPages)/i.test(source)) {
       const value = typeof source === 'string' && source.startsWith('=') ? evaluateExpression(source, context) : source;
-      if (value !== null && value !== undefined) children.push(...textRuns(String(value), runProps));
+      if (value !== null && value !== undefined) children.push(...textRuns(String(value), effectiveRunProps));
       return children;
     }
     const parts = splitConcatenation(source);
-    if (!parts) return textRuns(textForItem(item, context), runProps);
+    if (!parts) return textRuns(textForItem(item, context), effectiveRunProps);
     for (const part of parts) {
-      if (/^Globals!PageNumber(?:\.Value)?$/i.test(part)) children.push(new SimpleField('PAGE', '1'));
-      else if (/^Globals!TotalPages(?:\.Value)?$/i.test(part)) children.push(new SimpleField('NUMPAGES', '1'));
+      if (/^Globals!PageNumber(?:\.Value)?$/i.test(part)) children.push(...styledComplexField('PAGE', '1', effectiveRunProps));
+      else if (/^Globals!TotalPages(?:\.Value)?$/i.test(part)) children.push(...styledComplexField('NUMPAGES', '1', effectiveRunProps));
       else {
         const value = evaluateExpression(`=${part}`, context);
-        if (value !== null && value !== undefined) children.push(...textRuns(String(value), runProps));
+        if (value !== null && value !== undefined) children.push(...textRuns(String(value), effectiveRunProps));
       }
     }
     return children;
@@ -128,6 +157,7 @@ function styledRunChildren(item, context, textboxRunProps, effectiveText) {
 
 function paragraphForTextbox(item, context, overrideText, options = {}) {
   const style = item.style;
+  const paragraphStyle = options.paragraphStyle || item.paragraphStyles?.[0] || style;
   const backgroundColor = styleColor(style.backgroundColor, context, null);
   let effectiveText = overrideText;
   if (effectiveText === undefined && options.clipToBox) {
@@ -138,14 +168,15 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
     if (lines.length > maxLines) effectiveText = lines.slice(0, maxLines).join('\n');
   }
   const runProps = runPropsFor(style, context);
+  const lineHeight = styleSize(paragraphStyle?.lineHeight, context, 0) || options.lineHeight;
   return new Paragraph({
-    alignment: alignment(style.textAlign, context),
+    alignment: alignment(paragraphStyle?.textAlign ?? style.textAlign, context),
     shading: !options.suppressShading && backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
     spacing: {
-      before: 0,
-      after: 0,
-      line: options.lineHeight ? pointsToTwips(options.lineHeight) : undefined,
-      lineRule: options.lineHeight ? LineRuleType.EXACT : undefined,
+      before: pointsToTwips(styleSize(paragraphStyle?.spaceBefore, context, 0)),
+      after: pointsToTwips(styleSize(paragraphStyle?.spaceAfter, context, 0)),
+      line: lineHeight ? pointsToTwips(lineHeight) : undefined,
+      lineRule: lineHeight ? LineRuleType.EXACT : undefined,
     },
     keepLines: Boolean(item.keepTogether),
     keepNext: Boolean(options.keepNext),
@@ -156,8 +187,27 @@ function paragraphForTextbox(item, context, overrideText, options = {}) {
     pageBreakBefore: options.pageBreakBefore || undefined,
     // Recursive (parent/child) groups indent the first cell by recursion depth.
     indent: options.indentLeft ? { left: options.indentLeft } : undefined,
-    children: styledRunChildren(item, context, runProps, effectiveText),
+    children: options.children || styledRunChildren(item, context, runProps, effectiveText),
   });
+}
+
+function paragraphsForTextbox(item, context, overrideText, options = {}) {
+  // Page fields and clipped/free-form text use the established single-paragraph path because their child
+  // runs are synthesized rather than a direct one-to-one mapping of the RDL paragraphs.
+  if (hasPageFieldExpression(item) || options.clipToBox) {
+    return [paragraphForTextbox(item, context, overrideText, options)];
+  }
+  const paragraphs = styledTextForItem(item, context);
+  const fullText = paragraphs?.map((paragraph) => paragraph.runs.map((run) => run.text).join('')).join('\n');
+  if (!paragraphs?.length || (overrideText !== undefined && String(overrideText ?? '') !== fullText)) {
+    return [paragraphForTextbox(item, context, overrideText, options)];
+  }
+  return paragraphs.map((paragraph, index) => paragraphForTextbox(item, context, undefined, {
+    ...options,
+    paragraphStyle: paragraph.style || item.paragraphStyles?.[index] || item.style,
+    keepNext: options.keepNext || index < paragraphs.length - 1,
+    children: paragraph.runs.flatMap((run) => textRuns(run.text, runPropsFor(run.style || item.style, context))),
+  }));
 }
 
 function verticalAlignment(value, context = {}) {
@@ -166,6 +216,13 @@ function verticalAlignment(value, context = {}) {
   if (normalized === 'middle' || normalized === 'center') return VerticalAlignTable.CENTER;
   if (normalized === 'bottom') return VerticalAlignTable.BOTTOM;
   return VerticalAlignTable.TOP;
+}
+
+function textDirection(value, context = {}) {
+  const normalized = String(styleValue(value, context, 'Default') || 'Default').toLowerCase();
+  if (normalized === 'rotate270') return TextDirection.BOTTOM_TO_TOP_LEFT_TO_RIGHT;
+  if (normalized === 'vertical') return TextDirection.TOP_TO_BOTTOM_RIGHT_TO_LEFT;
+  return undefined;
 }
 
 function borderFor(style, context) {
@@ -197,6 +254,19 @@ function withEnforcedBottom(style) {
     ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
     : {});
   return { ...style, borders: { ...sides, bottom: enforcedBottomBorder(style) } };
+}
+
+function withoutBottom(style) {
+  const sides = style?.borders || (style?.border
+    ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
+    : {});
+  return {
+    ...style,
+    borders: {
+      ...sides,
+      bottom: { style: 'None', color: '#ffffff', width: 0 },
+    },
+  };
 }
 
 function hasPageDependentVisibility(value) {
@@ -389,7 +459,8 @@ function shadedBoxTable(child, context, containerWidth) {
   const backgroundColor = styleColor(child.style?.backgroundColor, context, null);
   const resolved = borderFor(child.style, context);
   const hasBorder = resolved && Object.values(resolved).some((side) => side.style !== BorderStyle.NONE);
-  if (!backgroundColor && !hasBorder) return null; // nothing to confine; alignment/text handles placement
+  const direction = textDirection(child.style?.writingMode, context);
+  if (!backgroundColor && !hasBorder && !direction) return null; // nothing to confine; alignment/text handles placement
   // Explicit no-border set: borderFor returns undefined when the RDL declares no border, and the docx
   // library then draws its OWN default single-line grid — a border the report never asked for.
   const none = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
@@ -411,6 +482,7 @@ function shadedBoxTable(child, context, containerWidth) {
       children: [new TableCell({
         width: { size: pointsToTwips(width), type: WidthType.DXA },
         verticalAlign: verticalAlignment(child.style?.verticalAlign, context),
+        textDirection: direction,
         shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
         margins: {
           top: pointsToTwips(styleSize(child.style?.paddingTop, context, 2)),
@@ -418,7 +490,7 @@ function shadedBoxTable(child, context, containerWidth) {
           bottom: pointsToTwips(styleSize(child.style?.paddingBottom, context, 2)),
           left: pointsToTwips(styleSize(child.style?.paddingLeft, context, 2)),
         },
-        children: [paragraphForTextbox(child, context, undefined, { suppressShading: true })],
+        children: paragraphsForTextbox(child, context, undefined, { suppressShading: true }),
       })],
     })],
   });
@@ -430,7 +502,7 @@ function shadedBoxTable(child, context, containerWidth) {
 // an oversized or vertically-centred textbox to its text and the whitespace below it disappears, making the
 // gaps uneven. Images are horizontally aligned from their box position. Gaps between boxes and the remaining
 // container height are emitted as editable spacer lines.
-function flowChildrenWithSpacing(model, items, context, containerHeight, containerWidth, zOrder) {
+function flowChildrenWithSpacing(model, items, context, containerHeight, containerWidth, zOrder, renderer) {
   const out = [];
   let flowBottom = 0;
   for (const child of [...items].sort((a, b) => (a.top || 0) - (b.top || 0) || (a.left || 0) - (b.left || 0))) {
@@ -454,13 +526,13 @@ function flowChildrenWithSpacing(model, items, context, containerHeight, contain
       const topPad = /middle|center/.test(verticalAlign) ? slack / 2 : /bottom/.test(verticalAlign) ? slack : 0;
       const bottomPad = /middle|center/.test(verticalAlign) ? slack / 2 : /bottom/.test(verticalAlign) ? 0 : slack;
       if (topPad > 0.5) out.push(spacerParagraph(topPad));
-      out.push(...childrenForItems(model, [child], context, false, null, zOrder));
+      out.push(...childrenForItems(model, [child], context, false, null, zOrder, renderer));
       if (bottomPad > 0.5) out.push(spacerParagraph(bottomPad));
     } else if (child.type === 'Image') {
       const paragraph = imageParagraph(model, child, false, null, context, flowAlignment(child, containerWidth));
       if (paragraph) out.push(paragraph);
     } else {
-      out.push(...childrenForItems(model, [child], context, false, null, zOrder));
+      out.push(...childrenForItems(model, [child], context, false, null, zOrder, renderer));
     }
     flowBottom = Math.max(flowBottom, (child.top || 0) + boxHeight);
   }
@@ -469,7 +541,7 @@ function flowChildrenWithSpacing(model, items, context, containerHeight, contain
   return out;
 }
 
-function childrenForItems(model, items, context, floating = false, origin = null, zOrder = { value: 1 }) {
+function childrenForItems(model, items, context, floating = false, origin = null, zOrder = { value: 1 }, renderer = null) {
   const children = [];
   const nextZIndex = () => {
     const value = zOrder.value;
@@ -479,8 +551,17 @@ function childrenForItems(model, items, context, floating = false, origin = null
   for (const item of [...items].sort((left, right) => left.zIndex - right.zIndex || left.top - right.top || left.left - right.left)) {
     if (isHidden(item.hidden, context)) continue;
     if (item.type === 'Textbox') {
-      if (floating) children.push(positionedShapeParagraph(item, context, origin, [paragraphForTextbox(item, context, undefined, { suppressShading: true, noWrap: true, clipToBox: true })], nextZIndex()));
-      else children.push(paragraphForTextbox(item, context));
+      if (floating) children.push(positionedShapeParagraph(item, context, origin, paragraphsForTextbox(item, context, undefined, { suppressShading: true, noWrap: true, clipToBox: true }), nextZIndex()));
+      else {
+        // Word applies text direction to table cells, not ordinary paragraphs. A rotated free-form textbox
+        // therefore uses the same native one-cell wrapper as a bounded shaded textbox; it stays editable and
+        // its width/height/direction all come from the normalized RDL geometry.
+        const boxed = textDirection(item.style?.writingMode, context)
+          ? shadedBoxTable(item, context, model.body?.width || item.width)
+          : null;
+        if (boxed) children.push(...boxed);
+        else children.push(...paragraphsForTextbox(item, context));
+      }
     }
     else if (item.type === 'Image') {
       const paragraph = imageParagraph(model, item, floating, origin, context);
@@ -493,12 +574,22 @@ function childrenForItems(model, items, context, floating = false, origin = null
       if (floating && (rectBg || !/^none$/i.test(rectBorderStyle))) children.push(positionedShapeParagraph(item, context, origin, [], nextZIndex()));
       if (floating) {
         const childOrigin = { x: origin.x + item.left, y: origin.y + item.top };
-        children.push(...childrenForItems(model, item.items || [], context, true, childOrigin, zOrder));
+        children.push(...childrenForItems(model, item.items || [], context, true, childOrigin, zOrder, renderer));
       } else {
         // Body (flow) Rectangle: preserve its internal vertical layout with spacers, and place its children
         // horizontally from their box positions — so a coordinate-designed cover keeps its layout.
-        children.push(...flowChildrenWithSpacing(model, item.items || [], context, item.height, item.width, zOrder));
+        children.push(...flowChildrenWithSpacing(model, item.items || [], context, item.height, item.width, zOrder, renderer));
       }
+    } else if (item.type === 'Tablix') {
+      if (!renderer) throw new ServiceError('UNSUPPORTED_FEATURE', 'A tablix in this document band is not supported');
+      children.push(...tableForTablix(
+        model,
+        item,
+        renderer.request,
+        renderer.config,
+        renderer.measurementDoc,
+        renderer.structuredOptions,
+      ));
     } else if (item.type === 'Line') {
       const lineWidth = styleSize(item.style?.border?.width, context, 1) || 1;
       const lineColor = styleColor(item.style?.border?.color, context, '#000000');
@@ -516,15 +607,27 @@ function childrenForItems(model, items, context, floating = false, origin = null
   return children;
 }
 
-function applyMeasurementFont(doc, config, style, context) {
+function applyMeasurementFont(doc, config, style, context, text = '') {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
   const family = styleValue(style.fontFamily, context, 'Arial');
-  doc.font(pdfFont(config, family, bold, italic)).fontSize(styleSize(style.fontSize, context, 10) || 10);
+  doc.font(pdfFont(config, family, bold, italic, text)).fontSize(styleSize(style.fontSize, context, 10) || 10);
+}
+
+function nestedTablixDeclaredHeight(cell) {
+  return Math.max(0, ...(cell.nestedTablixes || []).map((nested) => (
+    (nested.item.top || 0) + (nested.rows || []).reduce((sum, row) => Math.max(
+      row.height || 0,
+      ...row.cells.map((nestedCell) => nestedTablixDeclaredHeight(nestedCell)),
+    ) + sum, 0)
+  )));
 }
 
 function measureRows(rows, geometry, request, globals, datasets, datasetName, config, measurementDoc) {
   const placements = computeCellPlacements(rows, geometry.gridTwips.length);
+  const familyCounts = new Map();
+  let styledCells = 0;
+  let italicCells = 0;
   const metrics = rows.map((row, rowIndex) => {
     const contexts = row.cells.map((cell) => ({
       fields: row.fields,
@@ -536,15 +639,21 @@ function measureRows(rows, geometry, request, globals, datasets, datasetName, co
     }));
     const heights = row.cells.map((cell, index) => {
       const textbox = cellTextbox(cell);
-      if (!textbox || cell.hidden) return 0;
+      const nestedHeight = nestedTablixDeclaredHeight(cell);
+      if (!textbox || cell.hidden) return nestedHeight;
       const columnIndex = placements[rowIndex][index];
       const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1) / 20;
       const context = contexts[index];
-      applyMeasurementFont(measurementDoc, config, textbox.style, context);
-      const innerWidth = Math.max(1, width - styleSize(textbox.style.paddingLeft, context, 2) - styleSize(textbox.style.paddingRight, context, 2));
+      const family = String(styleValue(textbox.style.fontFamily, context, 'Arial'));
+      familyCounts.set(family, (familyCounts.get(family) || 0) + 1);
+      styledCells += 1;
+      if (/italic/i.test(String(styleValue(textbox.style.fontStyle, context, 'Normal')))) italicCells += 1;
       const text = cellText(cell);
-      const textHeight = text ? measurementDoc.heightOfString(text, { width: innerWidth, lineGap: 0 }) : 0;
-      return textHeight + styleSize(textbox.style.paddingTop, context, 2) + styleSize(textbox.style.paddingBottom, context, 2);
+      const textHeight = measureTextboxHeight(measurementDoc, config, textbox, context, text, width);
+      return Math.max(
+        nestedHeight,
+        textHeight + styleSize(textbox.style.paddingTop, context, 2) + styleSize(textbox.style.paddingBottom, context, 2),
+      );
     });
     return {
       height: Math.max(row.height, ...heights),
@@ -556,10 +665,150 @@ function measureRows(rows, geometry, request, globals, datasets, datasetName, co
       }),
     };
   });
-  return { placements, metrics };
+  const dominantFamilyCount = Math.max(0, ...familyCounts.values());
+  return {
+    placements,
+    metrics,
+    measurementRisk: {
+      fontMixRatio: styledCells > 0 ? 1 - dominantFamilyCount / styledCells : 0,
+      italicRatio: styledCells > 0 ? italicCells / styledCells : 0,
+    },
+  };
 }
 
-function fragmentRowsForWord(model, rows, rowMetrics, columnCount) {
+export function wordFragmentSafety(measurementRisk = {}) {
+  // Square the mix ratio so isolated font overrides do not repaginate an otherwise uniform table, while
+  // sustained multi-family content receives the full reserve because its metric differences compound over
+  // many rows.
+  const fontMixRatio = measurementRisk.fontMixRatio || 0;
+  const variancePenalty = Math.min(0.08,
+    fontMixRatio * fontMixRatio * 0.32 + (measurementRisk.italicRatio || 0) * 0.05);
+  // Deep and dense vertical merges add viewer-specific row-height rounding at every boundary. Derive a
+  // bounded reserve from the normalized spans themselves so nested group hierarchies cannot spill an
+  // otherwise measured fragment onto an unheaded continuation page.
+  const advancedGroupWeight = Math.min(1, (measurementRisk.advancedGroupRatio || 0) * 2);
+  const mergePenalty = advancedGroupWeight * Math.min(0.06,
+    Math.max(0, Math.log2(Math.max(1, measurementRisk.maxRowSpan || 1))) * 0.008
+      + (measurementRisk.mergeCellRatio || 0) * 0.04);
+  return 0.85 - variancePenalty - mergePenalty;
+}
+
+function measuredWordCellHeight(measurementDoc, config, textbox, context, text, width) {
+  if (!textbox || !text) return 0;
+  return measureTextboxHeight(measurementDoc, config, textbox, context, String(text), width)
+    + styleSize(textbox.style.paddingTop, context, 2) + styleSize(textbox.style.paddingBottom, context, 2);
+}
+
+// Split editable cell text into page-sized chunks using the same font measurement path as normal DOCX row
+// sizing. This is intentionally character-based (with newline/space preference), so it also handles wrapped
+// prose without explicit line breaks. Every source character remains in exactly one native Word row.
+function wordTextChunks(measurementDoc, config, textbox, context, text, width, maximumHeight) {
+  const value = String(text ?? '');
+  if (!textbox || !value || measuredWordCellHeight(measurementDoc, config, textbox, context, value, width) <= maximumHeight) return [value];
+  const chunks = [];
+  let remaining = value;
+  while (remaining) {
+    let low = 1;
+    let high = remaining.length;
+    let best = 0;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if (measuredWordCellHeight(measurementDoc, config, textbox, context, remaining.slice(0, middle), width) <= maximumHeight) {
+        best = middle;
+        low = middle + 1;
+      } else high = middle - 1;
+    }
+    if (best <= 0) best = 1;
+    if (best >= remaining.length) {
+      chunks.push(remaining);
+      break;
+    }
+    const newline = remaining.lastIndexOf('\n', best - 1);
+    const space = remaining.lastIndexOf(' ', best - 1);
+    const boundary = Math.max(newline, space);
+    const splitAt = boundary > 0 ? boundary : best;
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt + (boundary >= 0 ? 1 : 0)).trimStart();
+  }
+  return chunks.length ? chunks : [''];
+}
+
+// Word does not paint a table bottom border at an implicit page break inside one oversized `<w:tr>`. Turn
+// those exceptional rows into measured native fragments before packaging: headers repeat, every physical
+// page has an actual closing row, and the source text remains editable and non-duplicated. Ordinary rows and
+// all existing row-span fragmentation keep their unchanged path.
+function expandOversizedWordFragments(fragments, rowMetrics, rows, geometry, request, globals, datasets,
+  datasetName, config, measurementDoc, safeCapacity) {
+  const metricByRow = new Map(rows.map((row, index) => [row, rowMetrics[index]]));
+  const expanded = [];
+  for (const fragment of fragments) {
+    const headers = fragment.filter((row) => row.isHeader);
+    const body = fragment.filter((row) => !row.isHeader);
+    const oversized = body.length === 1
+      && (metricByRow.get(body[0].docxSourceRow || body[0])?.height || body[0].height) > safeCapacity;
+    if (!oversized) {
+      expanded.push(fragment);
+      continue;
+    }
+    const row = body[0];
+    const rowIndex = fragment.indexOf(row);
+    const placements = computeCellPlacements(fragment, geometry.gridTwips.length);
+    const context = {
+      fields: row.fields,
+      parameters: request.parameters || {},
+      globals,
+      dataset: datasets[datasetName] || [],
+      datasets,
+    };
+    const chunksByCell = row.cells.map((cell, cellIndex) => {
+      const textbox = cellTextbox(cell);
+      const columnIndex = placements[rowIndex][cellIndex];
+      const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1) / 20;
+      return wordTextChunks(measurementDoc, config, textbox, context, cellText(cell), width, safeCapacity);
+    });
+    const partCount = Math.max(1, ...chunksByCell.map((chunks) => chunks.length));
+    for (let part = 0; part < partCount; part += 1) {
+      const cells = row.cells.map((cell, cellIndex) => ({
+        ...cell,
+        rowSpan: 1,
+        values: [chunksByCell[cellIndex][part] ?? ''],
+      }));
+      const measuredHeight = Math.max(row.height || 0, ...cells.map((cell, cellIndex) => {
+        const textbox = cellTextbox(cell);
+        const columnIndex = placements[rowIndex][cellIndex];
+        const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1) / 20;
+        return measuredWordCellHeight(measurementDoc, config, textbox, context, cellText(cell), width);
+      }));
+      const piece = { ...row, cells, docxMeasuredHeight: Math.min(safeCapacity, measuredHeight) };
+      const physical = [...headers, piece];
+      physical.continuesFromPrevious = part > 0 || fragment.continuesFromPrevious;
+      physical.continuesToNext = part < partCount - 1 || fragment.continuesToNext;
+      expanded.push(physical);
+    }
+  }
+  return expanded;
+}
+
+function appendWordClosureRows(fragments, columnCount) {
+  return fragments.map((fragment) => {
+    const closure = {
+      docxClosureRow: true,
+      isHeader: false,
+      isStatic: true,
+      // One point is the smallest height consistently painted by both Word and LibreOffice. Sub-twip
+      // closure rows remain present in OOXML but LibreOffice can collapse their border completely.
+      height: 1,
+      fields: {},
+      cells: [{ colSpan: columnCount, rowSpan: 1, items: [], values: [], hidden: false }],
+    };
+    const closed = [...fragment, closure];
+    closed.continuesFromPrevious = fragment.continuesFromPrevious;
+    closed.continuesToNext = fragment.continuesToNext;
+    return closed;
+  });
+}
+
+function fragmentRowsForWord(model, rows, rowMetrics, columnCount, measurementRisk = {}) {
   const headerRows = rows.filter((row) => row.isHeader);
   const bodyRows = rows.filter((row) => !row.isHeader);
   if (bodyRows.length === 0) return [rows];
@@ -574,8 +823,12 @@ function fragmentRowsForWord(model, rows, rowMetrics, columnCount) {
   // margin a fragment sized to exactly fill the page spills one row onto a second, header-less page. Reserve
   // a fraction of the body so every fragment fits with headroom; a partial extra page is far worse than a
   // slightly shorter one. Not report-specific — a general safety buffer for approximate height measurement.
-  const SAFETY = 0.9;
-  const capacity = Math.max(1, pageBodyHeight * SAFETY - headerHeight);
+  // Word's row/merge metrics can exceed PDFKit's measurements substantially, especially when narrow cells
+  // combine wrapped text with mixed font families and italic metrics. Preserve the established 15% reserve
+  // for typographically uniform tables, then derive up to another 8% from the ACTUAL materialized cell
+  // styles. This is content-agnostic: it responds to metric variance, not report names, row counts, or text.
+  const safety = wordFragmentSafety(measurementRisk);
+  const capacity = Math.max(1, pageBodyHeight * safety - headerHeight);
 
   const fragmentRanges = [];
   let currentStart = -1;
@@ -656,7 +909,16 @@ function fragmentRowsForWord(model, rows, rowMetrics, columnCount) {
     }
     return sliced;
   };
-  const fragments = fragmentRanges.map(([start, end]) => [...headerRows, ...sliceRows(start, end)]);
+  const fragments = fragmentRanges.map(([start, end]) => {
+    const sourceStart = bodySourceIndexes[start];
+    const sourceEnd = bodySourceIndexes[end];
+    const fragment = [...headerRows, ...sliceRows(start, end)];
+    // Only a merge owner that crosses this explicit fragment boundary proves that the same logical row
+    // continues. Ordinary adjacent fragments are separate rows and must not be labelled as continuations.
+    fragment.continuesFromPrevious = owners.some((owner) => owner.rowIndex < sourceStart && owner.endRowIndex >= sourceStart);
+    fragment.continuesToNext = owners.some((owner) => owner.rowIndex <= sourceEnd && owner.endRowIndex > sourceEnd);
+    return fragment;
+  });
   return fragments.length > 0 ? fragments : [rows];
 }
 
@@ -664,15 +926,21 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
   const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
   const datasets = normalizeDatasets(model, request);
   const { rows, columns } = tablixRows(item, request, globals, model);
-  // Closing rules are a data-table invariant, not a generic layout-table invariant. A static, borderless
-  // one/two-row tablix is frequently used only to position a section heading; synthesizing a bottom border
-  // there creates a line that the RDL never declared. Dynamic tablixes still receive the guaranteed closing
-  // edge, while declared borders on static tablixes continue through borderFor unchanged.
-  const enforceBottomClosure = rows.some((row) => row.isStatic === false);
+  const enforceBottomClosure = shouldEnforceTablixBottom(rows);
   // Matrix tablixes expand to a data-dependent column grid; clamp uses the expanded natural width.
   const layoutItem = item.hasColumnGroups ? { ...item, columns, width: columns.reduce((sum, width) => sum + width, 0) } : item;
   const geometry = computeDocxTableGeometry(model, layoutItem);
-  const { placements, metrics: rowMetrics } = measureRows(rows, geometry, request, globals, datasets, item.datasetName, config, measurementDoc);
+  const { placements, metrics: rowMetrics, measurementRisk: fontMeasurementRisk } = measureRows(rows, geometry, request, globals, datasets, item.datasetName, config, measurementDoc);
+  const allCells = rows.flatMap((row) => row.cells);
+  const mergedCells = allCells.filter((cell) => (cell.rowSpan || 1) > 1);
+  const measurementRisk = {
+    ...fontMeasurementRisk,
+    maxRowSpan: Math.max(1, ...mergedCells.map((cell) => cell.rowSpan || 1)),
+    mergeCellRatio: allCells.length ? mergedCells.length / allCells.length : 0,
+    advancedGroupRatio: rows.length
+      ? rows.filter((row) => ['header', 'footer', 'group'].includes(row.role)).length / rows.length
+      : 0,
+  };
   // Keep-together: Word has no group-level "keep rows together", but a merged (row-span) cell means those
   // rows form one block. Only link a span when the whole block can fit on a fresh content page. The PDF
   // renderer makes the same distinction; chaining an oversized span makes Word move content repeatedly
@@ -701,59 +969,208 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
   const hasRepeatingHeader = rows.some((row) => row.isHeader);
   const useNativePageFragments = structuredOptions?.nativePageFragments === true
     || (hasRepeatingHeader && hasMergedCells);
-  const fragments = useNativePageFragments ? fragmentRowsForWord(model, rows, rowMetrics, geometry.gridTwips.length) : [rows];
+  let fragments = useNativePageFragments ? fragmentRowsForWord(model, rows, rowMetrics, geometry.gridTwips.length, measurementRisk) : [rows];
   const metricByRow = new Map(rows.map((row, index) => [row, rowMetrics[index]]));
   const keepWithNextByRow = new Map(rows.map((row, index) => [row, keepWithNext[index]]));
   const tableContext = { fields: {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
+  if (useNativePageFragments) {
+    const pageBodyHeight = freshPageCapacity + repeatedHeaderHeight;
+    const safeCapacity = Math.max(1, pageBodyHeight * wordFragmentSafety(measurementRisk) - repeatedHeaderHeight);
+    fragments = expandOversizedWordFragments(fragments, rowMetrics, rows, geometry, request, globals, datasets,
+      item.datasetName, config, measurementDoc, safeCapacity);
+    // A fragment can end after some nested vertical spans have already terminated, leaving no physical cell
+    // across those grid columns on the final source row. Word then ignores the table-level bottom border in
+    // the vacant columns. A zero-content, exact-height spanning row provides one real closing edge across the
+    // entire grid without changing report data or merge ownership.
+    if (enforceBottomClosure) fragments = appendWordClosureRows(fragments, geometry.gridTwips.length);
+  }
+  const showContinuationMarkers = continuationMarkersEnabled(request);
+  const representativeTextbox = rows.flatMap((row) => row.cells).map((cell) => cellTextbox(cell)).find(Boolean);
+  const continuationMarkerParagraph = (text, options = {}) => {
+    const style = representativeTextbox?.style || item.style || {};
+    const context = tableContext;
+    const markerRunProps = runPropsFor(style, context);
+    const markerSize = Math.max(14, Math.round(markerRunProps.size * 0.8));
+    return new Paragraph({
+      pageBreakBefore: options.pageBreakBefore || undefined,
+      alignment: AlignmentType.RIGHT,
+      spacing: { before: 0, after: 0, line: markerSize * 10, lineRule: LineRuleType.EXACT },
+      children: [new TextRun({
+        ...markerRunProps,
+        size: markerSize,
+        bold: false,
+        italics: true,
+        color: '000000',
+        text,
+      })],
+    });
+  };
+  const tableForNestedTablix = (nested, availableWidth) => {
+    const nestedRows = nested.rows || [];
+    const naturalColumns = nested.columns || nested.item.columns || [];
+    const naturalWidth = Math.max(1, naturalColumns.reduce((sum, value) => sum + value, 0));
+    const usableWidth = Math.max(1, availableWidth - Math.max(0, nested.item.left || 0));
+    const renderedWidth = Math.min(naturalWidth, usableWidth);
+    const scale = renderedWidth / naturalWidth;
+    const gridTwips = naturalColumns.map((value) => Math.max(1, pointsToTwips(value * scale)));
+    const placements = computeCellPlacements(nestedRows, gridTwips.length);
+    const nestedContext = (row) => ({
+      fields: row.fields || {},
+      parameters: request.parameters || {},
+      globals,
+      dataset: row.scopeDataset || datasets[nested.item.datasetName] || [],
+      datasets,
+    });
+    const nestedTable = new Table({
+      layout: TableLayoutType.FIXED,
+      width: { size: gridTwips.reduce((sum, value) => sum + value, 0), type: WidthType.DXA },
+      indent: (nested.item.left || 0) > 0 ? { size: pointsToTwips(nested.item.left), type: WidthType.DXA } : undefined,
+      columnWidths: gridTwips,
+      borders: borderFor(nested.item.style, nestedContext(nestedRows[0] || {})),
+      rows: nestedRows.map((row, rowIndex) => new TableRow({
+        tableHeader: row.isHeader || undefined,
+        cantSplit: row.keepTogether || row.isHeader || undefined,
+        height: { value: Math.max(1, pointsToTwips(row.height || 0)), rule: HeightRule.ATLEAST },
+        children: row.cells.map((cell, cellIndex) => {
+          const textbox = cellTextbox(cell);
+          const context = nestedContext(row);
+          const style = (cell.containerWrapped ? nested.item.style : textbox?.style) || nested.item.style;
+          const columnIndex = placements[rowIndex][cellIndex];
+          const width = cellGridWidth(gridTwips, columnIndex, cell.colSpan || 1);
+          const childWidth = width / 20;
+          const nestedChildren = (cell.nestedTablixes || []).length
+            ? nativeNestedChildren(cell, childWidth)
+            : null;
+          return new TableCell({
+            columnSpan: cell.colSpan || 1,
+            rowSpan: cell.rowSpan > 1 ? cell.rowSpan : undefined,
+            width: { size: width, type: WidthType.DXA },
+            verticalAlign: verticalAlignment(style.verticalAlign, context),
+            textDirection: textDirection(style.writingMode, context),
+            borders: borderFor(style, context),
+            shading: styleColor(style.backgroundColor, context, null)
+              ? { type: ShadingType.CLEAR, fill: styleColor(style.backgroundColor, context, null).replace('#', '') }
+              : undefined,
+            margins: {
+              top: pointsToTwips(styleSize(style.paddingTop, context, 0)),
+              right: pointsToTwips(styleSize(style.paddingRight, context, 0)),
+              bottom: pointsToTwips(styleSize(style.paddingBottom, context, 0)),
+              left: pointsToTwips(styleSize(style.paddingLeft, context, 0)),
+            },
+            children: nestedChildren || (textbox && !cell.hidden
+              ? paragraphsForTextbox(textbox, context, cellText(cell))
+              : [new Paragraph('')]),
+          });
+        }),
+      })),
+    });
+    return nestedTable;
+  };
+  function nativeNestedChildren(cell, availableWidth) {
+    const output = [];
+    let flowBottom = 0;
+    for (const nested of [...(cell.nestedTablixes || [])].sort((a, b) => (
+      (a.item.top || 0) - (b.item.top || 0) || (a.item.left || 0) - (b.item.left || 0)
+    ))) {
+      const gap = (nested.item.top || 0) - flowBottom;
+      if (gap > 0.5) output.push(spacerParagraph(gap));
+      output.push(tableForNestedTablix(nested, availableWidth));
+      const tableHeight = (nested.rows || []).reduce((sum, row) => sum + (row.height || 0), 0);
+      flowBottom = Math.max(flowBottom, (nested.item.top || 0) + tableHeight);
+    }
+    // Word requires a paragraph after a nested table in a table cell. Keep it visually inert.
+    output.push(new Paragraph({ spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } }));
+    return output;
+  }
   const tableForRows = (fragmentRows) => {
     const fragmentPlacements = computeCellPlacements(fragmentRows, geometry.gridTwips.length);
+    const hasClosureRow = fragmentRows.at(-1)?.docxClosureRow === true;
+    const contentBottomRowIndex = fragmentRows.length - (hasClosureRow ? 2 : 1);
     return new Table({
     layout: TableLayoutType.FIXED,
     width: { size: geometry.tableTwips, type: WidthType.DXA },
     indent: geometry.indentTwips > 0 ? { size: geometry.indentTwips, type: WidthType.DXA } : undefined,
     columnWidths: geometry.gridTwips,
-    borders: borderFor(item.style, tableContext),
+    // A closure strip owns the fragment edge at its TOP, where the content cells actually terminate. Its
+    // table-level bottom must stay absent because that boundary is one point lower and would create a gap.
+    // Unfragmented/native-flow tables retain the table-level fallback used when Word suppresses cell edges.
+    borders: borderFor(hasClosureRow
+      ? withoutBottom(item.style)
+      : (enforceBottomClosure ? withEnforcedBottom(item.style) : item.style), tableContext),
     rows: fragmentRows.map((row, rowIndex) => {
       const sourceRow = row.docxSourceRow || row;
       const rowMetric = metricByRow.get(sourceRow);
+      const measuredRowHeight = row.docxMeasuredHeight || rowMetric?.height || row.height;
+      // An intrinsically page-taller row cannot satisfy cantSplit. Combining that flag with a multi-page
+      // `trHeight` makes Word move the row to the next page first (leaving the current page blank), then
+      // split it anyway. Let Word grow and split this exceptional row naturally from the current page.
+      const intrinsicallyPageTaller = !row.isHeader && measuredRowHeight > freshPageCapacity;
       return new TableRow({
-      tableHeader: row.isHeader || undefined,
-      cantSplit: row.isHeader || row.keepTogether || undefined,
-      height: { value: pointsToTwips(rowMetric?.height || row.height), rule: HeightRule.ATLEAST },
-      children: row.cells.map((cell, index, cells) => {
-        const textbox = cellTextbox(cell);
-        const style = textbox?.style || item.style;
-        // Container-only cells (content wrapped in a Rectangle) have no border-bearing item of their own,
-        // so their edges come from the tablix style — matching the PDF renderer.
-        let borderStyle = cell.containerWrapped ? item.style : style;
-        // Hard rule: the table's last row is always closed with a bottom border (cell borders win over the
-        // table border in Word, so enforcing it on the cell — not just tblBorders — is what makes it show).
-        // A vertically merged cell is declared only on its OWNER row; the final physical row contains no
-        // cell object for that covered column. Enforce the edge on every owner whose rowSpan reaches the
-        // fragment end, otherwise grouped columns remain open when the final row is a merge continuation.
-        const reachesFragmentBottom = rowIndex + Math.max(1, cell.rowSpan || 1) >= fragmentRows.length;
-        if (enforceBottomClosure && reachesFragmentBottom) borderStyle = withEnforcedBottom(borderStyle);
-        const columnIndex = fragmentPlacements[rowIndex][index];
-        const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1);
-        const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
-        const backgroundColor = styleColor(style.backgroundColor, context, null);
-        return new TableCell({
-          columnSpan: cell.colSpan || 1,
-          rowSpan: cell.rowSpan > 1 ? cell.rowSpan : undefined,
-          width: { size: width, type: WidthType.DXA },
-          verticalAlign: verticalAlignment(style.verticalAlign, context),
-          borders: borderFor(borderStyle, context),
-          shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
-          margins: { top: pointsToTwips(styleSize(style.paddingTop, context, 2)), right: pointsToTwips(styleSize(style.paddingRight, context, 2)), bottom: pointsToTwips(styleSize(style.paddingBottom, context, 2)), left: pointsToTwips(styleSize(style.paddingLeft, context, 2)) },
-          children: textbox && !cell.hidden ? [paragraphForTextbox(textbox, context,
-            hasPageFieldExpression(textbox) ? undefined : cellText(cell), {
-            keepNext: keepWithNextByRow.get(sourceRow),
-            indentLeft: index === 0 && row.indentLevel ? pointsToTwips(row.indentLevel * 12) : undefined,
-            lineHeight: rowMetric?.lineHeights[index],
-          })] : [new Paragraph('')],
-        });
-      }),
-    });
+        tableHeader: row.isHeader || undefined,
+        // Native page-fragment mode has already chosen safe physical row boundaries. Prevent Word from
+        // re-splitting one of those rows across an extra viewer-created page, which produces partial bottom
+        // borders and separates cells from the rest of their logical row. Word may still split the exceptional
+        // case of a single row taller than the entire page because no intact placement is possible.
+        cantSplit: intrinsicallyPageTaller ? undefined : (useNativePageFragments || row.isHeader || row.keepTogether || undefined),
+        height: intrinsicallyPageTaller ? undefined : {
+          value: Math.max(1, pointsToTwips(measuredRowHeight)),
+          rule: row.docxClosureRow ? HeightRule.EXACT : HeightRule.ATLEAST,
+        },
+        children: row.cells.map((cell, index, cells) => {
+          const textbox = cellTextbox(cell);
+          const style = textbox?.style || item.style;
+          // Container-only cells (content wrapped in a Rectangle) have no border-bearing item of their own,
+          // so their edges come from the tablix style — matching the PDF renderer.
+          const none = { style: 'None', color: '#ffffff', width: 0 };
+          const closing = enforcedBottomBorder(item.style);
+          let borderStyle = row.docxClosureRow
+            // Paint the authoritative edge at the content boundary. The strip remains one point high so
+            // Word and LibreOffice retain the cell, but no visible rule is displaced below the verticals.
+            ? { borders: { top: closing, right: none, bottom: none, left: none } }
+            : cell.containerWrapped ? item.style : style;
+          // Remove content-cell bottoms that coincide with the strip's top so the shared boundary has one
+          // owner. The spanning strip closes every grid column, including columns vacant because a vertical
+          // merge owner ended on the preceding row.
+          const reachesContentBottom = !row.docxClosureRow
+            && rowIndex + Math.max(1, cell.rowSpan || 1) - 1 >= contentBottomRowIndex;
+          if (hasClosureRow && reachesContentBottom) borderStyle = withoutBottom(borderStyle);
+          // Hard rule: the table's last row is always closed with a bottom border (cell borders win over the
+          // table border in Word, so enforcing it on the cell — not just tblBorders — is what makes it show).
+          // A vertically merged cell is declared only on its OWNER row; the final physical row contains no
+          // cell object for that covered column. Enforce the edge on every owner whose rowSpan reaches the
+          // fragment end, otherwise grouped columns remain open when the final row is a merge continuation.
+          const reachesFragmentBottom = rowIndex + Math.max(1, cell.rowSpan || 1) >= fragmentRows.length;
+          if (enforceBottomClosure && reachesFragmentBottom && !row.docxClosureRow) {
+            borderStyle = withEnforcedBottom(borderStyle);
+          }
+          const columnIndex = fragmentPlacements[rowIndex][index];
+          const width = cellGridWidth(geometry.gridTwips, columnIndex, cell.colSpan || 1);
+          const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
+          const backgroundColor = styleColor(style.backgroundColor, context, null);
+          return new TableCell({
+            columnSpan: cell.colSpan || 1,
+            rowSpan: cell.rowSpan > 1 ? cell.rowSpan : undefined,
+            width: { size: width, type: WidthType.DXA },
+            verticalAlign: verticalAlignment(style.verticalAlign, context),
+            textDirection: textDirection(style.writingMode, context),
+            borders: borderFor(borderStyle, context),
+            shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor.replace('#', '') } : undefined,
+            margins: row.docxClosureRow
+              ? { top: 0, right: 0, bottom: 0, left: 0 }
+              : { top: pointsToTwips(styleSize(style.paddingTop, context, 2)), right: pointsToTwips(styleSize(style.paddingRight, context, 2)), bottom: pointsToTwips(styleSize(style.paddingBottom, context, 2)), left: pointsToTwips(styleSize(style.paddingLeft, context, 2)) },
+            children: row.docxClosureRow
+              ? [new Paragraph({ spacing: { before: 0, after: 0, line: 20, lineRule: LineRuleType.EXACT } })]
+              : (cell.nestedTablixes || []).length
+                ? nativeNestedChildren(cell, width / 20)
+              : textbox && !cell.hidden ? paragraphsForTextbox(textbox, context,
+                hasPageFieldExpression(textbox) ? undefined : cellText(cell), {
+                  keepNext: keepWithNextByRow.get(sourceRow),
+                  indentLeft: index === 0 && row.indentLevel ? pointsToTwips(row.indentLevel * 12) : undefined,
+                  lineHeight: rowMetric?.lineHeights[index],
+                }) : [new Paragraph('')],
+          });
+        }),
+      });
     }),
   });
   };
@@ -761,7 +1178,9 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
   // next fragment to begin in the remainder of the current page and overflow again. Put the break on a tiny
   // standalone paragraph BETWEEN tables—the same reliable construct used for explicit RDL section breaks.
   return fragments.flatMap((fragment, index) => [
-    ...(index > 0 ? [new Paragraph({ pageBreakBefore: true, spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } })] : []),
+    ...(index > 0 ? [showContinuationMarkers && fragment.continuesFromPrevious
+      ? continuationMarkerParagraph(CONTINUATION_MARKERS.fromPrevious, { pageBreakBefore: true })
+      : new Paragraph({ pageBreakBefore: true, spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } })] : []),
     tableForRows(fragment),
   ]);
 }
@@ -806,7 +1225,50 @@ async function chartParagraph(model, item, request, config, tempDir, context, in
   });
 }
 
+async function modelWithRasterizedNestedCharts(model, request, config, tempDir) {
+  const clone = structuredClone(model);
+  const datasets = normalizeDatasets(clone, request);
+  const context = {
+    parameters: request.parameters || {},
+    globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: clone.variables || {} },
+    fields: {},
+    dataset: [],
+    datasets,
+  };
+  let index = 10_000; // separate namespace from top-level chartParagraph indices
+  const visit = async (items, nested) => {
+    for (const item of items || []) {
+      if (item.type === 'Chart' && nested) {
+        if (!config || !tempDir) {
+          throw new ServiceError('RENDER_FAILED', 'Nested chart rendering requires a configured render environment (config and temporary directory)', 500, { chart: item.name });
+        }
+        const data = materializeChart(item, datasets, context.parameters, context.globals);
+        const image = await renderChartPng(item, data, config, tempDir, context, index);
+        if (!image) throw new ServiceError('RENDER_FAILED', `Chart '${item.name}' could not be rendered`, 500, { chart: item.name });
+        const imageName = `__docx_nested_chart_${index}`;
+        clone.embeddedImages[imageName] = { data: image.data.toString('base64'), mimeType: 'image/png' };
+        item.type = 'Image';
+        item.source = 'Embedded';
+        item.value = imageName;
+        item.sizing = 'FitProportional';
+        delete item.items;
+        index += 1;
+      } else if (item.items) {
+        await visit(item.items, true);
+      }
+    }
+  };
+  await visit(clone.body.items, false);
+  await visit(clone.page.header?.items, true);
+  await visit(clone.page.footer?.items, true);
+  return clone;
+}
+
 export async function renderEditableDocx(model, request, config, tempDir) {
+  // Charts inside Rectangles/page bands are not reached by the top-level chart branch. Rasterize those
+  // recursively into ordinary embedded Image items before flow layout so visible nested charts can never
+  // disappear silently from editable Word output.
+  model = await modelWithRasterizedNestedCharts(model, request, config, tempDir);
   const landscape = model.page.width > model.page.height;
   const children = [];
   const context = { parameters: request.parameters || {}, globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: model.variables || {} }, fields: {}, dataset: [], datasets: normalizeDatasets(model, request) };
@@ -831,7 +1293,12 @@ export async function renderEditableDocx(model, request, config, tempDir) {
     else if (item.type === 'Chart') {
       children.push(await chartParagraph(model, item, request, config, tempDir, context, chartIndex));
       chartIndex += 1;
-    } else children.push(...childrenForItems(model, [item], context));
+    } else children.push(...childrenForItems(model, [item], context, false, null, { value: 1 }, {
+      request,
+      config: measurementConfig,
+      measurementDoc,
+      structuredOptions,
+    }));
     if (/^(End|StartAndEnd)$/i.test(pageBreak)) forcePageBreak = true;
   }
   measurementDoc.end();

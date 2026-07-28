@@ -69,6 +69,7 @@ structure, not SSRS/VB runtime semantics. That distinction is also the origin of
 | `Image` | **`Source=Embedded` only.** `Sizing`: `Fit`, `FitProportional`, `Clip`, `AutoSize` |
 | `Line` | Body level only |
 | `Chart` | See [Charts](#charts) |
+| `Subreport` | `PDF` / `DOCX_VISUAL` only, with caller-bundled child RDL and invocation-scoped datasets; tablix-only child body |
 
 `Image` with `Source=External` or `Source=Database` is rejected (`ImageSource:<source>`) — the service does
 not fetch remote resources or read databases.
@@ -92,8 +93,8 @@ Flat tables, grouped tables, and matrices (cross-tabs).
 `validation.js needsAdvancedMaterialization`. A tablix using none of them takes the original flat path and
 materializes byte-identically. Do not remove those gates.
 
-Cell content is restricted to `Textbox` (optionally wrapped in container `Rectangle`s). Any other item type
-in a cell fails closed as `TablixCellContent:<Type>` — see
+Cell content supports `Textbox`, nested `Tablix`, and caller-bundled `Subreport` (optionally wrapped in
+container `Rectangle`s). Other item types fail closed as `TablixCellContent:<Type>` — see
 [LIMITATIONS.md](./LIMITATIONS.md#tablix-cell-content).
 
 ## Charts
@@ -132,6 +133,14 @@ a hard security invariant, not an implementation detail.
 plus `.IsMissing`, `.Count`, `.IsMultiValue`, and indexed `Parameters!X.Value(0)`.
 
 Globals available: `PageNumber`, `TotalPages`, `ReportName`, `ExecutionTime`.
+
+### Expression-capable layout properties
+
+Supported style, border, visibility, image, and paragraph-layout properties are evaluated in the current
+row scope rather than treated as raw strings. This includes `Paragraph/SpaceBefore`,
+`Paragraph/SpaceAfter`, and `Paragraph/Style/LineHeight`; PDF measurement and native DOCX paragraph
+spacing use the resolved RDL sizes. `TextRun/Value@EvaluationMode="Constant"` treats its value literally,
+including a leading `=`, while the default `Auto` mode retains normal SSRS expression detection.
 
 ### Operators
 
@@ -205,6 +214,12 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 `POST /v1/analyze` returns `structuredEditable` with native-DOCX drift risks and the
 `structuredEditable.nativePageFragments.recommendation` value for the RDL shape. The optional
 `docx.nativePageFragments` render flag keeps real Word tables but must be certified per report/data set.
+
+Set `pagination.continuationMarkers` to `true` to label renderer-confirmed logical-row continuations in
+PDF and editable DOCX. Both formats place “Continued from previous page” above the next table fragment;
+the current page remains unannotated. PDF detects cell-text and row-span splits. Editable DOCX detects
+row-span continuations across explicit native fragments. Pagination that Word creates after opening or
+editing the document is not observable during generation and therefore is not labelled.
 Certified structured-DOCX profiles may be mounted and matched by `identity.definitionSha256`; auto-apply is
 off by default. Profile files fail closed on duplicate/unsafe IDs, malformed match hashes, or unknown DOCX
 rendering keys.
@@ -214,8 +229,8 @@ fidelity matters more than editing.
 `XLSX` defaults to case-insensitive `excel.layoutMode: "REPORT"`. Visible report items are partitioned into
 worksheets only at resolved explicit RDL page breaks. Each section gets an independent coordinate-derived
 grid: title bands, textboxes, rectangles, lines, tablixes, fills, per-side borders, alignment, fonts, and
-horizontal headings remain native editable cells. Group values that span PDF rows are repeated in ordinary
-cells instead of vertically merged, so selection, copying, sorting, and filtering remain normal. Declared
+horizontal headings remain native editable cells. Group values that span PDF rows retain their RDL row
+spans as native editable merged regions, matching the PDF/DOCX table hierarchy. Declared
 embedded RDL images may be pictures; report layout, tables, and text are never rasterized or emitted as
 shapes. Visible charts fail with `UNSUPPORTED_FEATURE` in REPORT mode rather than disappearing.
 
@@ -239,7 +254,8 @@ emitted for XLSX.
 | Combined Assurance 2016 client profile | Smoke-tested |
 | Incident Dashboard | Smoke-tested |
 | KRI Report | Smoke-tested |
-| Internal 520-row stress fixture | Implemented + verified by `npm run verify:stress` |
+| Internal 470-row, multi-font/border stress fixture | Implemented + structurally and raster verified by `npm run verify:stress` |
+| Internal five-level nested-group/overflow stress fixture | Implemented + structurally and raster verified by `npm run verify:stress:nested` |
 
 No report is **SSRS-certified**. That requires the reference package described in `AGENTS.md` — the exact
 SSRS reference PDF, its parameters, its rows, and its licensed font versions from the same run — and the

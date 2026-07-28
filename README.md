@@ -279,7 +279,7 @@ Choose `DOCX_EDITABLE` when users need normal Word table editing and reflow (Wor
 breaks will not match the PDF). Choose `DOCX_VISUAL` when page-for-page fidelity matters and editing is not
 required — it is one full-page image per page. Choose the default XLSX `REPORT` layout for an editable,
 PDF-styled workbook without PDF pagination. It splits only at explicit RDL page breaks, keeps layout and
-tablix content in native cells, repeats grouped values instead of vertically merging them, and permits only
+tablix content in native cells, preserves RDL group row spans as editable merged regions, and permits only
 declared embedded RDL images as pictures. Set `"excel": { "layoutMode": "DATA" }` for the legacy data-first
 stacked workbook; `sheetPerTablix` remains available only in that mode.
 
@@ -335,6 +335,8 @@ The service fails generation if package protection or a text-edit lock is detect
 | `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
+| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF` and `DOCX_VISUAL`; no catalogue, query, or filesystem resolution occurs. |
+| `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, places “Continued from previous page” above the next table fragment for renderer-confirmed logical-row continuations. |
 | `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Experimental native-table page fragmentation for certified report/data combinations. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
 | `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
@@ -344,6 +346,28 @@ The service fails generation if package protection or a text-edit lock is detect
 > The two are often different, and confusing them is the most common integration error. The service maps
 > `DataField` → `Name` so expressions can use `Fields!Name.Value`. `POST /v1/analyze` returns the exact
 > `DataField` names each dataset expects — use it rather than guessing.
+
+For a parent containing `<ReportName>/Shared/Child</ReportName>`, supply every concrete invocation:
+
+```json
+{
+  "subreports": {
+    "/Shared/Child": {
+      "rdlBase64": "PD94bWwg...",
+      "instances": [
+        {
+          "parameters": { "EntityID": 42 },
+          "datasets": { "ChildData": [{ "Entity ID": 42, "Label": "Resolved child row" }] }
+        }
+      ]
+    }
+  }
+}
+```
+
+Child rows follow the same exact-`DataField` rule. Missing or duplicate invocation parameters, unused
+definitions, cycles, excessive nesting, unsupported child body items, and absent child datasets fail closed.
+The service never executes the child RDL query or resolves `ReportName` outside this request.
 
 ## Errors
 
@@ -375,12 +399,14 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_TEMP_ROOT` | `<tmpdir>/rdl-converter` | Private scratch root. Created `0700`. |
 | `RDL_FONT_DIR` | `<cwd>/fonts` | Licensed font directory. |
 | `RDL_STRICT_FONTS` | `true` | `false` substitutes missing fonts. **Development only.** |
+| `RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS` | `false` in strict mode; `true` in non-strict mode | Permit explicitly catalogued, glyph-validated font fallbacks. This is never an unrestricted system-font substitution. |
 | `RDL_MAX_RDL_BYTES` | `10485760` (10 MB) | Max RDL size. |
 | `RDL_MAX_REQUEST_BYTES` | `26214400` (25 MB) | Max request size. |
 | `RDL_MAX_ROWS` | `100000` | Max rows per render. |
 | `RDL_MAX_CONCURRENCY` | `2` | Concurrent renders. Beyond this → `BUSY`. |
 | `RDL_RENDER_TIMEOUT_MS` | `120000` | Hard render deadline. |
-| `RDL_WORKER_MEMORY_MB` | `512` | V8 heap cap per worker. |
+| `RDL_WORKER_MEMORY_MB` | `512` | Baseline V8 heap cap for an ordinary worker. |
+| `RDL_WORKER_MEMORY_MAX_MB` | `2048` | Hard cap for deterministic PDF workload-based heap scaling. Never lower than the baseline. |
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
 | `RDL_DOCX_NATIVE_PAGE_FRAGMENTS` | `false` | Experimental: split large `DOCX_EDITABLE` tablixes into native table fragments at PDF-like break estimates. Certify per RDL before enabling. |
@@ -404,6 +430,10 @@ missing font is `FONT_MISSING` (503) rather than a silent substitution that quie
   them at runtime into `RDL_FONT_DIR` (`/app/fonts` in the container).
 - Reports commonly need Arial, Times New Roman, and — for the Combined Assurance profile — Segoe UI and
   Segoe UI Symbol (the legend glyphs). Segoe UI is licensed on the client machine.
+- `Segoe UI Emoji` may use a mounted `NotoEmoji-Regular.ttf` as an explicitly enabled compatible PDF
+  fallback. The renderer validates the actual glyphs before layout and embedding; supplementary-plane emoji
+  never fall through to Helvetica. Enable this in strict mode only with
+  `RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS=true`.
 - `GET /readyz` reports exactly which variants are missing.
 - `RDL_STRICT_FONTS=false` substitutes them for local development. Never in production.
 
@@ -432,7 +462,8 @@ Every render gets a `0700` directory with `0600` files, runs in a forked child p
 heap, completes the whole artifact before response headers are sent, and has its directory removed on
 success, failure, timeout, disconnect, **and** shutdown.
 
-Defaults: 10 MB per RDL, 25 MB per request, 100,000 rows, 120 s, two concurrent workers, 512 MB heap each.
+Defaults: 10 MB per RDL, 25 MB per request, 100,000 rows, 120 s, two concurrent workers, a 512 MB
+baseline heap, and a 2048 MB hard per-worker cap for exceptionally wide or text-heavy PDF workloads.
 
 ## Docker
 
@@ -459,7 +490,10 @@ The short version: a table-report subset, fail-closed. Textbox, embedded image, 
 normalized tablix reports; exact `DataField` mapping; parameters, visibility, conditional styles, filters,
 sorts, nested and dynamic groups, merged cells, repeated headers, per-side borders, duplicate suppression,
 safe HTML-to-text normalization, z-order, keep-together, page settings and breaks, and a catalogued safe
-expression subset. Maps, gauges, subreports, custom code, and non-embedded images are rejected.
+expression subset. Expression-capable paragraph spacing and line height are resolved per row, and
+`TextRun/Value@EvaluationMode="Constant"` preserves a leading `=` as literal text. Caller-bundled,
+invocation-scoped tablix subreports render in PDF and visual DOCX; unresolved subreports and subreports in
+editable DOCX/XLSX remain fail-closed. Maps, gauges, custom code, and non-embedded images are rejected.
 
 To ask the service instead of reading docs, `POST /v1/analyze`. To dump the whole schema catalogue:
 
@@ -467,8 +501,8 @@ To ask the service instead of reading docs, `POST /v1/analyze`. To dump the whol
 npm run audit:schema   # tmp/output/rdl-2016-capability-catalogue.json
 ```
 
-Of the 695 declared names in Microsoft's 2016 schema (691 elements, 4 attributes): **160** `SUPPORTED`,
-**62** `METADATA_ONLY`, **473** `REJECTED`. The default is `REJECTED`.
+Of the 695 declared names in Microsoft's 2016 schema (691 elements, 4 attributes): **169** `SUPPORTED`,
+**62** `METADATA_ONLY`, **464** `REJECTED`. The default is `REJECTED`.
 
 > **Accuracy language.** *Implemented* = the code path and tests exist. *Smoke-tested* = the supplied RDL
 > renders in all modes with clean temporary storage. *SSRS-certified* = output passed comparison against the
@@ -523,23 +557,31 @@ npm run smoke:sample -- "/path/to/report.rdl"
 RDL_FONT_HOST_DIR="/path/to/licensed-font-directory" npm run smoke:docker -- "/path/to/report.rdl"
 npm run audit:schema
 npm run verify:stress -- --require-pass
+npm run verify:stress:nested -- --require-pass
 npm run verify:reference -- "/path/to/report.rdl" "/path/to/reference.pdf" "/path/to/hydration.json"
 npm run certify:docx -- "/path/to/report.rdl" "/path/to/request.json" "/path/to/ssrs-reference.pdf" --renderer=word --exact-inputs --require-match
 ```
 
 Inspect representative PDF/DOCX output. **An HTTP `200` is not verification.**
 
-- **`verify:stress`** renders a deterministic 520-row table as direct PDF, structured DOCX, and fixed
-  editable DOCX; converts both DOCX files back to PDF; and requires the structured DOCX to preserve native
-  tables, repeated headers, merges, exact-once row markers, and overflow content. Structured page count is
-  reported as an advisory because Word/LibreOffice own native-table pagination. Fixed Word must exactly
-  match the canonical PDF page count and dimensions within Word's smallest page-size unit (one twip,
-  0.05 pt). It
-  covers three repeating header rows, interlocking horizontal and vertical merges, nested group sorting,
-  wrapped and conditionally styled cells, one cell taller than a page, natural pagination, an explicit page
-  break, and exact-once row markers. It also verifies fixed Word contains positioned editable shapes rather
-  than native tables or a page screenshot. This certifies the mechanics — it does not claim SSRS pixel
+- **`verify:stress`** renders a deterministic 470-row table as direct PDF and structured editable DOCX,
+  then converts the DOCX back to PDF. Its canonical PDF must be 30–40 pages; structured-DOCX page count is
+  advisory because Word/LibreOffice own native-table pagination. The gate requires exact-once row and
+  oversized-cell markers, native tables, repeated headers, interlocking horizontal/vertical merges, and a
+  structurally closed bottom border on every explicit table fragment. It also raster-checks the complete
+  bottom rule on every table-bearing PDF and DOCX page, including pages created by a cell taller than the
+  page. Every text/field run must explicitly name its RDL font; the fixture materially mixes Arial, Times New
+  Roman, and Segoe UI with bold, italic, underline, colour, conditional fills, per-side/dashed borders,
+  wrapped text, nested grouping, and a final explicit page break. Artifacts and the JSON audit are written
+  directly under `tmp/`. This certifies renderer mechanics — it does not claim SSRS or Microsoft Word visual
   certification.
+- **`verify:stress:nested`** runs the same structural, traceability, font-grounding, package-integrity, and
+  all-page raster-border gates against a deterministic five-level hierarchy. It combines repeatable
+  multi-band headers, nested row-header spans, group headers/footers and scoped totals, conditional
+  visibility/styles, explicit group page breaks, and three independently page-taller editable cells. The
+  canonical PDF is constrained to 30–40 pages; editable Word pagination remains advisory. Oversized Word
+  rows must be split into bounded native rows, and every emitted page fragment must carry a continuous
+  full-grid closing rule. Artifacts are direct children of `tmp/`.
 - **`verify:reference`** renders a hydrated PDF, compares page count and dimensions, checks text anchors,
   rasterizes the first three pages at 144 DPI, and writes a comparison report. Add `--exact-inputs
   --require-match` **only** when the hydration and font versions come from the exact SSRS reference run.

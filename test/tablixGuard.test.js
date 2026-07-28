@@ -47,3 +47,22 @@ test('a plain grouped detail tablix is not treated as an advanced (subtotal) tab
   const tablix = parseRdl(rdl).body.items.find((item) => item.type === 'Tablix');
   assert.equal(needsAdvancedMaterialization(tablix), false);
 });
+
+test('a grouped multi-column row-header chain uses per-instance advanced materialization', () => {
+  const leaf = { children: [] };
+  const fourthHeader = { header: { size: 40 }, children: [leaf] };
+  const thirdHeader = { header: { size: 40 }, children: [fourthHeader] };
+  const secondHeader = { header: { size: 40 }, children: [thirdHeader] };
+  const firstHeader = { header: { size: 40 }, children: [secondHeader] };
+  const groupedHeaderChain = {
+    group: { name: 'DetailGroup', expressions: ['=Fields!Id.Value'] },
+    children: [firstHeader],
+  };
+  const tablix = {
+    hasColumnGroups: false,
+    rowMembers: [groupedHeaderChain],
+    rowMemberPaths: [[groupedHeaderChain, firstHeader, secondHeader, thirdHeader, fourthHeader, leaf]],
+  };
+
+  assert.equal(needsAdvancedMaterialization(tablix), true);
+});

@@ -8,7 +8,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { buildApp } from '../src/app.js';
-import { fontAvailability, resolveFontFile } from '../src/render/fonts.js';
+import { fontAvailability, pdfFont, resolveFontFile } from '../src/render/fonts.js';
 import { loadConfig } from '../src/config.js';
 
 // Set an env var for the duration of fn(), restoring (or unsetting) it afterwards even on failure.
@@ -50,6 +50,61 @@ test('fontAvailability marks a fully-mounted family available with no missing va
   assert.equal(entry.available, true);
   assert.deepEqual(entry.missingVariants, []);
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('emoji never falls through to Helvetica when no embedded font covers the glyph', async () => {
+  const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-empty-fonts-'));
+  const config = loadConfig({
+    ...process.env,
+    RDL_FONT_DIR: fontDir,
+    RDL_STRICT_FONTS: 'false',
+    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+  });
+  assert.throws(
+    () => pdfFont(config, 'Segoe UI Emoji', false, false, '😊'),
+    (error) => error?.code === 'FONT_MISSING' && /emoji/i.test(error.message),
+  );
+  await fs.rm(fontDir, { recursive: true, force: true });
+});
+
+test('compatible emoji fallback is explicit and visible in font availability', async () => {
+  const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-emoji-fallback-'));
+  const fallback = path.join(fontDir, 'NotoEmoji-Regular.ttf');
+  await fs.writeFile(fallback, 'resolver fixture');
+  const disabled = loadConfig({
+    ...process.env,
+    RDL_FONT_DIR: fontDir,
+    RDL_STRICT_FONTS: 'true',
+    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'false',
+  });
+  assert.throws(() => pdfFont(disabled, 'Segoe UI Emoji'), (error) => error?.code === 'FONT_MISSING');
+
+  const enabled = loadConfig({
+    ...process.env,
+    RDL_FONT_DIR: fontDir,
+    RDL_STRICT_FONTS: 'true',
+    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+  });
+  assert.equal(pdfFont(enabled, 'Segoe UI Emoji'), fallback);
+  const [availability] = fontAvailability(enabled, ['Segoe UI Emoji']);
+  assert.equal(availability.available, false);
+  assert.equal(availability.compatibleFallback, 'Noto Emoji');
+  assert.equal(availability.renderable, true);
+  assert.equal(availability.blocksStrictRender, false);
+  await fs.rm(fontDir, { recursive: true, force: true });
+});
+
+test('a fallback filename alone is insufficient when its font does not cover the emoji', async () => {
+  const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-invalid-emoji-fallback-'));
+  await fs.writeFile(path.join(fontDir, 'NotoEmoji-Regular.ttf'), 'not a font');
+  const config = loadConfig({
+    ...process.env,
+    RDL_FONT_DIR: fontDir,
+    RDL_STRICT_FONTS: 'false',
+    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+  });
+  assert.throws(() => pdfFont(config, 'Segoe UI Emoji', false, false, '😡'), (error) => error?.code === 'FONT_MISSING');
+  await fs.rm(fontDir, { recursive: true, force: true });
 });
 
 test('a font installed in the Windows %SystemRoot%\\Fonts directory resolves without mounting', async () => {

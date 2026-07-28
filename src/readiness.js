@@ -22,7 +22,12 @@ export async function readiness(config) {
   // `ready` still gates only on the always-required base families (Arial, Times New Roman). The catalogue is
   // informational: it shows which other licensed faces the host actually has, so ops can see at a glance that
   // an optional-but-report-consumed family such as Segoe UI is present before a report that needs it arrives.
-  checks.fonts = { ...checkFonts(config), catalogue: fontAvailability(config, ['Arial', 'Times New Roman', 'Segoe UI', 'Segoe UI Symbol']) };
+  checks.fonts = {
+    ...checkFonts(config),
+    catalogue: fontAvailability(config, [
+      'Arial', 'Times New Roman', 'Segoe UI', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Emoji',
+    ]),
+  };
   try {
     await execFileAsync(config.pdftoppmPath, ['-v'], { timeout: 5_000, maxBuffer: 64 * 1024 });
     checks.pdftoppm = { ready: true };

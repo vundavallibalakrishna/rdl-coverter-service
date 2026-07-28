@@ -130,6 +130,62 @@ test('overlapping tablix merge plans fail closed', async () => {
   await assert.rejects(renderExcel(overlapping, request, config, null), (error) => error.code === 'RDL_INVALID');
 });
 
+test('REPORT mode coalesces adjacent free-form edges that overlap only by their shared border stroke', async () => {
+  const adjacent = structuredClone(model);
+  const source = adjacent.body.items.find((item) => item.type === 'Textbox');
+  const item = (name, value, left, width) => {
+    const textbox = structuredClone(source);
+    textbox.name = name;
+    textbox.value = value;
+    textbox.top = 0;
+    textbox.left = left;
+    textbox.width = width;
+    textbox.height = 20;
+    textbox.style.border = { style: 'Solid', color: '#000000', width: 1 };
+    textbox.style.borders = Object.fromEntries(['top', 'right', 'bottom', 'left']
+      .map((side) => [side, { style: 'Solid', color: '#000000', width: 1 }]));
+    textbox.paragraphs = [[{ value, markupType: 'None', style: textbox.style }]];
+    return textbox;
+  };
+  adjacent.page.header = {
+    height: 20,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [{
+      type: 'Rectangle', name: 'HeaderBand', top: 0, left: 0, width: 140, height: 20,
+      zIndex: 0, hidden: 'false', style: source.style, pageBreak: null, items: [
+        item('LeftHeader', 'Left header', 0, 70.75),
+        item('RightHeader', 'Right header', 69.75, 70.25),
+      ],
+    }],
+  };
+
+  const ws = await load((await renderExcel(adjacent, request, config, null)).buffer);
+  assert.ok(findCell(ws, 'Left header'));
+  assert.ok(findCell(ws, 'Right header'));
+});
+
+test('REPORT mode treats a one-quarter-point accumulated band edge as the declared band boundary', async () => {
+  const quantized = structuredClone(model);
+  const imageEdge = structuredClone(quantized.body.items.find((item) => item.type === 'Textbox'));
+  imageEdge.name = 'BandEdge';
+  imageEdge.value = 'Band edge';
+  imageEdge.paragraphs = [[{ value: 'Band edge', markupType: 'None', style: imageEdge.style }]];
+  imageEdge.top = 2.414976377952756;
+  imageEdge.left = 0;
+  imageEdge.width = 100;
+  imageEdge.height = 49.1700188976378;
+  quantized.page.header = {
+    height: 51.58499527559055,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [imageEdge],
+  };
+
+  const ws = await load((await renderExcel(quantized, request, config, null)).buffer);
+  assert.ok(findCell(ws, 'Band edge'));
+});
+
 test('sheetPerTablix puts each tablix on its own worksheet with its own columns', async () => {
   const single = await renderExcel(model, request, config, null);
   assert.equal(single.sheetCount, 1); // default: everything stacked on one sheet
@@ -173,6 +229,15 @@ test('explicit page breaks create stable section worksheets and normal views hav
   }
 });
 
+test('a declared RDL PageName is preferred for the native section worksheet name', async () => {
+  const named = structuredClone(model);
+  named.body.items.find((item) => item.type === 'Tablix').pageName = '=Parameters!Title.Value & " detail"';
+  const result = await renderExcel(named, request, config, null);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(result.buffer);
+  assert.equal(wb.worksheets[0].name, 'Sales detail');
+});
+
 test('only declared repeating header rows produce a valid frozen pane and AutoFilter', async () => {
   const repeating = structuredClone(model);
   const tablix = repeating.body.items.find((item) => item.type === 'Tablix');
@@ -203,7 +268,7 @@ test('multiple RDL text runs remain native Excel rich text', async () => {
   assert.equal(cell.value.richText[1].font.color.argb, 'FFCC0000');
 });
 
-test('vertical group spans become repeated editable values and FixedData freezes a real column split', async () => {
+test('REPORT mode preserves vertical group spans as native merges and closes the final grid edge', async () => {
   const grouped = parseRdl(groupedRdl());
   const groupedRequest = { outputFileName: 'Grouped', parameters: {}, datasets: { D: [
     { Region: 'East', Name: 'A', Amount: 1 },
@@ -214,8 +279,21 @@ test('vertical group spans become repeated editable values and FixedData freezes
   const ws = await load(result.buffer);
   const eastCells = [];
   ws.eachRow((row) => row.eachCell((cell) => { if (cell.value === 'East') eastCells.push(cell.address); }));
-  assert.equal(eastCells.length, 2, `expected repeated group values, got ${eastCells.join(', ')}`);
-  assert.equal((ws.model.merges || []).some((range) => range.includes(`${eastCells[0]}:`)), false);
+  const eastMasters = new Set(eastCells.map((address) => ws.getCell(address).master.address));
+  assert.equal(eastMasters.size, 1, `expected one merged group owner, got ${eastCells.join(', ')}`);
+  const eastMaster = [...eastMasters][0];
+  const zip = await JSZip.loadAsync(result.buffer);
+  const sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+  const mergeRefs = [...sheetXml.matchAll(/<mergeCell ref="([A-Z]+\d+:[A-Z]+\d+)"/g)].map((match) => match[1]);
+  const eastMerge = mergeRefs.find((range) => range.startsWith(`${eastMaster}:`));
+  assert.ok(eastMerge, `the grouped risk/header value must own a vertical merged range: ${eastMaster} / ${mergeRefs.join(', ')}`);
+  const [, endAddress] = eastMerge.split(':');
+  assert.notEqual(endAddress.replace(/\d+/g, ''), '');
+  assert.notEqual(Number(endAddress.match(/\d+/)?.[0]), Number(eastMaster.match(/\d+/)?.[0]));
+  const finalRow = ws.getRow(ws.rowCount);
+  for (let column = 1; column <= ws.columnCount; column += 1) {
+    assert.equal(finalRow.getCell(column).border?.bottom?.style, 'thin', `missing final bottom border in column ${column}`);
+  }
   assert.ok((ws.views.find((view) => view.state === 'frozen')?.xSplit || 0) > 0);
 });
 

@@ -36,6 +36,16 @@ export const conversionFunctions = {
     return String(v);
   },
 
+  // VB Str reserves a leading character for the sign of non-negative numbers, uses "." as its decimal
+  // separator, and emits a minus sign (without the leading space) for negative numbers. This is deliberately
+  // distinct from CStr: SSRS reports sometimes concatenate Str(...) and rely on that sign-space.
+  Str(args) {
+    const n = toNumber(args[0]);
+    if (!Number.isFinite(n)) return null;
+    const rendered = String(Object.is(n, -0) ? 0 : n);
+    return n < 0 ? rendered : ` ${rendered}`;
+  },
+
   CBool(args) {
     const v = args[0];
     if (isBlank(v)) return false;

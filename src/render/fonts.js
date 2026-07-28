@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import * as fontkit from 'fontkit';
 import { ServiceError } from '../errors.js';
 
 const FILE_CANDIDATES = {
@@ -15,12 +16,23 @@ const FILE_CANDIDATES = {
   'Segoe UI:bold': ['Segoe UI Bold.ttf', 'segoeuib.ttf'],
   'Segoe UI:italic': ['Segoe UI Italic.ttf', 'segoeuii.ttf'],
   'Segoe UI:bolditalic': ['Segoe UI Bold Italic.ttf', 'segoeuiz.ttf'],
+  'Segoe UI Emoji': ['Segoe UI Emoji.ttf', 'seguiemj.ttf'],
+  'Noto Emoji': ['NotoEmoji-Regular.ttf', 'NotoEmoji.ttf'],
   // Segoe UI Symbol carries the ☺/☹ (U+263A/U+2639) legend glyphs. Windows ships seguisym.ttf — preferred
   // and found first in the licensed font directory. Where it is absent, fall back to another font that
   // actually covers those code points: the base-14 Helvetica fallback does NOT, so the glyphs would
   // otherwise render as garbage rather than smileys.
   'Segoe UI Symbol': ['Segoe UI Symbol.ttf', 'seguisym.ttf', 'Arial Unicode.ttf', 'Apple Symbols.ttf'],
 };
+
+const COMPATIBLE_FALLBACKS = Object.freeze({
+  // Segoe UI Emoji is commonly a colour font that cannot be subset by every PDF backend. Noto Emoji is
+  // an outline font with compatible Unicode semantics; the ordinary UI families cover any Latin tokens
+  // that share the same RDL run (for example "Low 😊").
+  'Segoe UI Emoji': ['Noto Emoji', 'Segoe UI', 'Arial'],
+});
+
+const openedFonts = new Map();
 
 function styleKey(family, bold, italic) {
   return `${family}${bold || italic ? `:${bold ? 'bold' : ''}${italic ? 'italic' : ''}` : ''}`;
@@ -58,15 +70,64 @@ export function resolveFontFile(fontDir, family, bold = false, italic = false) {
   return null;
 }
 
-export function pdfFont(config, family, bold = false, italic = false) {
-  const normalized = ['Arial', 'Times New Roman', 'Segoe UI', 'Segoe UI Symbol'].includes(family) ? family : null;
+function openedFont(file) {
+  if (!openedFonts.has(file)) openedFonts.set(file, fontkit.openSync(file));
+  return openedFonts.get(file);
+}
+
+function fontCoversText(file, text) {
+  if (!text) return true;
+  try {
+    return openedFont(file).layout(String(text)).glyphs.every((glyph) => glyph.id !== 0);
+  } catch {
+    return false;
+  }
+}
+
+function containsEmoji(text) {
+  return /\p{Extended_Pictographic}/u.test(String(text || ''));
+}
+
+function fallbackFamilies(family, text = '') {
+  const families = [...(COMPATIBLE_FALLBACKS[family] || [])];
+  // A pictographic character in an otherwise ordinary run still needs a glyph-capable font. This is
+  // deliberately coverage-checked below; no family is selected merely because its filename exists.
+  if (containsEmoji(text)) families.unshift('Noto Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol');
+  return [...new Set(families.filter((candidate) => candidate !== family))];
+}
+
+function compatibleFont(config, family, bold, italic, text = '') {
+  if (!config.allowCompatibleFontFallbacks) return null;
+  for (const candidateFamily of fallbackFamilies(family, text)) {
+    const file = resolveFontFile(config.fontDir, candidateFamily, bold, italic);
+    if (file && fontCoversText(file, text)) return { family: candidateFamily, file };
+  }
+  return null;
+}
+
+export function pdfFont(config, family, bold = false, italic = false, text = '') {
+  const supported = ['Arial', 'Times New Roman', 'Segoe UI', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Emoji'];
+  const normalized = supported.includes(family) ? family : null;
   if (!normalized) {
     if (config.strictFonts) throw new ServiceError('FONT_MISSING', `Required font is unavailable: ${family}`, 503);
+    if (containsEmoji(text)) {
+      const fallback = compatibleFont(config, family, bold, italic, text);
+      if (fallback) return fallback.file;
+      throw new ServiceError('FONT_MISSING', `No embedded font covers the required emoji for: ${family}`, 503);
+    }
     return bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica');
   }
   const file = resolveFontFile(config.fontDir, normalized, bold, italic);
-  if (file) return file;
+  if (file && fontCoversText(file, text)) return file;
+  const fallback = compatibleFont(config, normalized, bold, italic, text);
+  if (fallback) return fallback.file;
+  if (file && !text) return file;
   if (config.strictFonts) throw new ServiceError('FONT_MISSING', `Required font is unavailable: ${normalized}`, 503);
+  // Base-14 fonts cannot represent supplementary-plane emoji. Failing here prevents the corrupt surrogate
+  // bytes that Helvetica otherwise writes while keeping legacy non-strict fallback for ordinary text.
+  if (containsEmoji(text)) {
+    throw new ServiceError('FONT_MISSING', `No embedded font covers the required emoji for: ${normalized}`, 503);
+  }
   if (normalized === 'Times New Roman') return bold ? (italic ? 'Times-BoldItalic' : 'Times-Bold') : (italic ? 'Times-Italic' : 'Times-Roman');
   return bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica');
 }
@@ -91,12 +152,15 @@ export function fontAvailability(config, families = []) {
     const missingVariants = VARIANTS
       .filter(([bold, italic]) => !resolveFontFile(config.fontDir, family, bold, italic))
       .map(([, , style]) => style);
+    const fallback = compatibleFont(config, family, false, false);
     return {
       family,
       available: missingVariants.length === 0,
       missingVariants,
+      compatibleFallback: fallback?.family || null,
+      renderable: missingVariants.length === 0 || Boolean(fallback),
       // strict render would reject a report that consumes an unavailable family (PDF must embed it).
-      blocksStrictRender: config.strictFonts && missingVariants.length > 0,
+      blocksStrictRender: config.strictFonts && missingVariants.length > 0 && !fallback,
     };
   });
 }

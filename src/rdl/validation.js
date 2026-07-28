@@ -19,6 +19,36 @@ function validateParameterType(parameter, value) {
   }
 }
 
+export function resolveParameterValues(definitions, parameters = {}) {
+  const resolved = { ...parameters };
+  for (const parameter of definitions || []) {
+    const defaultValue = parameter.multiValue ? parameter.defaultValues : parameter.defaultValues[0];
+    const value = hasValue(parameters[parameter.name]) ? parameters[parameter.name] : defaultValue;
+    if (!hasValue(value) && !parameter.nullable && !parameter.allowBlank) {
+      throw new ServiceError('PARAMETER_INVALID', `Required parameter is missing: ${parameter.name}`);
+    }
+    if (hasValue(value)) validateParameterType(parameter, value);
+    resolved[parameter.name] = value;
+  }
+  return resolved;
+}
+
+function canonicalParameterValue(parameter, value) {
+  if (parameter.multiValue) return (value || []).map((entry) => canonicalParameterValue({ ...parameter, multiValue: false }, entry));
+  if (value === null || value === undefined) return null;
+  if (parameter.dataType === 'Integer' || parameter.dataType === 'Float') return Number(value);
+  if (parameter.dataType === 'Boolean') return String(value).toLowerCase() === 'true';
+  if (parameter.dataType === 'DateTime') return new Date(value).toISOString();
+  return String(value);
+}
+
+export function parameterSignature(definitions, parameters = {}) {
+  return JSON.stringify((definitions || []).map((parameter) => [
+    parameter.name,
+    canonicalParameterValue(parameter, parameters[parameter.name]),
+  ]));
+}
+
 export function validateRenderInput(model, request, limits) {
   if (model.unsupported.length > 0) throw new ServiceError(
     'UNSUPPORTED_FEATURE',
@@ -26,15 +56,7 @@ export function validateRenderInput(model, request, limits) {
     400,
     { features: model.unsupported.slice(0, 100) },
   );
-  const parameters = request.parameters || {};
-  const resolvedParameters = { ...parameters };
-  for (const parameter of model.parameters) {
-    const defaultValue = parameter.multiValue ? parameter.defaultValues : parameter.defaultValues[0];
-    const value = hasValue(parameters[parameter.name]) ? parameters[parameter.name] : defaultValue;
-    if (!hasValue(value) && !parameter.nullable && !parameter.allowBlank) throw new ServiceError('PARAMETER_INVALID', `Required parameter is missing: ${parameter.name}`);
-    if (hasValue(value)) validateParameterType(parameter, value);
-    resolvedParameters[parameter.name] = value;
-  }
+  const resolvedParameters = resolveParameterValues(model.parameters, request.parameters || {});
 
   const datasets = request.datasets || {};
   let totalRows = 0;
@@ -65,7 +87,13 @@ function itemUsesFields(item) {
 
 function normalizeFields(row, definitions = []) {
   const normalized = { ...row };
-  for (const field of definitions) normalized[field.name] = row[field.dataField];
+  for (const field of definitions) {
+    // Nested data regions receive the already-normalized rows from their containing group scope. Preserve
+    // that internal field value when the original DataField key is no longer present; this also makes
+    // normalization idempotent without weakening the request validator's exact-DataField requirement.
+    if (Object.hasOwn(row, field.dataField)) normalized[field.name] = row[field.dataField];
+    else if (!Object.hasOwn(normalized, field.name)) normalized[field.name] = undefined;
+  }
   return normalized;
 }
 
@@ -76,7 +104,9 @@ function evaluateItemText(item, context) {
   }
   return normalizeDisplayText(item.paragraphs.map((runs) => runs.map((run) => {
     const definition = run && typeof run === 'object' ? run : { value: run, markupType: 'None' };
-    const value = evaluateExpression(definition.value, context);
+    const value = /^constant$/i.test(String(definition.evaluationMode || 'Auto'))
+      ? definition.value
+      : evaluateExpression(definition.value, context);
     if (value === null || value === undefined) return '';
     const format = expressionValue(definition.style?.format ?? item.style?.format, context);
     const formatted = format ? String(formatValue(value, format)) : String(value);
@@ -144,8 +174,23 @@ function groupValue(group, fields, parameters, globals, dataset, datasets, rowIn
   return group.expressions.map((expression) => expressionValue(expression, context));
 }
 
-function scopeKey(scope, tablix, groups, fields, parameters, globals, dataset, datasets, rowIndex) {
+function scopeKey(scope, tablix, groups, fields, parameters, globals, dataset, datasets, rowIndex, memberPath = []) {
   if (!scope || scope === tablix.datasetName) return `dataset:${tablix.datasetName}`;
+  // HideDuplicates is scoped to a containing GROUP INSTANCE, not merely to the target group's
+  // expression value. The same child value (especially Nothing/null) under two different parent
+  // instances represents two distinct scopes in SSRS and must display once in each. Include every
+  // containing group from the current hierarchy path through the named scope so nested instances do
+  // not collapse into one global `<group>:<value>` bucket.
+  const instancePath = [];
+  for (const [depth, member] of memberPath.entries()) {
+    const group = member.group;
+    if (!group) continue;
+    instancePath.push([
+      group.name || `depth:${depth}`,
+      groupValue(group, fields, parameters, globals, dataset, datasets, rowIndex),
+    ]);
+    if (group.name === scope) return `${scope}:${JSON.stringify(instancePath)}`;
+  }
   const group = groups.get(scope);
   if (!group) return `scope:${scope}`;
   return `${scope}:${JSON.stringify(groupValue(group, fields, parameters, globals, dataset, datasets, rowIndex))}`;
@@ -190,6 +235,34 @@ function headerSpans(descriptors, widths) {
   return spans;
 }
 
+function assertMaterializedGrid(rows, columnCount, tablixName) {
+  if (columnCount === 0) return;
+  const occupied = new Array(columnCount).fill(0);
+  for (const [rowIndex, row] of rows.entries()) {
+    const covered = occupied.map((remaining) => remaining > 0);
+    let columnIndex = 0;
+    for (const cell of row.cells || []) {
+      while (columnIndex < columnCount && covered[columnIndex]) columnIndex += 1;
+      const colSpan = Math.max(1, cell.colSpan || 1);
+      if (columnIndex + colSpan > columnCount) {
+        throw new ServiceError('RDL_INVALID', `Tablix ${tablixName || 'unnamed'} row ${rowIndex + 1} exceeds its declared column grid`);
+      }
+      for (let offset = 0; offset < colSpan; offset += 1) {
+        if (covered[columnIndex + offset]) {
+          throw new ServiceError('RDL_INVALID', `Tablix ${tablixName || 'unnamed'} row ${rowIndex + 1} contains overlapping cells`);
+        }
+        covered[columnIndex + offset] = true;
+        if ((cell.rowSpan || 1) > 1) occupied[columnIndex + offset] = Math.max(occupied[columnIndex + offset], cell.rowSpan || 1);
+      }
+      columnIndex += colSpan;
+    }
+    if (covered.some((value) => !value)) {
+      throw new ServiceError('RDL_INVALID', `Tablix ${tablixName || 'unnamed'} row ${rowIndex + 1} does not cover its declared column grid`);
+    }
+    for (let index = 0; index < occupied.length; index += 1) occupied[index] = Math.max(0, occupied[index] - 1);
+  }
+}
+
 function itemValue(item, context) {
   return item.type === 'Textbox' ? evaluateItemText(item, context) : '';
 }
@@ -209,6 +282,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     throw new ServiceError('UNSUPPORTED_FEATURE', `Tablix cell content is not supported: ${unrenderable.type}`);
   }
   const values = cell.items.map((item, itemIndex) => {
+    if (item.type === 'Tablix' || item.type === 'Subreport') return '';
     const value = itemValue(item, context);
     if (item.type !== 'Textbox' || !item.hideDuplicates) return value;
     const key = `${duplicatePrefix}:${item.name || itemIndex}`;
@@ -217,9 +291,80 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     duplicateState.set(key, current);
     return previous && previous.scope === current.scope && previous.value === current.value ? '' : value;
   });
+  const nestedTablixes = cell.items.filter((item) => item.type === 'Tablix').map((item) => {
+    const depth = (context.nestedTablixDepth || 0) + 1;
+    if (depth > 8) {
+      throw new ServiceError('UNSUPPORTED_FEATURE', 'Nested tablix depth exceeds the supported limit of 8');
+    }
+    const parentDatasetName = context.tablixDatasetName;
+    if (item.datasetName && parentDatasetName && item.datasetName !== parentDatasetName) {
+      throw new ServiceError(
+        'UNSUPPORTED_FEATURE',
+        `Nested tablix ${item.name || 'unnamed'} must use the containing tablix dataset`,
+      );
+    }
+    const scopedRows = context.nestedDataset || context.dataset || [];
+    const nestedGlobals = { ...context.globals, __nestedTablixDepth: depth };
+    return {
+      item,
+      rows: materializeTablixRows(item, scopedRows, context.parameters, nestedGlobals, context.datasets),
+      columns: materializeTablixColumns(item, scopedRows, context.parameters, nestedGlobals, context.datasets),
+      parameters: context.parameters,
+      datasets: context.datasets,
+      globals: nestedGlobals,
+    };
+  });
+  for (const item of cell.items.filter((candidate) => candidate.type === 'Subreport')) {
+    if (evalHidden(item.hidden, context)) continue;
+    const resolved = item.resolvedSubreport;
+    if (!resolved?.model || !resolved.instancesBySignature) {
+      throw new ServiceError('UNSUPPORTED_FEATURE', `Subreport is not bundled: ${item.reportName || item.name || 'unnamed'}`);
+    }
+    const suppliedParameters = Object.fromEntries((item.parameters || []).map((parameter) => [
+      parameter.name,
+      evaluateExpression(parameter.value, context),
+    ]));
+    const childParameters = resolveParameterValues(resolved.model.parameters, suppliedParameters);
+    const signature = parameterSignature(resolved.model.parameters, childParameters);
+    const instance = resolved.instancesBySignature.get(signature);
+    if (!instance) {
+      throw new ServiceError(
+        'DATASET_MISSING',
+        `Subreport invocation data is missing: ${item.reportName || item.name || 'unnamed'}`,
+      );
+    }
+    const childDatasets = Object.fromEntries(resolved.model.datasets.map((dataset) => [
+      dataset.name,
+      (instance.datasets[dataset.name] || []).map((row) => normalizeFields(row, dataset.fields)),
+    ]));
+    const childGlobals = {
+      ...context.globals,
+      ReportName: resolved.reportName,
+      variables: resolved.model.variables || {},
+      __nestedTablixDepth: (context.nestedTablixDepth || 0) + 1,
+    };
+    for (const childItem of resolved.model.body.items) {
+      const nestedItem = {
+        ...childItem,
+        left: (item.left || 0) + (childItem.left || 0),
+        top: (item.top || 0) + (childItem.top || 0),
+      };
+      const rawRows = instance.datasets[childItem.datasetName] || [];
+      nestedTablixes.push({
+        item: nestedItem,
+        rows: materializeTablixRows(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
+        columns: materializeTablixColumns(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
+        parameters: instance.parameters,
+        datasets: childDatasets,
+        globals: childGlobals,
+        subreport: true,
+      });
+    }
+  }
   return {
     ...cell,
     values,
+    nestedTablixes,
     hidden: cell.items.some((item) => {
       const result = evaluateExpression(item.hidden, context);
       return result === true || String(result).toLowerCase() === 'true';
@@ -276,10 +421,9 @@ export function needsAdvancedMaterialization(tablix) {
   if (tablix.hasColumnGroups) return true;
   const hasParent = (members) => (members || []).some((member) => member.group?.parent || hasParent(member.children));
   if (hasParent(tablix.rowMembers)) return true;
-  // A group header/footer subtotal row is a STATIC leaf member (no Group element at all) nested inside
-  // an ancestor group that has grouping expressions. A detail leaf (the `Details` group, expressions
-  // empty) still has a Group element and is intentionally NOT matched, so ordinary grouped tables stay
-  // on the flat path.
+  // A group header/footer row is a STATIC leaf member (no Group element) nested inside an ancestor
+  // group. This also covers SSRS's group-instance row-header chains: the recursive materializer must
+  // emit those once per group instance rather than once per source row.
   return (tablix.rowMemberPaths || []).some((path) => {
     const leaf = path[path.length - 1];
     if (leaf?.group) return false;
@@ -298,15 +442,25 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
   const scopeContext = (path, fields, rowIndex) => {
     const scopes = { [tablix.datasetName]: sourceRows };
     let innermost = sourceRows;
+    let nestedDataset = sourceRows;
     for (const member of path || []) {
       const group = member.group;
-      if (!group?.expressions?.length) continue;
+      if (!group) continue;
+      if (!group.expressions?.length) {
+        // A Group with no expressions is the RDL detail scope: one group instance per current row.
+        // A nested data region sees that one-row intersection, while ordinary no-scope aggregates retain
+        // the nearest named parent group scope (matching SSRS aggregate semantics).
+        nestedDataset = [fields];
+        if (group.name) scopes[group.name] = nestedDataset;
+        continue;
+      }
       const key = JSON.stringify(groupValue(group, fields, parameters, globals, sourceRows, datasets, rowIndex));
       const instance = groupInstances.get(group)?.get(key) || sourceRows;
       if (group.name) scopes[group.name] = instance;
       innermost = instance;
+      nestedDataset = instance;
     }
-    return { scopes, dataset: innermost };
+    return { scopes, dataset: innermost, nestedDataset };
   };
   // Row groups that page-break between instances (Start/End/Between/StartAndEnd all read as "start each
   // new instance on a fresh page" for a top-down table). The first row of every new instance is tagged.
@@ -337,12 +491,24 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
     const dynamic = row.cells.some((cell) => cell.items.some(itemUsesFields)) || path.some((member) => member.group);
     const contexts = dynamic ? sourceRows : [sourceRows[0] || {}];
     for (const [rowIndex, fields] of contexts.entries()) {
-      const { scopes, dataset } = dynamic ? scopeContext(path, fields, rowIndex) : { scopes: { [tablix.datasetName]: sourceRows }, dataset: sourceRows };
-      const context = { fields, parameters, globals, dataset, datasets, scopes };
+      const { scopes, dataset, nestedDataset } = dynamic
+        ? scopeContext(path, fields, rowIndex)
+        : { scopes: { [tablix.datasetName]: sourceRows }, dataset: sourceRows, nestedDataset: sourceRows };
+      const context = {
+        fields,
+        parameters,
+        globals,
+        dataset,
+        nestedDataset,
+        datasets,
+        scopes,
+        tablixDatasetName: tablix.datasetName,
+        nestedTablixDepth: globals.__nestedTablixDepth || 0,
+      };
       // Honor static Visibility.Hidden on the row and on any member in its path (a hidden group/row is
       // not rendered). Interactive drill-down toggles are ignored — everything renders expanded.
       if (evalHidden(row.hidden, context) || path.some((member) => evalHidden(member.hidden, context))) continue;
-      const resolveScope = (scope) => scopeKey(scope, tablix, groups, fields, parameters, globals, sourceRows, datasets, rowIndex);
+      const resolveScope = (scope) => scopeKey(scope, tablix, groups, fields, parameters, globals, sourceRows, datasets, rowIndex, path);
       const rowHeaders = [];
       for (const [descriptorIndex, descriptor] of descriptors.entries()) {
         const key = descriptorKey(descriptor, fields, parameters, globals, sourceRows, datasets, rowIndex);
@@ -381,6 +547,7 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
         indentLevel: 0,
         pageBreakBefore,
         fields,
+        scopeDataset: dataset,
         height: row.height,
         keepTogether: path.some((member) => member.keepTogether) || row.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
         cells: [
@@ -491,8 +658,8 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
   const units = [];
   const lastBreakKey = new Map();
   let pendingPageBreak = false;
-  const emit = (leaf, path, fields, dataset, scopes, role, indentLevel) => {
-    units.push({ templateIndex: templateIndexOf.get(leaf) ?? 0, path, fields, dataset, scopes, role, indentLevel, pageBreakBefore: pendingPageBreak, emitIndex: units.length });
+  const emit = (leaf, path, fields, dataset, scopes, role, indentLevel, nestedDataset = dataset) => {
+    units.push({ templateIndex: templateIndexOf.get(leaf) ?? 0, path, fields, dataset, nestedDataset, scopes, role, indentLevel, pageBreakBefore: pendingPageBreak, emitIndex: units.length });
     pendingPageBreak = false;
   };
 
@@ -545,7 +712,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       } else if (group) {
         for (const row of incomingRows) {
           if (member.children?.length) walkMembers(member.children, [row], scopes, path, indentLevel);
-          else emit(member, path, row, incomingRows, scopes, 'detail', indentLevel);
+          else emit(member, path, row, incomingRows, scopes, 'detail', indentLevel, [row]);
         }
       } else if (member.children?.length) {
         walkMembers(member.children, incomingRows, scopes, path, indentLevel);
@@ -557,47 +724,92 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
   walkMembers(tablix.rowMembers, sourceRows, { [tablix.datasetName]: sourceRows }, [], 0);
 
+  // Visibility changes the physical row sequence, so remove hidden units before calculating vertical
+  // spans. Counting a hidden unit and then dropping it later makes an ancestor span one row too far and
+  // overlap the first row of the next group instance.
+  const visibleUnits = units.filter((unit) => {
+    const template = tablix.rows[unit.templateIndex];
+    if (!template) return false;
+    const context = {
+      fields: unit.fields,
+      parameters,
+      globals,
+      dataset: unit.dataset,
+      nestedDataset: unit.nestedDataset,
+      datasets,
+      scopes: unit.scopes,
+      tablixDatasetName: tablix.datasetName,
+      nestedTablixDepth: globals.__nestedTablixDepth || 0,
+    };
+    return !evalHidden(template.hidden, context) && !unit.path.some((member) => evalHidden(member.hidden, context));
+  });
+
+  // Advanced tablixes can still begin with ordinary static column-header members before their first
+  // grouped row. Preserve the same repeatable-header contract as the flat materializer: only the leading
+  // contiguous static units repeat, while group headers and subtotal rows remain ordinary table rows.
+  const firstDynamicUnit = visibleUnits.findIndex((unit) => unit.role !== 'static');
+  const repeatingHeaderCount = firstDynamicUnit > 0 ? firstDynamicUnit : 0;
+
   const rowHeaderColumns = tablix.rowHeaderColumns || [];
   const duplicateState = new Map();
-  const unitDescriptors = units.map((unit) => headerDescriptors(unit.path));
+  const unitDescriptors = visibleUnits.map((unit) => headerDescriptors(unit.path));
   const descriptorValue = (unit, descriptors, descriptor) => descriptorKey(descriptor, unit.fields, parameters, globals, sourceRows, datasets, unit.emitIndex);
 
   const output = [];
-  for (const [index, unit] of units.entries()) {
+  for (const [index, unit] of visibleUnits.entries()) {
     const template = tablix.rows[unit.templateIndex];
-    if (!template) continue;
     const context = { fields: unit.fields, parameters, globals, dataset: unit.dataset, datasets, scopes: unit.scopes };
-    if (evalHidden(template.hidden, context) || unit.path.some((member) => evalHidden(member.hidden, context))) continue;
-    const resolveScope = (scope) => scopeKey(scope, tablix, groups, unit.fields, parameters, globals, sourceRows, datasets, unit.emitIndex);
+    const resolveScope = (scope) => scopeKey(scope, tablix, groups, unit.fields, parameters, globals, sourceRows, datasets, unit.emitIndex, unit.path);
 
     const descriptors = unitDescriptors[index];
-    const spans = headerSpans(descriptors, rowHeaderColumns);
     const rowHeaders = [];
+    const staticSpans = unit.role === 'static' ? headerSpans(descriptors, rowHeaderColumns) : [];
     descriptors.forEach((descriptor, descriptorIndex) => {
       const key = descriptorValue(unit, descriptors, descriptor);
       const previous = index > 0 ? unitDescriptors[index - 1].find((entry) => entry.member === descriptor.member) : null;
-      if (previous && descriptorValue(units[index - 1], unitDescriptors[index - 1], previous) === key) return;
+      if (previous && descriptorValue(visibleUnits[index - 1], unitDescriptors[index - 1], previous) === key) return;
       let rowSpan = 1;
-      for (let ahead = index + 1; ahead < units.length; ahead += 1) {
+      for (let ahead = index + 1; ahead < visibleUnits.length; ahead += 1) {
         const match = unitDescriptors[ahead].find((entry) => entry.member === descriptor.member);
-        if (match && descriptorValue(units[ahead], unitDescriptors[ahead], match) === key) rowSpan += 1;
+        if (match && descriptorValue(visibleUnits[ahead], unitDescriptors[ahead], match) === key) rowSpan += 1;
         else break;
       }
       rowHeaders.push({
         ...materializedCell(descriptor.header.cell, context, duplicateState, `header:${descriptorIndex}`, resolveScope),
-        colSpan: spans[descriptorIndex] || 1,
+        // Dynamic group owners keep a stable single hierarchy column because they may also span later
+        // rows with deeper descendants. A standalone static band has no such descendants, so preserve
+        // its declared header size as a horizontal span across the row-header grid.
+        colSpan: staticSpans[descriptorIndex] || 1,
         rowSpan,
         isRowHeader: true,
       });
     });
+
+    // Advanced group header/footer rows often have fewer header descriptors than the deepest detail path.
+    // Materialize the unowned tail as a real blank grid cell so body cells always begin after the complete
+    // row-header grid. Active ancestor row spans occupy the earlier columns and are skipped by placement.
+    const rowHeaderTail = Math.max(0, rowHeaderColumns.length - descriptors.length);
+    if (rowHeaderTail > 0 && unit.role !== 'static') {
+      rowHeaders.push({ colSpan: rowHeaderTail, rowSpan: 1, items: [], values: [], hidden: false, isRowHeader: true });
+    }
 
     let bodyCells;
     if (columnData) {
       bodyCells = [];
       for (const column of columnData.leaves) {
         const intersection = intersectRows(unit.dataset, column.rows);
-        const cellContext = { fields: intersection[0] || unit.fields, parameters, globals, dataset: intersection, datasets, scopes: { ...unit.scopes, ...column.scopes } };
-        const cellResolve = (scope) => scopeKey(scope, tablix, groups, cellContext.fields, parameters, globals, sourceRows, datasets, unit.emitIndex);
+        const cellContext = {
+          fields: intersection[0] || unit.fields,
+          parameters,
+          globals,
+          dataset: intersection,
+          nestedDataset: intersection,
+          datasets,
+          scopes: { ...unit.scopes, ...column.scopes },
+          tablixDatasetName: tablix.datasetName,
+          nestedTablixDepth: globals.__nestedTablixDepth || 0,
+        };
+        const cellResolve = (scope) => scopeKey(scope, tablix, groups, cellContext.fields, parameters, globals, sourceRows, datasets, unit.emitIndex, unit.path);
         template.cells.forEach((cell, cellIndex) => {
           bodyCells.push(materializedCell(cell, cellContext, duplicateState, `body:${unit.templateIndex}:${column.rows.length}:${cellIndex}`, cellResolve));
         });
@@ -608,12 +820,13 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
     output.push({
       sourceIndex: unit.templateIndex,
-      isHeader: false,
-      isStatic: false,
+      isHeader: index < repeatingHeaderCount,
+      isStatic: unit.role === 'static',
       role: unit.role,
       indentLevel: unit.indentLevel || 0,
       pageBreakBefore: unit.pageBreakBefore || false,
       fields: unit.fields,
+      scopeDataset: unit.dataset,
       height: template.height,
       keepTogether: unit.path.some((member) => member.keepTogether) || template.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
       cells: [...rowHeaders, ...bodyCells],
@@ -628,7 +841,16 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       const cells = [];
       if (depth === 0 && rowHeaderColumns.length) {
         const cornerCell = tablix.tablixCorner?.[0]?.[0];
-        const cornerContext = { fields: {}, parameters, globals, dataset: sourceRows, datasets, scopes: { [tablix.datasetName]: sourceRows } };
+        const cornerContext = {
+          fields: {},
+          parameters,
+          globals,
+          dataset: sourceRows,
+          datasets,
+          scopes: { [tablix.datasetName]: sourceRows },
+          tablixDatasetName: tablix.datasetName,
+          nestedTablixDepth: globals.__nestedTablixDepth || 0,
+        };
         cells.push({
           ...(cornerCell
             ? materializedCell(cornerCell, cornerContext, duplicateState, `corner`, () => `corner`)
@@ -639,7 +861,16 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
         });
       }
       for (const header of level) {
-        const headerContext = { fields: header.fields, parameters, globals, dataset: header.rows, datasets, scopes: header.scopes };
+        const headerContext = {
+          fields: header.fields,
+          parameters,
+          globals,
+          dataset: header.rows,
+          datasets,
+          scopes: header.scopes,
+          tablixDatasetName: tablix.datasetName,
+          nestedTablixDepth: globals.__nestedTablixDepth || 0,
+        };
         const headerResolve = (scope) => scopeKey(scope, tablix, groups, header.fields, parameters, globals, sourceRows, datasets, 0);
         cells.push({
           ...materializedCell(header.cell, headerContext, duplicateState, `colheader:${depth}`, headerResolve),
@@ -655,13 +886,17 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
         indentLevel: 0,
         pageBreakBefore: false,
         fields: {},
+        scopeDataset: sourceRows,
         height: tablix.rows[0]?.height || 18,
         keepTogether: false,
         cells,
       });
     });
-    return [...headerRows, ...output];
+    const result = [...headerRows, ...output];
+    assertMaterializedGrid(result, rowHeaderColumns.length + columnData.leaves.length * tablix.bodyColumns.length, tablix.name);
+    return result;
   }
 
+  assertMaterializedGrid(output, rowHeaderColumns.length + tablix.bodyColumns.length, tablix.name);
   return output;
 }

@@ -23,6 +23,14 @@ test('CStr converts to string', () => {
   assert.equal(evaluateExpression('=CStr(True)', {}), 'True');
 });
 
+test('Str preserves Visual Basic sign-space and invariant decimal semantics', () => {
+  assert.equal(evaluateExpression('=Str(459)', {}), ' 459');
+  assert.equal(evaluateExpression('=Str(-459.65)', {}), '-459.65');
+  assert.equal(evaluateExpression('=Str(459.001)', {}), ' 459.001');
+  assert.equal(evaluateExpression('=Str(0)', {}), ' 0');
+  assert.equal(evaluateExpression('=Str(Nothing)', {}), null);
+});
+
 test('CBool follows VB truthiness', () => {
   assert.equal(evaluateExpression('=CBool(0)', {}), false);
   assert.equal(evaluateExpression('=CBool(5)', {}), true);

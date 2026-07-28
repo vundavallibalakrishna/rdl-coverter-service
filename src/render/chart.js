@@ -1,6 +1,6 @@
 import { evaluateExpression } from '../rdl/expression.js';
 import { pdfFont } from './fonts.js';
-import { color as resolveColor, styleColor } from './common.js';
+import { color as resolveColor, styleColor, styleSize, styleValue } from './common.js';
 
 const AXIS_COLOR = '#d9d9d9';
 const TICK_LABEL_COLOR = '#595959';
@@ -24,6 +24,22 @@ function setFont(doc, config, { size = 8, bold = false } = {}) {
 
 function fillText(doc, text, x, y, options = {}) {
   doc.save().fillColor(options.color || LABEL_COLOR).text(String(text), x, y, { lineBreak: false, ...options }).restore();
+}
+
+function axisFont(doc, config, axis, context, labels, slot, fallback = 8) {
+  const style = axis?.style || {};
+  const configured = styleSize(style.fontSize, context, fallback) || fallback;
+  const disabled = String(styleValue(axis?.labelsAutoFitDisabled, context, 'false')).toLowerCase() === 'true';
+  let size = configured;
+  setFont(doc, config, { size, bold: /bold|[6-9]00/i.test(String(styleValue(style.fontWeight, context, 'Normal'))) });
+  // SSRS auto-fit can shrink/offset/rotate labels. This renderer implements the deterministic shrink part;
+  // when auto-fit is disabled the declared font size is retained exactly.
+  if (!disabled && slot > 0 && labels?.length) {
+    const widest = Math.max(0, ...labels.map((label) => doc.widthOfString(String(label ?? ''))));
+    if (widest > slot) size = Math.max(6, configured * slot / widest);
+  }
+  setFont(doc, config, { size, bold: /bold|[6-9]00/i.test(String(styleValue(style.fontWeight, context, 'Normal'))) });
+  return { color: styleColor(style.color, context, TICK_LABEL_COLOR), size };
 }
 
 // Legend: colour swatch + label chips wrapped across the width and centred. Returns the height used.
@@ -66,19 +82,19 @@ function drawTitle(doc, config, chart, data, x, y, width, context) {
   return height;
 }
 
-function drawValueGrid(doc, config, scale, plot, orientation) {
-  setFont(doc, config, { size: 8 });
+function drawValueGrid(doc, config, scale, plot, orientation, axis, context) {
+  const axisAppearance = axisFont(doc, config, axis, context, [], 0, 8);
   const ticks = Math.round(scale.max / scale.interval);
   for (let tick = 0; tick <= ticks; tick += 1) {
     const value = tick * scale.interval;
     if (orientation === 'horizontal') {
       const gx = plot.x + (value / scale.max) * plot.width;
       doc.save().lineWidth(0.5).strokeColor(AXIS_COLOR).moveTo(gx, plot.y).lineTo(gx, plot.y + plot.height).stroke().restore();
-      fillText(doc, value, gx - 10, plot.y + plot.height + 4, { width: 20, align: 'center', color: TICK_LABEL_COLOR });
+      fillText(doc, value, gx - 10, plot.y + plot.height + 4, { width: 20, align: 'center', color: axisAppearance.color });
     } else {
       const gy = plot.y + plot.height - (value / scale.max) * plot.height;
       doc.save().lineWidth(0.5).strokeColor(AXIS_COLOR).moveTo(plot.x, gy).lineTo(plot.x + plot.width, gy).stroke().restore();
-      fillText(doc, value, plot.x - 34, gy - 4, { width: 30, align: 'right', color: TICK_LABEL_COLOR });
+      fillText(doc, value, plot.x - 34, gy - 4, { width: 30, align: 'right', color: axisAppearance.color });
     }
   }
 }
@@ -93,16 +109,17 @@ function scaleFor(data, stacked) {
   return niceScale(data.maxY);
 }
 
-function drawBarChart(doc, config, data, plot, stacked = 'none') {
+function drawBarChart(doc, config, chart, data, plot, stacked, context) {
   const scale = scaleFor(data, stacked);
-  drawValueGrid(doc, config, scale, plot, 'horizontal');
+  drawValueGrid(doc, config, scale, plot, 'horizontal', chart.valueAxis, context);
   const slot = plot.height / (data.categories.length || 1);
-  const barHeight = slot * 0.6;
-  setFont(doc, config, { size: 8 });
+  const configuredWidth = Number(styleValue(chart.seriesDefs?.[0]?.customProperties?.PointWidth, context, 0.8));
+  const barHeight = slot * Math.min(1, Math.max(0.05, Number.isFinite(configuredWidth) ? configuredWidth : 0.8));
+  const categoryAppearance = axisFont(doc, config, chart.categoryAxis, context, data.categories.map((entry) => entry.label), 152, 8);
   data.categories.forEach((category, index) => {
     // First category at the bottom (SSRS horizontal-bar order).
     const centerY = plot.y + plot.height - (index + 0.5) * slot;
-    fillText(doc, category.label ?? '', plot.x - 158, centerY - 4, { width: 152, align: 'right', color: TICK_LABEL_COLOR });
+    fillText(doc, category.label ?? '', plot.x - 158, centerY - 4, { width: 152, align: 'right', color: categoryAppearance.color });
     if (stacked === 'none') {
       const point = data.series[0]?.points[index];
       if (!point || point.y === null || point.y <= 0) return;
@@ -123,18 +140,20 @@ function drawBarChart(doc, config, data, plot, stacked = 'none') {
   });
 }
 
-function drawColumnChart(doc, config, data, plot, stacked = 'none') {
+function drawColumnChart(doc, config, chart, data, plot, stacked, context) {
   const scale = scaleFor(data, stacked);
-  drawValueGrid(doc, config, scale, plot, 'vertical');
+  drawValueGrid(doc, config, scale, plot, 'vertical', chart.valueAxis, context);
   const categoryCount = data.categories.length || 1;
   const seriesCount = data.series.length || 1;
   const slot = plot.width / categoryCount;
-  setFont(doc, config, { size: 7 });
+  const categoryAppearance = axisFont(doc, config, chart.categoryAxis, context, data.categories.map((entry) => entry.label), slot, 7);
+  const configuredWidth = Number(styleValue(chart.seriesDefs?.[0]?.customProperties?.PointWidth, context, 0.8));
+  const pointWidth = Math.min(1, Math.max(0.05, Number.isFinite(configuredWidth) ? configuredWidth : 0.8));
   data.categories.forEach((category, categoryIndex) => {
     const slotX = plot.x + categoryIndex * slot;
-    fillText(doc, category.label ?? '', slotX, plot.y + plot.height + 4, { width: slot, align: 'center', color: TICK_LABEL_COLOR });
+    fillText(doc, category.label ?? '', slotX, plot.y + plot.height + 4, { width: slot, align: 'center', color: categoryAppearance.color });
     if (stacked === 'none') {
-      const groupWidth = slot * 0.7;
+      const groupWidth = slot * pointWidth;
       const barWidth = groupWidth / seriesCount;
       data.series.forEach((series, seriesIndex) => {
         const point = series.points[categoryIndex];
@@ -147,7 +166,7 @@ function drawColumnChart(doc, config, data, plot, stacked = 'none') {
       });
       return;
     }
-    const barWidth = slot * 0.5;
+    const barWidth = slot * pointWidth;
     const barX = slotX + (slot - barWidth) / 2;
     const total = stackTotal(data, categoryIndex) || 1;
     let cursorY = plot.y + plot.height;
@@ -163,7 +182,7 @@ function drawColumnChart(doc, config, data, plot, stacked = 'none') {
 }
 
 // Pie (innerRatio 0) and doughnut (innerRatio > 0) share this: each slice is an annulus segment.
-function drawPieChart(doc, config, data, plot, innerRatio = 0) {
+function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
   const points = (data.series[0]?.points || []).filter((point) => point.y && point.y > 0);
   const total = points.reduce((sum, point) => sum + point.y, 0);
   if (total <= 0) return;
@@ -183,8 +202,18 @@ function drawPieChart(doc, config, data, plot, innerRatio = 0) {
     for (let step = steps; step >= 0; step -= 1) doc.lineTo(...at(angle + (sweep * step) / steps, inner));
     doc.fill().restore();
     if (point.label) {
-      const [labelX, labelY] = at(angle + sweep / 2, inner + (radius - inner) * 0.55);
-      fillText(doc, point.label, labelX - 12, labelY - 4, { width: 24, align: 'center' });
+      const middle = angle + sweep / 2;
+      if (/outside/i.test(point.labelPosition || '')) {
+        const [lineStartX, lineStartY] = at(middle, radius * 0.92);
+        const [lineEndX, lineEndY] = at(middle, radius + 9);
+        const calloutColor = styleColor(chart.seriesDefs?.[0]?.customProperties?.PieLineColor, context, '#000000');
+        doc.save().lineWidth(0.75).strokeColor(calloutColor).moveTo(lineStartX, lineStartY).lineTo(lineEndX, lineEndY).stroke().restore();
+        const right = Math.cos(middle) >= 0;
+        fillText(doc, point.label, right ? lineEndX + 2 : lineEndX - 42, lineEndY - 4, { width: 40, align: right ? 'left' : 'right' });
+      } else {
+        const [labelX, labelY] = at(middle, inner + (radius - inner) * 0.55);
+        fillText(doc, point.label, labelX - 12, labelY - 4, { width: 24, align: 'center' });
+      }
     }
     angle += sweep;
   }
@@ -203,18 +232,18 @@ function seriesLines(data, scale, plot) {
   }));
 }
 
-function drawCategoryLabels(doc, config, data, plot) {
+function drawCategoryLabels(doc, config, chart, data, plot, context) {
   const slot = plot.width / (data.categories.length || 1);
-  setFont(doc, config, { size: 7 });
+  const appearance = axisFont(doc, config, chart.categoryAxis, context, data.categories.map((entry) => entry.label), slot, 7);
   data.categories.forEach((category, index) => {
-    fillText(doc, category.label ?? '', plot.x + index * slot, plot.y + plot.height + 4, { width: slot, align: 'center', color: TICK_LABEL_COLOR });
+    fillText(doc, category.label ?? '', plot.x + index * slot, plot.y + plot.height + 4, { width: slot, align: 'center', color: appearance.color });
   });
 }
 
-function drawLineChart(doc, config, data, plot) {
+function drawLineChart(doc, config, chart, data, plot, context) {
   const scale = niceScale(data.maxY);
-  drawValueGrid(doc, config, scale, plot, 'vertical');
-  drawCategoryLabels(doc, config, data, plot);
+  drawValueGrid(doc, config, scale, plot, 'vertical', chart.valueAxis, context);
+  drawCategoryLabels(doc, config, chart, data, plot, context);
   setFont(doc, config, { size: 7 });
   for (const series of seriesLines(data, scale, plot)) {
     const points = series.points.filter(Boolean);
@@ -230,10 +259,10 @@ function drawLineChart(doc, config, data, plot) {
   }
 }
 
-function drawAreaChart(doc, config, data, plot, stacked = 'none') {
+function drawAreaChart(doc, config, chart, data, plot, stacked, context) {
   const scale = scaleFor(data, stacked);
-  drawValueGrid(doc, config, scale, plot, 'vertical');
-  drawCategoryLabels(doc, config, data, plot);
+  drawValueGrid(doc, config, scale, plot, 'vertical', chart.valueAxis, context);
+  drawCategoryLabels(doc, config, chart, data, plot, context);
   setFont(doc, config, { size: 7 });
   const baseline = plot.y + plot.height;
   if (stacked === 'none') {
@@ -276,10 +305,10 @@ function drawAreaChart(doc, config, data, plot, stacked = 'none') {
   }
 }
 
-function drawScatterChart(doc, config, data, plot) {
+function drawScatterChart(doc, config, chart, data, plot, context) {
   const scale = niceScale(data.maxY);
-  drawValueGrid(doc, config, scale, plot, 'vertical');
-  drawCategoryLabels(doc, config, data, plot);
+  drawValueGrid(doc, config, scale, plot, 'vertical', chart.valueAxis, context);
+  drawCategoryLabels(doc, config, chart, data, plot, context);
   setFont(doc, config, { size: 7 });
   for (const series of seriesLines(data, scale, plot)) {
     const color = resolveColor(series.color, '#4472c4');
@@ -316,13 +345,13 @@ export function drawChart(doc, config, chart, data, x, y, width, height, context
   const plot = { x: x + leftGutter, y: top + 6, width: width - leftGutter - 24, height: bottom - top - 6 - bottomGutter };
   if (plot.width > 10 && plot.height > 10) {
     const stacked = chart.stacked || 'none';
-    if (chart.chartType === 'bar') drawBarChart(doc, config, data, plot, stacked);
-    else if (chart.chartType === 'column') drawColumnChart(doc, config, data, plot, stacked);
-    else if (chart.chartType === 'pie') drawPieChart(doc, config, data, plot, 0);
-    else if (chart.chartType === 'doughnut') drawPieChart(doc, config, data, plot, 0.55);
-    else if (chart.chartType === 'line') drawLineChart(doc, config, data, plot);
-    else if (chart.chartType === 'area') drawAreaChart(doc, config, data, plot, stacked);
-    else if (chart.chartType === 'scatter') drawScatterChart(doc, config, data, plot);
+    if (chart.chartType === 'bar') drawBarChart(doc, config, chart, data, plot, stacked, context);
+    else if (chart.chartType === 'column') drawColumnChart(doc, config, chart, data, plot, stacked, context);
+    else if (chart.chartType === 'pie') drawPieChart(doc, config, chart, data, plot, 0, context);
+    else if (chart.chartType === 'doughnut') drawPieChart(doc, config, chart, data, plot, 0.55, context);
+    else if (chart.chartType === 'line') drawLineChart(doc, config, chart, data, plot, context);
+    else if (chart.chartType === 'area') drawAreaChart(doc, config, chart, data, plot, stacked, context);
+    else if (chart.chartType === 'scatter') drawScatterChart(doc, config, chart, data, plot, context);
   }
   doc.restore();
 }

@@ -35,6 +35,7 @@
     "collect:docx-profiles": "node scripts/collect-docx-profiles.js",
     "verify:local-summary": "node scripts/local-readiness-summary.js",
     "verify:stress": "node scripts/stress-certification.js",
+    "verify:stress:nested": "node scripts/stress-certification.js --nested",
     "audit:schema": "node scripts/schema-coverage.js",
     "smoke:docker": "node scripts/docker-smoke.js"
   },
@@ -44,6 +45,7 @@
     "exceljs": "^4.4.0",
     "fast-xml-parser": "^5.3.1",
     "fastify": "^5.6.2",
+    "fontkit": "^2.0.4",
     "jszip": "^3.10.1",
     "pdf-lib": "^1.17.1",
     "pdfkit": "^0.17.2",

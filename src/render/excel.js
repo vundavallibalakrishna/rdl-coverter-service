@@ -2,7 +2,7 @@ import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
 import { ServiceError } from '../errors.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, isHidden, normalizeDatasets, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -310,6 +310,51 @@ function point(value) {
   return Math.round(Number(value || 0) * POINT_PRECISION) / POINT_PRECISION;
 }
 
+function visibleBorderWidth(border, context = {}) {
+  const style = String(styleValue(border?.style, context, 'None'));
+  return /^none$/i.test(style) ? 0 : Math.max(0, styleSize(border?.width, context, 1));
+}
+
+// RDL designers commonly make adjacent free-form boxes overlap by exactly their shared border width so
+// raster/fixed renderers draw one continuous rule. Excel cannot represent two overlapping merged ranges.
+// Record only sibling edges whose vertical spans overlap and whose horizontal difference is no greater
+// than the visible shared-edge stroke. Those two physical coordinates then become one native grid edge.
+// Larger/intentional overlaps remain distinct and still fail closed in mergeSafe.
+function collectEquivalentXEdges(items, target, context, parentLeft = 0, parentTop = 0) {
+  const positioned = (items || []).map((item) => {
+    // Match collectXBoundaries/renderFreeformItem exactly: round the positioned origin first, then add
+    // dimensions. Rounding the combined expression instead creates a different quarter-point edge.
+    const left = point(parentLeft + (item.left || 0));
+    const top = point(parentTop + (item.top || 0));
+    return {
+      item,
+      left,
+      right: point(left + (item.width || 0)),
+      top,
+      bottom: point(top + (item.height || 0)),
+    };
+  }).sort((left, right) => left.left - right.left || left.top - right.top);
+
+  for (let index = 1; index < positioned.length; index += 1) {
+    const previous = positioned[index - 1];
+    const current = positioned[index];
+    const verticallyOverlaps = previous.top < current.bottom && current.top < previous.bottom;
+    if (!verticallyOverlaps) continue;
+    const previousWidth = visibleBorderWidth(previous.item.style?.borders?.right, context);
+    const currentWidth = visibleBorderWidth(current.item.style?.borders?.left, context);
+    const tolerance = Math.max(1 / POINT_PRECISION, previousWidth, currentWidth);
+    if (Math.abs(previous.right - current.left) <= tolerance) {
+      const canonical = point((previous.right + current.left) / 2);
+      target.set(previous.right, canonical);
+      target.set(current.left, canonical);
+    }
+  }
+
+  for (const entry of positioned) {
+    collectEquivalentXEdges(entry.item.items, target, context, entry.left, entry.top);
+  }
+}
+
 function visiblePageBreak(item, context) {
   if (!item.pageBreak || isHidden(item.pageBreak.disabled, context)) return 'None';
   return String(item.pageBreak.location || 'None');
@@ -414,16 +459,44 @@ function tablixLayout(item, request, globals, model, cache) {
 }
 
 function collectXBoundaries(items, request, globals, model, tablixCache, target, parentLeft = 0) {
+  const collectNested = (nested, cellLeft) => {
+    const left = point(cellLeft + (nested.item.left || 0));
+    target.add(left);
+    let cursor = left;
+    for (const width of nested.columns || nested.item.columns || []) {
+      cursor = point(cursor + width);
+      target.add(cursor);
+    }
+    const placements = computeCellPlacements(nested.rows || [], (nested.columns || []).length);
+    for (const [rowIndex, row] of (nested.rows || []).entries()) {
+      for (const [cellIndex, cell] of row.cells.entries()) {
+        const columnIndex = placements[rowIndex][cellIndex];
+        const nestedCellLeft = left + (nested.columns || []).slice(0, columnIndex).reduce((sum, width) => sum + width, 0);
+        for (const child of cell.nestedTablixes || []) collectNested(child, nestedCellLeft);
+      }
+    }
+  };
   for (const item of items || []) {
     const left = point(parentLeft + (item.left || 0));
     const right = point(left + (item.width || 0));
     target.add(left);
     target.add(right);
     if (item.type === 'Tablix') {
+      const layout = tablixLayout(item, request, globals, model, tablixCache);
       let cursor = left;
-      for (const width of tablixLayout(item, request, globals, model, tablixCache).columns) {
+      const offsets = [0];
+      for (const width of layout.columns) {
         cursor = point(cursor + width);
         target.add(cursor);
+        offsets.push(cursor - left);
+      }
+      const placements = computeCellPlacements(layout.rows, layout.columns.length);
+      for (const [rowIndex, row] of layout.rows.entries()) {
+        for (const [cellIndex, cell] of row.cells.entries()) {
+          const columnIndex = placements[rowIndex][cellIndex];
+          const cellLeft = left + offsets[columnIndex];
+          for (const nested of cell.nestedTablixes || []) collectNested(nested, cellLeft);
+        }
       }
     }
     collectXBoundaries(item.items, request, globals, model, tablixCache, target, left);
@@ -434,16 +507,36 @@ function reportGrid(model, section, request, globals, tablixCache) {
   const boundaries = new Set([0]);
   collectXBoundaries(model.page.header?.items || [], request, globals, model, tablixCache, boundaries);
   collectXBoundaries(section, request, globals, model, tablixCache, boundaries);
+  const aliases = new Map();
+  const context = { parameters: request.parameters || {}, globals, fields: {} };
+  collectEquivalentXEdges(model.page.header?.items || [], aliases, context);
+  collectEquivalentXEdges(section, aliases, context);
   const maximum = Math.max(...boundaries, point(model.page.width - model.page.marginLeft - model.page.marginRight));
   boundaries.add(maximum);
-  const values = [...boundaries].filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b);
+  const values = [...new Set([...boundaries]
+    .map((value) => aliases.get(value) ?? value))]
+    .filter((value) => value >= 0 && value <= maximum)
+    .sort((a, b) => a - b);
   if (values.length < 2) values.push(point(maximum || 100));
+  values.aliases = aliases;
   return values;
 }
 
 function boundaryIndex(boundaries, value) {
-  const expected = point(value);
-  const index = boundaries.findIndex((candidate) => candidate === expected);
+  const raw = point(value);
+  const expected = boundaries.aliases?.get(raw) ?? raw;
+  let index = boundaries.findIndex((candidate) => candidate === expected);
+  // Independently accumulated decimal RDL sizes can land one quarter-point apart at a containing band
+  // edge. At the renderer's declared 0.25-point precision those coordinates are equivalent.
+  if (index < 0) {
+    const nearby = boundaries
+      .map((candidate, candidateIndex) => ({ candidateIndex, distance: Math.abs(candidate - expected) }))
+      .filter(({ distance }) => distance <= 1 / POINT_PRECISION)
+      .sort((left, right) => left.distance - right.distance);
+    if (nearby.length === 1 || (nearby.length > 1 && nearby[0].distance < nearby[1].distance)) {
+      index = nearby[0].candidateIndex;
+    }
+  }
   if (index < 0) throw new ServiceError('RDL_INVALID', `Excel layout boundary is not on the section grid: ${expected}`);
   return index;
 }
@@ -497,10 +590,12 @@ function applyFillFontAlignment(cell, style, context) {
   cell.font = excelFont(style, context);
   const vertical = String(styleValue(style?.verticalAlign, context, 'Top'));
   const horizontal = String(styleValue(style?.textAlign, context, 'Left'));
+  const writingMode = String(styleValue(style?.writingMode, context, 'Default') || 'Default').toLowerCase();
   cell.alignment = {
     vertical: /bottom/i.test(vertical) ? 'bottom' : /middle|center/i.test(vertical) ? 'middle' : 'top',
     horizontal: /center/i.test(horizontal) ? 'center' : /right/i.test(horizontal) ? 'right' : /justify/i.test(horizontal) ? 'justify' : 'left',
     wrapText: true,
+    textRotation: writingMode === 'rotate270' ? 90 : writingMode === 'vertical' ? -90 : 0,
   };
 }
 
@@ -525,13 +620,31 @@ function rangesOverlap(left, right) {
     && left.startCol <= right.endCol && right.startCol <= left.endCol;
 }
 
-function mergeSafe(worksheet, range, merges) {
+function mergeSafe(worksheet, range, merges, owner = null) {
   if (range.startRow === range.endRow && range.startCol === range.endCol) return;
-  if (merges.some((existing) => rangesOverlap(existing, range))) {
-    throw new ServiceError('RDL_INVALID', 'RDL produced overlapping Excel merged-cell ranges');
+  const existing = merges.find((candidate) => rangesOverlap(candidate, range));
+  if (existing) {
+    throw new ServiceError(
+      'RDL_INVALID',
+      `RDL produced overlapping Excel merged-cell ranges${owner ? ` for ${owner}` : ''} (${existing.startRow},${existing.startCol}:${existing.endRow},${existing.endCol} and ${range.startRow},${range.startCol}:${range.endRow},${range.endCol})`,
+    );
   }
   worksheet.mergeCells(range.startRow, range.startCol, range.endRow, range.endCol);
   merges.push(range);
+}
+
+function splitTallRowIntervals(boundaries) {
+  const output = [boundaries[0] || 0];
+  for (let index = 0; index < boundaries.length - 1; index += 1) {
+    const end = boundaries[index + 1];
+    let cursor = output.at(-1);
+    while (end - cursor > MAX_EXCEL_ROW_HEIGHT) {
+      cursor = point(cursor + MAX_EXCEL_ROW_HEIGHT);
+      output.push(cursor);
+    }
+    if (end > output.at(-1)) output.push(end);
+  }
+  return output;
 }
 
 function allocateHeightRows(worksheet, boundaries, startRow) {
@@ -556,7 +669,9 @@ function collectYBoundaries(items, target, parentTop = 0) {
 function freeformRows(worksheet, items, height, startRow) {
   const boundaries = new Set([0, point(height)]);
   collectYBoundaries(items, boundaries);
-  const values = [...boundaries].filter((value) => value >= 0 && value <= point(height)).sort((a, b) => a - b);
+  const values = splitTallRowIntervals(
+    [...boundaries].filter((value) => value >= 0 && value <= point(height)).sort((a, b) => a - b),
+  );
   allocateHeightRows(worksheet, values, startRow);
   return values;
 }
@@ -603,7 +718,7 @@ function renderFreeformItem({ workbook, worksheet, model, item, context, xGrid, 
   }
   applyRegionStyle(worksheet, range, item.style || {}, context);
   if (item.type === 'Textbox') {
-    mergeSafe(worksheet, range, merges);
+    mergeSafe(worksheet, range, merges, item.name);
     const text = cellString(textForItem(item, context));
     const target = worksheet.getCell(range.startRow, range.startCol);
     target.value = richTextValue(item, context, text) || text;
@@ -636,15 +751,23 @@ function resolvedOwnerBorder(owner, side) {
   return excelBorderSide(border, owner.context);
 }
 
-function repeatedCellBorders(gridOwners, rowIndex, columnIndex, owner) {
+function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
+  const rowIndex = owner.rowIndex;
+  const columnIndex = owner.start;
   const span = owner.cell.colSpan || 1;
+  const endRow = Math.min(gridOwners.length - 1, rowIndex + Math.max(1, owner.cell.rowSpan || 1) - 1);
   const above = rowIndex > 0 ? gridOwners[rowIndex - 1][columnIndex] : null;
-  const below = rowIndex + 1 < gridOwners.length ? gridOwners[rowIndex + 1][columnIndex] : null;
+  const below = endRow + 1 < gridOwners.length ? gridOwners[endRow + 1][columnIndex] : null;
   const left = columnIndex > 0 ? gridOwners[rowIndex][columnIndex - 1] : null;
   const right = columnIndex + span < gridOwners[rowIndex].length ? gridOwners[rowIndex][columnIndex + span] : null;
+  const bottom = resolvedOwnerBorder(owner, 'bottom')
+    || (below && resolvedOwnerBorder(below, 'top'))
+    || (enforceBottomClosure && endRow === gridOwners.length - 1
+      ? excelBorderSide(enforcedBottomBorder(itemStyle), owner.context)
+      : undefined);
   return {
     top: above === owner ? undefined : resolvedOwnerBorder(owner, 'top') || (above && resolvedOwnerBorder(above, 'bottom')) || undefined,
-    bottom: below === owner ? undefined : resolvedOwnerBorder(owner, 'bottom') || (below && resolvedOwnerBorder(below, 'top')) || undefined,
+    bottom,
     left: resolvedOwnerBorder(owner, 'left') || (left && resolvedOwnerBorder(left, 'right')) || undefined,
     right: resolvedOwnerBorder(owner, 'right') || (right && resolvedOwnerBorder(right, 'left')) || undefined,
   };
@@ -654,9 +777,32 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   const { rows, columns } = tablixLayout(item, request, globals, model, tablixCache);
   const placements = computeCellPlacements(rows, columns.length);
   const datasets = normalizeDatasets(model, request);
+  const enforceBottomClosure = shouldEnforceTablixBottom(rows);
   const gridOwners = rows.map(() => new Array(columns.length).fill(null));
+  const owners = [];
   const columnOffsets = [0];
   columns.forEach((width) => columnOffsets.push(point(columnOffsets[columnOffsets.length - 1] + width)));
+  const addNestedYBoundaries = (nested, baseTop, target) => {
+    let cursor = point(baseTop + (nested.item.top || 0));
+    target.add(cursor);
+    for (const row of nested.rows || []) {
+      const rowTop = cursor;
+      cursor = point(cursor + (row.height || DEFAULT_ROW_POINTS));
+      target.add(cursor);
+      for (const cell of row.cells || []) {
+        for (const child of cell.nestedTablixes || []) addNestedYBoundaries(child, rowTop, target);
+      }
+    }
+  };
+  const rowProfiles = rows.map((row) => {
+    const boundaries = new Set([0, point(row.height || DEFAULT_ROW_POINTS)]);
+    for (const cell of row.cells || []) {
+      for (const nested of cell.nestedTablixes || []) addNestedYBoundaries(nested, 0, boundaries);
+    }
+    const maximum = Math.max(...boundaries);
+    boundaries.add(maximum);
+    return [...boundaries].sort((a, b) => a - b);
+  });
 
   rows.forEach((row, rowIndex) => {
     const context = { fields: row.fields || {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
@@ -665,6 +811,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       if (start === undefined || start < 0) return;
       const presentation = cellStyle(item, cell, context);
       const owner = { cell, rowIndex, start, ...presentation };
+      owners.push(owner);
       for (let r = 0; r < Math.max(1, cell.rowSpan || 1) && rowIndex + r < rows.length; r += 1) {
         for (let c = 0; c < Math.max(1, cell.colSpan || 1) && start + c < columns.length; c += 1) {
           if (gridOwners[rowIndex + r][start + c]) throw new ServiceError('RDL_INVALID', 'RDL produced overlapping Excel tablix cells');
@@ -674,54 +821,165 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     });
   });
 
+  // Excel does not auto-fit merged cells. Measure every logical owner once, then grow the final row of its
+  // vertical span only when the declared combined row heights cannot contain the text. This preserves the
+  // RDL row proportions while keeping merged group labels readable.
+  const measuredHeights = rows.map((row, index) => Math.max(
+    2,
+    row.height || DEFAULT_ROW_POINTS,
+    rowProfiles[index].at(-1) || 0,
+  ));
+  for (const owner of owners) {
+    const display = cellText(owner.cell);
+    if (!owner.textbox || !display) continue;
+    const span = Math.max(1, owner.cell.colSpan || 1);
+    const rowSpan = Math.max(1, owner.cell.rowSpan || 1);
+    const width = point(columnOffsets[owner.start + span] - columnOffsets[owner.start]);
+    const required = measureTextboxHeight(measureDoc, config, owner.textbox, owner.context, display, width)
+      + styleSize(owner.style?.paddingTop, owner.context, 2) + styleSize(owner.style?.paddingBottom, owner.context, 2);
+    const endRow = Math.min(rows.length - 1, owner.rowIndex + rowSpan - 1);
+    const available = measuredHeights.slice(owner.rowIndex, endRow + 1).reduce((sum, height) => sum + height, 0);
+    if (required > available) measuredHeights[endRow] += required - available;
+  }
+
+  // A logical parent row may contain a child grid with several physical rows. Split only that parent row
+  // at the child-grid boundaries; ordinary surrounding cells are vertically merged across the resulting
+  // native Excel rows, keeping the workbook editable without flattening the child tablix to text.
+  rowProfiles.forEach((profile, rowIndex) => {
+    const declared = profile.at(-1) || 0;
+    if (measuredHeights[rowIndex] > declared) profile[profile.length - 1] = point(measuredHeights[rowIndex]);
+    rowProfiles[rowIndex] = splitTallRowIntervals(profile);
+  });
+  const physicalStarts = [];
+  let physicalCursor = startRow;
+  rowProfiles.forEach((profile) => {
+    physicalStarts.push(physicalCursor);
+    physicalCursor += Math.max(1, profile.length - 1);
+  });
+  rowProfiles.forEach((profile, rowIndex) => {
+    for (let index = 0; index < profile.length - 1; index += 1) {
+      const height = profile[index + 1] - profile[index];
+      if (height > MAX_EXCEL_ROW_HEIGHT) throw new ServiceError('UNSUPPORTED_FEATURE', 'Rendered Excel cell text exceeds the 409-point row-height limit');
+      worksheet.getRow(physicalStarts[rowIndex] + index).height = Math.max(2, height);
+    }
+  });
+
+  const renderNested = (nested, parentCellLeft, parentRowIndex, baseTop = 0) => {
+    const nestedRows = nested.rows || [];
+    const nestedColumns = nested.columns || nested.item.columns || [];
+    const nestedPlacements = computeCellPlacements(nestedRows, nestedColumns.length);
+    const nestedOffsets = [0];
+    nestedColumns.forEach((width) => nestedOffsets.push(point(nestedOffsets.at(-1) + width)));
+    const nestedOwners = nestedRows.map(() => new Array(nestedColumns.length).fill(null));
+    const rowOffsets = [point(baseTop + (nested.item.top || 0))];
+    nestedRows.forEach((row) => rowOffsets.push(point(rowOffsets.at(-1) + (row.height || DEFAULT_ROW_POINTS))));
+    for (const [rowIndex, row] of nestedRows.entries()) {
+      const context = {
+        fields: row.fields || {},
+        parameters: request.parameters || {},
+        globals,
+        dataset: row.scopeDataset || datasets[nested.item.datasetName] || [],
+        datasets,
+      };
+      for (const [cellIndex, cell] of row.cells.entries()) {
+        const start = nestedPlacements[rowIndex][cellIndex];
+        const presentation = cellStyle(nested.item, cell, context);
+        const owner = { cell, rowIndex, start, ...presentation };
+        for (let r = 0; r < Math.max(1, cell.rowSpan || 1) && rowIndex + r < nestedRows.length; r += 1) {
+          for (let c = 0; c < Math.max(1, cell.colSpan || 1) && start + c < nestedColumns.length; c += 1) {
+            if (nestedOwners[rowIndex + r][start + c]) throw new ServiceError('RDL_INVALID', 'Nested tablix produced overlapping Excel cells');
+            nestedOwners[rowIndex + r][start + c] = owner;
+          }
+        }
+      }
+    }
+    for (const [rowIndex, row] of nestedRows.entries()) {
+      for (const [cellIndex, cell] of row.cells.entries()) {
+        const start = nestedPlacements[rowIndex][cellIndex];
+        const owner = nestedOwners[rowIndex][start];
+        const colSpan = Math.max(1, cell.colSpan || 1);
+        const rowSpan = Math.max(1, cell.rowSpan || 1);
+        const left = point(parentCellLeft + (nested.item.left || 0) + nestedOffsets[start]);
+        const width = point(nestedOffsets[Math.min(nestedColumns.length, start + colSpan)] - nestedOffsets[start]);
+        const top = rowOffsets[rowIndex];
+        const bottom = rowOffsets[Math.min(nestedRows.length, rowIndex + rowSpan)];
+        const profile = rowProfiles[parentRowIndex];
+        const range = {
+          ...gridRange(xGrid, left, width),
+          startRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, top),
+          endRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, bottom) - 1,
+        };
+        if (range.startRow !== range.endRow || range.startCol !== range.endCol) mergeSafe(worksheet, range, merges);
+        const target = worksheet.getCell(range.startRow, range.startCol);
+        const { value, numFmt } = excelCellValue(cell, owner.context);
+        const display = cellText(cell);
+        target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
+        if (numFmt) target.numFmt = numFmt;
+        applyFillFontAlignment(target, owner.style || {}, owner.context);
+        target.border = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows));
+        const childCellLeft = left;
+        for (const child of cell.nestedTablixes || []) renderNested(child, childCellLeft, parentRowIndex, top);
+      }
+    }
+  };
+
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
-    const excelRow = startRow + rowIndex;
-    let measuredHeight = rows[rowIndex].height || DEFAULT_ROW_POINTS;
+    const excelRow = physicalStarts[rowIndex];
     for (let columnIndex = 0; columnIndex < columns.length;) {
       const owner = gridOwners[rowIndex][columnIndex];
       if (!owner) { columnIndex += 1; continue; }
       if (columnIndex !== owner.start) { columnIndex += 1; continue; }
       const span = Math.max(1, owner.cell.colSpan || 1);
+      if (rowIndex !== owner.rowIndex) { columnIndex += span; continue; }
+      const rowSpan = Math.max(1, owner.cell.rowSpan || 1);
       const left = point((item.left || 0) + columnOffsets[columnIndex]);
       const width = point(columnOffsets[columnIndex + span] - columnOffsets[columnIndex]);
       const columnsRange = gridRange(xGrid, left, width);
-      const range = { startRow: excelRow, endRow: excelRow, ...columnsRange };
+      const endLogicalRow = Math.min(rows.length - 1, rowIndex + rowSpan - 1);
+      const range = {
+        startRow: excelRow,
+        endRow: physicalStarts[endLogicalRow] + Math.max(1, rowProfiles[endLogicalRow].length - 1) - 1,
+        ...columnsRange,
+      };
       // The section-wide coordinate grid also contains boundaries from unrelated report items (for example,
       // a logo edge can fall inside a tablix column). A single logical RDL cell may therefore cover several
       // physical Excel columns even when its ColSpan is 1. Merge the occupied Excel region, not merely RDL
       // spans, or the extra grid slices appear as blank gaps inside the table.
-      if (range.startCol !== range.endCol) mergeSafe(worksheet, range, merges);
+      const hasNested = (owner.cell.nestedTablixes || []).length > 0;
+      if (!hasNested && (range.startRow !== range.endRow || range.startCol !== range.endCol)) mergeSafe(worksheet, range, merges);
       const target = worksheet.getCell(excelRow, range.startCol);
       const { value, numFmt } = excelCellValue(owner.cell, owner.context);
       const display = cellText(owner.cell);
       target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
       if (numFmt) target.numFmt = numFmt;
       applyFillFontAlignment(target, owner.style || {}, owner.context);
-      target.border = repeatedCellBorders(gridOwners, rowIndex, columnIndex, owner);
-      if (owner.textbox && display) {
-        const textHeight = measureTextboxHeight(measureDoc, config, owner.textbox, owner.context, display, width)
-          + styleSize(owner.style?.paddingTop, owner.context, 2) + styleSize(owner.style?.paddingBottom, owner.context, 2);
-        measuredHeight = Math.max(measuredHeight, textHeight);
+      target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+      if (hasNested) {
+        applyRegionStyle(worksheet, range, owner.style || {}, owner.context);
+        target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+        for (const nested of owner.cell.nestedTablixes || []) renderNested(nested, left, rowIndex);
       }
       columnIndex += span;
     }
-    if (measuredHeight > MAX_EXCEL_ROW_HEIGHT) throw new ServiceError('UNSUPPORTED_FEATURE', 'Rendered Excel cell text exceeds the 409-point row-height limit');
-    worksheet.getRow(excelRow).height = Math.max(2, measuredHeight);
   }
 
-  const headerRows = rows.filter((row) => row.isHeader).length;
+  const headerRows = rows.reduce((sum, row, index) => (
+    row.isHeader ? sum + Math.max(1, rowProfiles[index].length - 1) : sum
+  ), 0);
   const tableRange = gridRange(xGrid, point(item.left || 0), columnOffsets[columnOffsets.length - 1]);
-  const fixedLogicalColumns = Math.min(
-    item.rowHeaderColumns?.length || 0,
-    (item.rowMemberPaths || []).filter((path) => path.some((member) => member.fixedData)).length,
-  );
+  const fixedLogicalColumns = item.fixedRowHeaders
+    ? (item.rowHeaderColumns?.length || 0)
+    : Math.min(
+      item.rowHeaderColumns?.length || 0,
+      (item.rowMemberPaths || []).filter((path) => path.some((member) => member.fixedData)).length,
+    );
   const fixedColumnsSplit = fixedLogicalColumns > 0
     ? gridRange(xGrid, point(item.left || 0), columnOffsets[fixedLogicalColumns]).endCol
     : 0;
   return {
-    rowsConsumed: rows.length,
+    rowsConsumed: physicalCursor - startRow,
     startRow,
-    endRow: startRow + rows.length - 1,
+    endRow: physicalCursor - 1,
     headerRows,
     dynamic: rows.some((row) => !row.isHeader && !row.isStatic),
     fixedColumnsSplit,
@@ -795,6 +1053,17 @@ function configureReportSheet(worksheet, model, request, globals, usedRows, used
   worksheet.headerFooter = { oddFooter: footer, evenFooter: footer };
 }
 
+function declaredSectionName(items, context) {
+  for (const item of items) {
+    if (item.pageName !== null && item.pageName !== undefined && String(item.pageName).trim() !== '') {
+      const value = evaluateExpression(item.pageName, context);
+      const name = String(value ?? '').replace(/\s+/g, ' ').trim();
+      if (name) return name;
+    }
+  }
+  return '';
+}
+
 async function renderReportExcel(model, request, config) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'RDL Converter Service';
@@ -813,7 +1082,7 @@ async function renderReportExcel(model, request, config) {
 
   for (let index = 0; index < sections.length; index += 1) {
     const section = sections[index];
-    const title = firstVisibleText(section, model, request, globals);
+    const title = declaredSectionName(section, context) || firstVisibleText(section, model, request, globals);
     const name = uniqueSheetName(workbook, title, `Section ${index + 1}`);
     const worksheet = workbook.addWorksheet(name);
     const xGrid = reportGrid(model, section, request, globals, tablixCache);
@@ -831,21 +1100,86 @@ async function renderReportExcel(model, request, config) {
       cursor += headerBandRows;
     }
     const detailRegions = [];
+    const renderSectionItem = (sourceItem, parentLeft = 0) => {
+      const item = { ...sourceItem, left: point(parentLeft + (sourceItem.left || 0)) };
+      if (item.type === 'Rectangle') {
+        const containerStart = cursor;
+        let previousChildBottom = 0;
+        for (const child of [...(item.items || [])].sort((a, b) => (
+          (a.top || 0) - (b.top || 0) || (a.left || 0) - (b.left || 0) || a.zIndex - b.zIndex
+        ))) {
+          const gap = Math.max(0, (child.top || 0) - previousChildBottom);
+          cursor += addGapRows(worksheet, cursor, gap);
+          renderSectionItem({ ...child, top: 0 }, item.left);
+          previousChildBottom = Math.max(previousChildBottom, (child.top || 0) + (child.height || 0));
+        }
+        const trailing = Math.max(0, (item.height || 0) - previousChildBottom);
+        cursor += addGapRows(worksheet, cursor, trailing);
+        if (cursor === containerStart) cursor += addGapRows(worksheet, cursor, Math.max(2, item.height || DEFAULT_ROW_POINTS));
+        const range = {
+          ...gridRange(xGrid, item.left, item.width || 0),
+          startRow: containerStart,
+          endRow: Math.max(containerStart, cursor - 1),
+        };
+        const fill = hex(styleColor(item.style?.backgroundColor, context, null));
+        const borders = item.style?.borders || {};
+        for (let row = range.startRow; row <= range.endRow; row += 1) {
+          for (let column = range.startCol; column <= range.endCol; column += 1) {
+            const target = worksheet.getCell(row, column);
+            if (fill && !target.fill?.type && (target.value === null || target.value === undefined)) {
+              target.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
+            }
+            target.border = {
+              ...(target.border || {}),
+              top: row === range.startRow ? excelBorderSide(borders.top, context) : target.border?.top,
+              bottom: row === range.endRow ? excelBorderSide(borders.bottom, context) : target.border?.bottom,
+              left: column === range.startCol ? excelBorderSide(borders.left, context) : target.border?.left,
+              right: column === range.endCol ? excelBorderSide(borders.right, context) : target.border?.right,
+            };
+          }
+        }
+        return;
+      }
+      if (item.type === 'Tablix') {
+        const region = renderReportTablix({
+          worksheet,
+          model,
+          item,
+          request,
+          globals,
+          config,
+          xGrid,
+          startRow: cursor,
+          merges,
+          tablixCache,
+          measureDoc,
+        });
+        cursor += region.rowsConsumed;
+        if (region.dynamic) detailRegions.push(region);
+        return;
+      }
+      if (item.type === 'Chart') {
+        throw new ServiceError('UNSUPPORTED_FEATURE', 'Charts are not supported in Excel REPORT mode without drawings; use excel.layoutMode DATA');
+      }
+      const height = Math.max(2, item.height || DEFAULT_ROW_POINTS);
+      const consumed = renderFreeformBand({
+        workbook,
+        worksheet,
+        model,
+        items: [{ ...item, top: 0 }],
+        height,
+        context,
+        xGrid,
+        startRow: cursor,
+        merges,
+      });
+      cursor += consumed;
+    };
     let previousDesignBottom = null;
     for (const item of section) {
       const gap = previousDesignBottom === null ? 0 : Math.max(0, (item.top || 0) - previousDesignBottom);
       cursor += addGapRows(worksheet, cursor, gap);
-      if (item.type === 'Tablix') {
-        const region = renderReportTablix({ worksheet, model, item, request, globals, config, xGrid, startRow: cursor, merges, tablixCache, measureDoc });
-        cursor += region.rowsConsumed;
-        if (region.dynamic) detailRegions.push(region);
-      } else if (item.type === 'Chart') {
-        throw new ServiceError('UNSUPPORTED_FEATURE', 'Charts are not supported in Excel REPORT mode without drawings; use excel.layoutMode DATA');
-      } else {
-        const height = Math.max(2, item.height || DEFAULT_ROW_POINTS);
-        const rows = renderFreeformBand({ workbook, worksheet, model, items: [{ ...item, top: 0 }], height, context, xGrid, startRow: cursor, merges });
-        cursor += rows;
-      }
+      renderSectionItem({ ...item, top: 0 });
       previousDesignBottom = Math.max(previousDesignBottom ?? 0, (item.top || 0) + (item.height || 0));
     }
     const usedRows = Math.max(1, cursor - 1);

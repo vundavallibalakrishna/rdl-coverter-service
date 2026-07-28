@@ -36,6 +36,14 @@ test('Trim / LTrim / RTrim', () => {
   assert.equal(evalExpr('=Trim(Nothing)'), '');
 });
 
+test('VB control-character constants compose multiline and tabbed text', () => {
+  assert.equal(evalExpr('="first" & vbCrLf & "second"'), 'first\r\nsecond');
+  assert.equal(evalExpr('="a" & vbTab & "b"'), 'a\tb');
+  assert.equal(evalExpr('=vbLf'), '\n');
+  assert.equal(evalExpr('=vbCr'), '\r');
+  assert.equal(evalExpr('=vbNewLine'), '\r\n');
+});
+
 test('UCase / LCase', () => {
   assert.equal(evalExpr('=UCase("Hello")'), 'HELLO');
   assert.equal(evalExpr('=LCase("Hello")'), 'hello');

@@ -58,3 +58,15 @@ test('the subtotal tablix keeps its static grid columns (no matrix expansion)', 
   const tablix = tablixOf(subtotalRdl());
   assert.deepEqual(materializeTablixColumns(tablix, [{ Cat: 'A', Amount: 10 }], {}, {}, {}), tablix.columns);
 });
+
+test('advanced grouped tablixes preserve leading static rows as repeatable column headers', () => {
+  const staticRow = '<TablixRow><Height>0.25in</Height><TablixCells><TablixCell><CellContents><Textbox Name="columnHeading"><Paragraphs><Paragraph><TextRuns><TextRun><Value>Column heading</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox></CellContents></TablixCell></TablixCells></TablixRow>';
+  const rdl = subtotalRdl()
+    .replace('<TablixRows>\n      ', `<TablixRows>\n      ${staticRow}\n      `)
+    .replace('<TablixRowHierarchy><TablixMembers>\n      ', '<TablixRowHierarchy><TablixMembers>\n      <TablixMember><RepeatOnNewPage>true</RepeatOnNewPage></TablixMember>\n      ');
+  const tablix = tablixOf(rdl);
+  const rows = materializeTablixRows(tablix, [{ Cat: 'A', Amount: 10 }], {}, {}, {});
+  assert.equal(rows[0].role, 'static');
+  assert.equal(rows[0].isHeader, true);
+  assert.equal(rows.slice(1).every((row) => row.isHeader === false), true);
+});

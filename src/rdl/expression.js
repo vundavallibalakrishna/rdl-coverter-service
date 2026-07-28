@@ -491,6 +491,16 @@ export function evaluateExpression(input, context = {}) {
     }
     return raw ?? null; // globals, user, reportitems
   }
+  // Built-in VB control-character constants commonly used to assemble multiline labels. These are
+  // declarative literals, not function calls or custom code, and are safe to resolve directly.
+  const vbConstants = {
+    vbcrlf: '\r\n',
+    vbnewline: '\r\n',
+    vblf: '\n',
+    vbcr: '\r',
+    vbtab: '\t',
+  };
+  if (Object.hasOwn(vbConstants, value.toLowerCase())) return vbConstants[value.toLowerCase()];
   if (/^Nothing$/i.test(value)) return null;
   if (/^(True|False)$/i.test(value)) return value.toLowerCase() === 'true';
   if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);

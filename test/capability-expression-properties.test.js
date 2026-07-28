@@ -7,9 +7,9 @@ import test from 'node:test';
 import { EXPRESSION_PROPERTIES } from '../src/rdl/capabilities.js';
 import { analyzeRdl } from '../src/rdl/parser.js';
 
-// The one documented not-yet-rendered expression property. A NEW unhandled entry (a property catalogued but
-// silently unhandled) must be added here consciously — otherwise this test catches it.
-const KNOWN_UNHANDLED = ['Style.LineHeight'];
+// A NEW unhandled entry (a property catalogued but silently unhandled) must be added here consciously —
+// otherwise this test catches it.
+const KNOWN_UNHANDLED = [];
 
 test('the only unhandled expression properties are the documented ones', () => {
   const unhandled = Object.entries(EXPRESSION_PROPERTIES).filter(([, spec]) => !spec.handled).map(([k]) => k).sort();
@@ -23,6 +23,7 @@ test('the catalogue covers the full Style + Border expression surface', () => {
     'Style.Color', 'Style.BackgroundColor', 'Style.FontFamily', 'Style.FontSize', 'Style.FontWeight',
     'Style.FontStyle', 'Style.TextDecoration', 'Style.TextAlign', 'Style.VerticalAlign', 'Style.Format',
     'Style.PaddingLeft', 'Style.PaddingRight', 'Style.PaddingTop', 'Style.PaddingBottom', 'Style.LineHeight',
+    'Paragraph.SpaceBefore', 'Paragraph.SpaceAfter',
     'Visibility.Hidden', 'Image.Value', 'Image.Sizing',
   ];
   for (const owner of ['Border', 'TopBorder', 'RightBorder', 'BottomBorder', 'LeftBorder']) {

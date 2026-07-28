@@ -93,6 +93,7 @@ test('continues a PDF table cell taller than a page without clipping or duplicat
   const longCell = `PDF_GIANT_START\n${Array.from({ length: 180 }, (_, index) => `PDF_GIANT_LINE_${String(index + 1).padStart(3, '0')} deterministic overflow content`).join('\n')}\nPDF_GIANT_END`;
   const overflowRequest = {
     ...request,
+    pagination: { continuationMarkers: true },
     datasets: {
       Sales: [
         { Name: longCell, Amount: 1 },
@@ -108,6 +109,8 @@ test('continues a PDF table cell taller than a page without clipping or duplicat
   const extracted = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
   assert.equal((extracted.stdout.match(/PDF_GIANT_START/g) || []).length, 1);
   assert.equal((extracted.stdout.match(/PDF_GIANT_END/g) || []).length, 1);
+  assert.equal((extracted.stdout.match(/Continued from previous page/g) || []).length > 0, true);
+  assert.equal((extracted.stdout.match(/Continued on next page/g) || []).length, 0);
   for (let index = 1; index <= 180; index += 1) {
     const marker = `PDF_GIANT_LINE_${String(index).padStart(3, '0')}`;
     assert.equal((extracted.stdout.match(new RegExp(marker, 'g')) || []).length, 1);
@@ -435,10 +438,24 @@ test('keeps wide multi-page DOCX tables inside the page, repeats only declared h
   const zip = await JSZip.loadAsync(result.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
   const nativeTables = (documentXml.match(/<w:tbl>/g) || []).length;
+  const nativeTableXml = [...documentXml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((match) => match[0]);
+  const nativeRows = nativeTableXml.flatMap((table) => [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]));
   assert.equal(nativeTables > 1, true);
   assert.equal((documentXml.match(/<wps:wsp>/g) || []).length, 0);
   assert.equal((documentXml.match(/<w:tblHeader\/>/g) || []).length, nativeTables);
-  assert.equal((documentXml.match(/<w:cantSplit\/>/g) || []).length, nativeTables);
+  for (const table of nativeTableXml) {
+    const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
+    const closureRow = physicalRows.at(-1) || '';
+    assert.match(closureRow, new RegExp(`<w:gridSpan w:val="${geometry.gridTwips.length}"\\/>`), 'each fragment closes across the complete grid');
+    assert.match(closureRow, /<w:top w:val="single"/);
+    assert.match(closureRow, /<w:bottom w:val="none"/);
+  }
+  const oversizedStartRow = nativeRows.find((row) => row.includes('LONG_CELL_START')) || '';
+  const oversizedEndRow = nativeRows.find((row) => row.includes('LONG_CELL_END')) || '';
+  assert.ok(oversizedStartRow && oversizedEndRow, 'the page-taller content remains native and editable');
+  assert.notEqual(oversizedStartRow, oversizedEndRow, 'a page-taller source row becomes bounded native rows');
+  assert.equal(nativeRows.every((row) => /<w:cantSplit\/>/.test(row)), true, 'every physical row remains atomic');
+  assert.equal(nativeRows.every((row) => /<w:trHeight\b/.test(row)), true, 'every physical row has a bounded measured height');
   assert.equal((documentXml.match(/LONG_CELL_START/g) || []).length, 1);
   assert.equal((documentXml.match(/LONG_CELL_END/g) || []).length, 1);
   for (let index = 1; index <= 45; index += 1) {
@@ -541,6 +558,7 @@ test('structured footer materializes PAGE and NUMPAGES as real Word fields', asy
   footerText.name = 'PageFooter';
   footerText.value = '="Page " & Globals!PageNumber & " of " & Globals!TotalPages';
   footerText.paragraphs = [[{ value: footerText.value, markupType: 'None' }]];
+  footerText.style = { ...footerText.style, fontFamily: 'Arial', fontSize: 8, fontWeight: 'Normal' };
   footerText.left = 400;
   footerText.top = 0;
   footerText.width = 100;
@@ -549,9 +567,52 @@ test('structured footer materializes PAGE and NUMPAGES as real Word fields', asy
   const result = await renderEditableDocx(footerModel, request);
   const zip = await JSZip.loadAsync(result.buffer);
   const footerXml = await zip.file('word/footer1.xml').async('string');
-  assert.match(footerXml, /w:instr="PAGE"/);
-  assert.match(footerXml, /w:instr="NUMPAGES"/);
+  assert.match(footerXml, /<w:instrText[^>]*>PAGE<\/w:instrText>/);
+  assert.match(footerXml, /<w:instrText[^>]*>NUMPAGES<\/w:instrText>/);
+  assert.equal((footerXml.match(/<w:fldChar w:fldCharType="begin"\/>/g) || []).length, 2);
+  assert.doesNotMatch(footerXml, /w:dirty=/);
+  assert.doesNotMatch(footerXml, /<w:instrText[^>]*>\s*(?:LINK|INCLUDETEXT|INCLUDEPICTURE|DDE)\b/i);
+  assert.doesNotMatch(footerXml, /<w:fldSimple/);
+  const complexFields = [...footerXml.matchAll(/<w:r><w:rPr>(?:(?!<\/w:rPr>)[\s\S])*?<\/w:rPr><w:fldChar w:fldCharType="begin"[^>]*\/><\/w:r>(?:(?!<w:fldChar w:fldCharType="end")[\s\S])*?<w:fldChar w:fldCharType="end"[^>]*\/><\/w:r>/g)].map((match) => match[0]);
+  for (const instruction of ['PAGE', 'NUMPAGES']) {
+    const field = complexFields.find((candidate) => new RegExp(`<w:instrText[^>]*>${instruction}<\\/w:instrText>`).test(candidate)) || '';
+    assert.ok(field, `${instruction} complex field is present`);
+    const fieldRuns = field.match(/<w:r>[\s\S]*?<\/w:r>/g) || [];
+    assert.equal(fieldRuns.length, 5);
+    for (const run of fieldRuns) {
+      assert.match(run, /<w:rFonts[^>]*w:ascii="Arial"/);
+      assert.match(run, /<w:sz w:val="16"/);
+    }
+  }
   assert.match(footerXml, /<wp:positionH relativeFrom="page">/);
+});
+
+test('each generated Word field inherits its own RDL text-run style', async () => {
+  const footerModel = structuredClone(model);
+  const footerText = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
+  const arial = { ...footerText.style, fontFamily: 'Arial', fontSize: 8 };
+  const times = { ...footerText.style, fontFamily: 'Times New Roman', fontSize: 11, fontWeight: 'Bold' };
+  footerText.name = 'MixedStylePageFooter';
+  footerText.paragraphs = [[
+    { value: '=Globals!PageNumber', markupType: 'None', style: arial },
+    { value: '=" of "', markupType: 'None', style: arial },
+    { value: '=Globals!TotalPages', markupType: 'None', style: times },
+  ]];
+  footerModel.page.footer = { height: 24, printOnFirstPage: true, printOnLastPage: true, items: [footerText] };
+
+  const zip = await JSZip.loadAsync((await renderEditableDocx(footerModel, request)).buffer);
+  const footerXml = await zip.file('word/footer1.xml').async('string');
+  const complexFields = [...footerXml.matchAll(/<w:r><w:rPr>(?:(?!<\/w:rPr>)[\s\S])*?<\/w:rPr><w:fldChar w:fldCharType="begin"[^>]*\/><\/w:r>(?:(?!<w:fldChar w:fldCharType="end")[\s\S])*?<w:fldChar w:fldCharType="end"[^>]*\/><\/w:r>/g)].map((match) => match[0]);
+  const complexField = (instruction) => complexFields.find((candidate) => new RegExp(`<w:instrText[^>]*>${instruction}<\\/w:instrText>`).test(candidate)) || '';
+  const pageField = complexField('PAGE');
+  const totalField = complexField('NUMPAGES');
+  assert.equal((pageField.match(/w:ascii="Arial"/g) || []).length, 5);
+  assert.equal((totalField.match(/w:ascii="Times New Roman"/g) || []).length, 5);
+  assert.match(pageField, /w:ascii="Arial"/);
+  assert.match(pageField, /<w:sz w:val="16"/);
+  assert.match(totalField, /w:ascii="Times New Roman"/);
+  assert.match(totalField, /<w:sz w:val="22"/);
+  assert.match(totalField, /<w:b\/>/);
 });
 
 test('editable DOCX preserves multi-line cell text as breaks and normalizes tabs', async () => {

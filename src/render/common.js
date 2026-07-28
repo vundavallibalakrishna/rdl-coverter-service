@@ -3,6 +3,17 @@ import { materializeTablixColumns, materializeTablixRows } from '../rdl/validati
 import { normalizeDisplayText, renderMarkupText } from '../rdl/text.js';
 import { toPoints } from '../units.js';
 
+// Cross-format labels for an explicitly detected logical row continuation. The feature is opt-in because
+// adding explanatory text changes the rendered artifact. Renderers must only emit these labels when they
+// own the pagination decision; a viewer-created page break is not detectable while generating the file.
+export const CONTINUATION_MARKERS = Object.freeze({
+  fromPrevious: 'Continued from previous page',
+});
+
+export function continuationMarkersEnabled(request) {
+  return request?.pagination?.continuationMarkers === true;
+}
+
 export function isHidden(expression, context) {
   const result = evaluateExpression(expression, context);
   return result === true || String(result).toLowerCase() === 'true';
@@ -29,7 +40,9 @@ export function styledTextForItem(item, context) {
     style: item.paragraphStyles?.[paragraphIndex] || item.style,
     runs: runs.map((run) => {
       const definition = run && typeof run === 'object' ? run : { value: run, markupType: 'None' };
-      const value = evaluateExpression(definition.value, context);
+      const value = /^constant$/i.test(String(definition.evaluationMode || 'Auto'))
+        ? definition.value
+        : evaluateExpression(definition.value, context);
       const runStyle = definition.style || item.style;
       if (value === null || value === undefined) return { text: '', style: runStyle };
       const format = styleValue(runStyle?.format ?? item.style?.format, context, null);
@@ -98,7 +111,14 @@ export function textForItem(item, context) {
   return normalizeDisplayText(item.style?.format ? String(formatValue(value, styleValue(item.style.format, context))) : String(value));
 }
 
-// Hard rule: the last row of a tablix must be closed with a bottom border, even when the RDL leaves the
+// A materialized dynamic/data row identifies a data tablix whose physical fragments require a guaranteed
+// closing edge. Static tablixes are also used as borderless layout containers, so they must keep the RDL's
+// declared Border=None rather than receiving a synthetic rule.
+export function shouldEnforceTablixBottom(rows) {
+  return (rows || []).some((row) => row.isStatic === false);
+}
+
+// For data tablixes, the last row must be closed with a bottom border even when the RDL leaves the
 // tablix/last-row bottom edge as None (or the row splits across a page). Returns the declared bottom border
 // when it is already a visible rule (Solid, or a conditional expression the row may resolve), otherwise a
 // Solid border matching another declared side of the same style (so the enforced edge picks up the table's

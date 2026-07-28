@@ -29,12 +29,17 @@ export function parseBoolean(value, fallback = false) {
 // Rectangle-wrapped cells silently rendered blank. Everything a cell renderer consumes must be listed here,
 // and anything else is refused (analyze reports TablixCellContent:<Type>; materialization throws) rather
 // than being silently dropped to an empty value.
-export const RENDERABLE_CELL_ITEMS = new Set(['Textbox']);
+export const RENDERABLE_CELL_ITEMS = new Set(['Textbox', 'Tablix', 'Subreport']);
 
 // A cell often wraps its content in a Rectangle used purely as a container
 // (CellContents > Rectangle > ReportItems > Textbox…). Flatten those away so the real content is seen.
-export function flattenCellItems(items) {
-  return (items || []).flatMap((item) => (item.type === 'Rectangle' ? flattenCellItems(item.items) : [item]));
+export function flattenCellItems(items, offset = { left: 0, top: 0 }) {
+  return (items || []).flatMap((item) => {
+    const left = offset.left + (item.left || 0);
+    const top = offset.top + (item.top || 0);
+    if (item.type === 'Rectangle') return flattenCellItems(item.items, { left, top });
+    return [{ ...item, left, top }];
+  });
 }
 
 export function firstDefined(...values) {

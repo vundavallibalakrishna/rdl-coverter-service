@@ -68,8 +68,9 @@ export async function createConverter(options = {}) {
      * Renders one artifact. Rejects with a ServiceError carrying a stable `code` and `statusCode`.
      *
      * @param {{ rdl: Buffer|Uint8Array|string, output: 'PDF'|'DOCX_EDITABLE'|'DOCX_VISUAL'|'XLSX',
-     *   parameters?: object, datasets?: object, signal?: AbortSignal }} request
+     *   parameters?: object, datasets?: object, subreports?: object, signal?: AbortSignal }} request
      *   `datasets` values are arrays of row objects keyed by exact RDL `DataField` names.
+     *   `subreports` maps child ReportName to its base64 RDL and invocation-scoped rows.
      * @returns {Promise<{ buffer: Buffer, mimeType: string, extension: string,
      *   pageCount: number|null, size: number, totalRows: number }>}
      */

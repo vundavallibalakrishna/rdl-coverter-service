@@ -84,6 +84,10 @@ test('classifies every encountered XML path and fails closed for unconsumed elem
   // Column-hierarchy TablixHeader now backs dynamic column groups (matrix) and is supported, not blocking.
   const columnHeader = fixture.toString().replace('<TablixColumnHierarchy><TablixMembers><TablixMember/>', '<TablixColumnHierarchy><TablixMembers><TablixMember><TablixHeader><Size>1in</Size></TablixHeader></TablixMember>');
   assert.equal(analyzeRdl(columnHeader).compatible, true);
+
+  const pageName = fixture.toString().replace('<Tablix Name="SalesTable">', '<Tablix Name="SalesTable"><PageName>Sales detail</PageName>');
+  assert.equal(analyzeRdl(pageName).compatible, true);
+  assert.equal(parseRdl(pageName).body.items.find((item) => item.type === 'Tablix').pageName, 'Sales detail');
 });
 
 test('catalogues every element and attribute declared by the published 2016 schema', () => {
@@ -235,6 +239,59 @@ test('interactive-only features are metadata-only and no longer block rendering'
   // Genuinely unsupported report items must still fail closed.
   const withSubreport = fixture.toString().replace('<Textbox Name="TitleBox">', '<Subreport Name="Sub"/><Textbox Name="TitleBox">');
   assert.equal(analyzeRdl(withSubreport).compatible, false);
+});
+
+test('analysis exposes subreport dependencies without resolving or rendering them', () => {
+  const subreport = `
+    <Subreport Name="ChildReport">
+      <ReportName>/Reports/Child Detail</ReportName>
+      <Parameters>
+        <Parameter Name="EntityId"><Value>=Fields!Id.Value</Value></Parameter>
+        <Parameter Name="Mode"><Value>Summary</Value></Parameter>
+      </Parameters>
+      <KeepTogether>true</KeepTogether>
+      <MergeTransactions>true</MergeTransactions>
+      <OmitBorderOnPageBreak>true</OmitBorderOnPageBreak>
+      <Top>0.5in</Top><Left>0in</Left><Width>7in</Width><Height>1in</Height>
+    </Subreport>`;
+  const analysis = analyzeRdl(fixture.toString().replace('<Textbox Name="TitleBox">', `${subreport}<Textbox Name="TitleBox">`));
+
+  assert.equal(analysis.compatible, false);
+  assert.equal(analysis.features.subreports, 1);
+  assert.deepEqual(analysis.subreports, [{
+    name: 'ChildReport',
+    reportName: '/Reports/Child Detail',
+    parameters: [
+      { name: 'EntityId', value: '=Fields!Id.Value' },
+      { name: 'Mode', value: 'Summary' },
+    ],
+    keepTogether: true,
+    mergeTransactions: true,
+    omitBorderOnPageBreak: true,
+  }]);
+  assert.equal(analysis.blockingErrors.some(({ feature }) => feature === 'Subreport'), true);
+});
+
+test('unused embedded code is metadata-only while every Code.* invocation remains fail-closed', () => {
+  const definition = `
+    <Code>
+      Public Function Paint(ByVal value As Integer) As String
+        Return "#00ff00"
+      End Function
+    </Code>`;
+  const unused = fixture.toString().replace('<ReportSections>', `${definition}<ReportSections>`);
+  const unusedAnalysis = analyzeRdl(unused);
+  assert.equal(unusedAnalysis.compatible, true);
+  assert.equal(unusedAnalysis.capabilities.expressions.detected.some((entry) => entry.name === 'Code.*'), false);
+
+  const invoked = unused.replace(
+    '<BackgroundColor>#dddddd</BackgroundColor>',
+    '<BackgroundColor>=Code.Paint(Fields!Amount.Value)</BackgroundColor>',
+  );
+  const invokedAnalysis = analyzeRdl(invoked);
+  assert.equal(invokedAnalysis.compatible, false);
+  assert.equal(invokedAnalysis.blockingErrors.some(({ feature }) => feature === 'CustomCode'), true);
+  assert.equal(invokedAnalysis.capabilities.expressions.detected.some((entry) => entry.name === 'Code.*' && entry.status === 'REJECTED'), true);
 });
 
 test('an RDL using RunningValue passes the expression capability gate', () => {

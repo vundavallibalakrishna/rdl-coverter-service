@@ -49,6 +49,7 @@ function styleOf(style = {}, defaultFontFamily = 'Arial') {
     textDecoration: textValue(style.TextDecoration, 'None'),
     textAlign: textValue(style.TextAlign, 'Left'),
     verticalAlign: textValue(style.VerticalAlign, 'Top'),
+    writingMode: textValue(style.WritingMode, 'Default'),
     format: textValue(style.Format, null),
     paddingLeft: sizeOrExpression(style.PaddingLeft, 2),
     paddingRight: sizeOrExpression(style.PaddingRight, 2),
@@ -65,6 +66,14 @@ function styleOf(style = {}, defaultFontFamily = 'Arial') {
   };
 }
 
+function evaluationModeOf(value) {
+  const mode = textValue(value?.['@_EvaluationMode'], 'Auto');
+  if (!/^(Auto|Constant)$/i.test(mode)) {
+    throw new ServiceError('RDL_INVALID', `Unsupported TextRun Value EvaluationMode: ${mode}`);
+  }
+  return /^constant$/i.test(mode) ? 'Constant' : 'Auto';
+}
+
 function textboxParagraphs(textbox, defaultFontFamily) {
   const paragraphs = asArray(textbox.Paragraphs?.Paragraph);
   if (paragraphs.length === 0) return [[{
@@ -74,6 +83,7 @@ function textboxParagraphs(textbox, defaultFontFamily) {
   }]];
   return paragraphs.map((paragraph) => asArray(paragraph.TextRuns?.TextRun).map((run) => ({
     value: textValue(run.Value, ''),
+    evaluationMode: evaluationModeOf(run.Value),
     markupType: textValue(run.MarkupType, 'None'),
     // TextRun styles are independent within a textbox. Preserve their effective inherited style instead
     // of flattening every run to the first run's font. Renderers can then switch weight, size, family,
@@ -89,12 +99,16 @@ function textboxParagraphs(textbox, defaultFontFamily) {
 
 function textboxParagraphStyles(textbox, defaultFontFamily) {
   const paragraphs = asArray(textbox.Paragraphs?.Paragraph);
-  if (paragraphs.length === 0) return [styleOf(textbox.Style, defaultFontFamily)];
-  return paragraphs.map((paragraph) => styleOf({
-    ...(textbox.Style || {}),
-    ...(paragraph.Style || {}),
-    Border: textbox.Style?.Border,
-  }, defaultFontFamily));
+  if (paragraphs.length === 0) return [{ ...styleOf(textbox.Style, defaultFontFamily), spaceBefore: 0, spaceAfter: 0 }];
+  return paragraphs.map((paragraph) => ({
+    ...styleOf({
+      ...(textbox.Style || {}),
+      ...(paragraph.Style || {}),
+      Border: textbox.Style?.Border,
+    }, defaultFontFamily),
+    spaceBefore: sizeOrExpression(paragraph.SpaceBefore, 0),
+    spaceAfter: sizeOrExpression(paragraph.SpaceAfter, 0),
+  }));
 }
 
 function textboxStyle(textbox, defaultFontFamily) {
@@ -124,6 +138,7 @@ function baseItem(type, value, defaultFontFamily) {
       location: textValue(value.PageBreak.BreakLocation, 'None'),
       disabled: textValue(value.PageBreak.Disabled, 'false'),
     } : null,
+    pageName: textValue(value?.PageName, null),
   };
 }
 
@@ -287,6 +302,19 @@ function parseChart(value, defaultFontFamily) {
   const categoryAxis = asArray(area.ChartCategoryAxes?.ChartAxis)[0] || {};
   const legend = asArray(value.ChartLegends?.ChartLegend)[0];
   const title = asArray(value.ChartTitles?.ChartTitle)[0];
+  const parseAxis = (axis) => ({
+    interval: textValue(axis.Interval, null),
+    labelsAutoFitDisabled: textValue(axis.LabelsAutoFitDisabled, 'false'),
+    style: styleOf(axis.Style, defaultFontFamily),
+  });
+  const customProperties = (series) => Object.fromEntries(asArray(series.CustomProperties?.CustomProperty)
+    .map((property) => [textValue(property.Name, ''), textValue(property.Value, '')])
+    .filter(([name]) => name));
+  const propertyAllowed = (name) => {
+    if (/^PointWidth$/i.test(name)) return chartType === 'bar' || chartType === 'column';
+    if (/^PieLineColor$/i.test(name)) return chartType === 'pie' || chartType === 'doughnut';
+    return false;
+  };
   return {
     ...item,
     datasetName: textValue(value.DataSetName),
@@ -306,12 +334,15 @@ function parseChart(value, defaultFontFamily) {
           expression: textValue(dataLabel.Label, null),
           useValueAsLabel: parseBoolean(dataLabel.UseValueAsLabel),
           visible: parseBoolean(dataLabel.Visible),
+          position: textValue(dataLabel.Position, 'Auto'),
           style: styleOf(dataLabel.Style, defaultFontFamily),
         },
+        customProperties: customProperties(series),
+        unsupportedCustomProperties: Object.keys(customProperties(series)).filter((name) => !propertyAllowed(name)),
       };
     }),
-    valueAxis: { interval: textValue(valueAxis.Interval, null) },
-    categoryAxis: { interval: textValue(categoryAxis.Interval, null) },
+    valueAxis: parseAxis(valueAxis),
+    categoryAxis: parseAxis(categoryAxis),
     // Draw the built-in legend only when the RDL declares one. Charts without <ChartLegends> (Chart1/
     // Chart2 here) rely on a manual legend built from separate report items, so a synthetic legend
     // would duplicate it.
@@ -343,6 +374,18 @@ function parseItem(type, value, defaultFontFamily) {
   if (type === 'Line') return item;
   if (type === 'Image') {
     return { ...item, source: textValue(value.Source), value: textValue(value.Value), sizing: textValue(value.Sizing, 'FitProportional') };
+  }
+  if (type === 'Subreport') {
+    return {
+      ...item,
+      reportName: textValue(value.ReportName, null),
+      parameters: asArray(value.Parameters?.Parameter).map((parameter) => ({
+        name: parameter['@_Name'] || null,
+        value: textValue(parameter.Value, ''),
+      })),
+      mergeTransactions: parseBoolean(value.MergeTransactions),
+      omitBorderOnPageBreak: parseBoolean(value.OmitBorderOnPageBreak),
+    };
   }
   if (type === 'Tablix') {
     const rows = asArray(value.TablixBody?.TablixRows?.TablixRow).map((row) => ({
@@ -379,6 +422,8 @@ function parseItem(type, value, defaultFontFamily) {
       tablixCorner,
       repeatColumnHeaders: parseBoolean(value.RepeatColumnHeaders),
       repeatRowHeaders: parseBoolean(value.RepeatRowHeaders),
+      fixedColumnHeaders: parseBoolean(value.FixedColumnHeaders),
+      fixedRowHeaders: parseBoolean(value.FixedRowHeaders),
       noRowsMessage: textValue(value.NoRowsMessage, null),
       filters: parseFilters(value.Filters),
       sortExpressions: asArray(value.SortExpressions?.SortExpression).map((sort) => ({ value: textValue(sort.Value), direction: textValue(sort.Direction, 'Ascending') })),
@@ -425,6 +470,45 @@ function collectItemDatasets(items, target = new Set()) {
   return target;
 }
 
+// Subreports are intentionally not rendered yet: their definitions and invocation-specific datasets live
+// outside the parent RDL. Preserve their complete caller-facing dependency metadata in the normalized model
+// so /v1/analyze can identify exactly what must be supplied without resolving a report-server path.
+function collectSubreports(items, target = []) {
+  const visitMembers = (members) => {
+    for (const member of members || []) {
+      if (member.header) collectSubreports(member.header.cell.items, target);
+      visitMembers(member.children);
+    }
+  };
+
+  for (const item of items || []) {
+    if (item.type === 'Subreport') {
+      target.push({
+        name: item.name,
+        reportName: item.reportName,
+        parameters: item.parameters,
+        keepTogether: item.keepTogether,
+        mergeTransactions: item.mergeTransactions,
+        omitBorderOnPageBreak: item.omitBorderOnPageBreak,
+      });
+    }
+    if (item.type === 'Tablix') {
+      visitMembers(item.rowMembers);
+      visitMembers(item.columnMembers);
+      for (const cornerRow of item.tablixCorner || []) {
+        for (const cornerCell of cornerRow) collectSubreports(cornerCell.items, target);
+      }
+    }
+    if (item.items) collectSubreports(item.items, target);
+    if (item.rows) {
+      for (const row of item.rows) {
+        for (const cell of row.cells) collectSubreports(cell.items, target);
+      }
+    }
+  }
+  return target;
+}
+
 // A tablix cell is a distinct rendering context: only the types in RENDERABLE_CELL_ITEMS are actually drawn
 // there, regardless of what the catalogue says about the element name elsewhere in the report. Report
 // anything else so the report fails closed at analyze time instead of rendering a silently empty cell.
@@ -439,11 +523,22 @@ function collectUnsupported(items, target = new Set()) {
   for (const item of items) {
     if (['Subreport', 'Map', 'GaugePanel', 'CustomReportItem'].includes(item.type)) target.add(item.type);
     if (item.type === 'Chart' && item.unsupportedType) target.add(`ChartType:${item.unsupportedType}`);
+    if (item.type === 'Chart') {
+      for (const series of item.seriesDefs || []) {
+        for (const property of series.unsupportedCustomProperties || []) target.add(`ChartProperty:${property}`);
+      }
+    }
     if (item.type === 'Image' && item.source !== 'Embedded') target.add(`ImageSource:${item.source || 'missing'}`);
     if (item.type === 'Textbox') {
+      const writingMode = String(item.style?.writingMode || 'Default');
+      if (!writingMode.startsWith('=') && !/^(Default|Horizontal|Vertical|Rotate270)$/i.test(writingMode)) {
+        target.add(`WritingMode:${writingMode}`);
+      }
       for (const paragraph of item.paragraphs || []) for (const run of paragraph) {
         const markupType = typeof run === 'object' ? run.markupType : 'None';
         if (!/^(None|HTML)$/i.test(String(markupType || 'None'))) target.add(`MarkupType:${markupType}`);
+        const evaluationMode = typeof run === 'object' ? run.evaluationMode : 'Auto';
+        if (!/^(Auto|Constant)$/i.test(String(evaluationMode || 'Auto'))) target.add(`EvaluationMode:${evaluationMode}`);
       }
     }
     if (item.type === 'Tablix') {
@@ -477,7 +572,16 @@ function collectUnsupportedExpressions(value, target = new Set()) {
   } else if (Array.isArray(value)) {
     for (const entry of value) collectUnsupportedExpressions(entry, target);
   } else if (value && typeof value === 'object') {
-    for (const entry of Object.values(value)) collectUnsupportedExpressions(entry, target);
+    for (const [key, entry] of Object.entries(value)) {
+      if (
+        key === 'value' &&
+        (
+          /^constant$/i.test(String(value.evaluationMode || '')) ||
+          Array.isArray(value.paragraphs)
+        )
+      ) continue;
+      collectUnsupportedExpressions(entry, target);
+    }
   }
   return target;
 }
@@ -568,6 +672,7 @@ export function parseRdl(input, limits = {}) {
     }
   };
   collectTablixVariables(allItems);
+  const subreports = collectSubreports(allItems);
   const unsupported = [...new Set([
     ...collectUnsupportedExpressions(allItems, collectUnsupported(allItems)),
     ...capabilities.rejected.map((entry) => `RdlPath:${entry.path}`),
@@ -598,6 +703,7 @@ export function parseRdl(input, limits = {}) {
     datasets,
     parameters,
     variables,
+    subreports,
     renderingDatasets: [...renderingDatasets],
     parameterDatasets: [...parameterDatasets],
     embeddedImages,
@@ -611,6 +717,7 @@ export function parseRdl(input, limits = {}) {
       images: (xml.match(/<Image\b/g) || []).length,
       groups: (xml.match(/<Group\b/g) || []).length,
       pageBreaks: (xml.match(/<PageBreak\b/g) || []).length,
+      subreports: subreports.length,
     },
     unsupported,
     capabilities,
@@ -644,6 +751,7 @@ export function analyzeParsedRdl(model) {
     datasets: model.datasets.map((dataset) => ({ ...dataset, requiredForRendering: model.renderingDatasets.includes(dataset.name), parameterOnly: model.parameterDatasets.includes(dataset.name) && !model.renderingDatasets.includes(dataset.name) })),
     fonts: model.fonts,
     features: model.features,
+    subreports: model.subreports,
     compatible: model.unsupported.length === 0,
     blockingErrors: model.unsupported.map((type) => ({ code: 'UNSUPPORTED_FEATURE', feature: type })),
     capabilities: model.capabilities,

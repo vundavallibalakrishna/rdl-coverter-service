@@ -19,15 +19,20 @@ const SUPPORTED_ELEMENTS = new Set([
   'PrintOnFirstPage', 'PrintOnLastPage', 'Height', 'Width', 'Top', 'Left', 'ReportItems',
   'Textbox', 'Paragraphs', 'Paragraph', 'TextRuns', 'TextRun', 'Value', 'CanGrow', 'CanShrink',
   'Style', 'Color', 'BackgroundColor', 'FontFamily', 'FontSize', 'FontWeight', 'FontStyle',
-  'TextAlign', 'VerticalAlign', 'TextDecoration', 'Format', 'PaddingLeft', 'PaddingRight', 'PaddingTop', 'PaddingBottom',
+  'TextAlign', 'VerticalAlign', 'WritingMode', 'TextDecoration', 'Format', 'PaddingLeft', 'PaddingRight', 'PaddingTop', 'PaddingBottom',
+  'LineHeight', 'SpaceBefore', 'SpaceAfter',
   'Border', 'TopBorder', 'RightBorder', 'BottomBorder', 'LeftBorder',
   'Visibility', 'Hidden', 'PageBreak', 'BreakLocation', 'Disabled',
+  // PageName is a rendering-extension page label. It is preserved on report items and used as the
+  // preferred native worksheet name for an Excel report section.
+  'PageName',
   'KeepTogether', 'ZIndex', 'HideDuplicates', 'MarkupType',
   'Tablix', 'TablixBody', 'TablixColumns', 'TablixColumn', 'TablixRows', 'TablixRow',
   'TablixCells', 'TablixCell', 'CellContents', 'ColSpan', 'RowSpan', 'DataSetName',
   'TablixRowHierarchy', 'TablixColumnHierarchy', 'TablixMembers', 'TablixMember', 'TablixHeader', 'Size',
   'TablixCorner', 'TablixCornerRows', 'TablixCornerRow', 'TablixCornerCell',
-  'RepeatColumnHeaders', 'RepeatRowHeaders', 'RepeatOnNewPage', 'KeepWithGroup', 'FixedData',
+  'RepeatColumnHeaders', 'RepeatRowHeaders', 'FixedColumnHeaders', 'FixedRowHeaders',
+  'RepeatOnNewPage', 'KeepWithGroup', 'FixedData',
   'HideIfNoRows', 'NoRowsMessage',
   // Group/Parent drives supported recursive (parent/child) row grouping, rendered expanded with
   // indentation. Group/Variables are consumed (resolved as Variables!Name.Value in the current scope).
@@ -43,6 +48,7 @@ const SUPPORTED_ELEMENTS = new Set([
   'ChartData', 'ChartSeriesCollection', 'ChartSeries', 'ChartDataPoints', 'ChartDataPoint',
   'ChartDataPointValues', 'Y', 'ChartDataLabel', 'UseValueAsLabel', 'Visible',
   'ChartAreas', 'ChartArea', 'ChartCategoryAxes', 'ChartValueAxes', 'ChartAxis',
+  'LabelsAutoFitDisabled',
   'ChartLegends', 'ChartLegend', 'Position', 'ChartTitles', 'ChartTitle', 'Caption',
   'Type', 'Subtype', 'Minimum', 'Maximum', 'Interval', 'ChartNoDataMessage',
 ]);
@@ -132,17 +138,20 @@ export const EXPRESSION_PROPERTIES = Object.freeze({
   'Style.TextDecoration': { valueType: 'Enum', handled: true },
   'Style.TextAlign': { valueType: 'Enum', handled: true },
   'Style.VerticalAlign': { valueType: 'Enum', handled: true },
+  'Style.WritingMode': { valueType: 'Enum', handled: true },
   'Style.Format': { valueType: 'String', handled: true },
   'Style.PaddingLeft': { valueType: 'RdlSize', handled: true },
   'Style.PaddingRight': { valueType: 'RdlSize', handled: true },
   'Style.PaddingTop': { valueType: 'RdlSize', handled: true },
   'Style.PaddingBottom': { valueType: 'RdlSize', handled: true },
-  // LineHeight is parsed (kept as an expression) but not yet applied to output — reported as unhandled so
-  // /v1/analyze can tell an integrator a custom line-height expression will not affect the rendered result.
-  'Style.LineHeight': { valueType: 'RdlSize', handled: false },
+  'Style.LineHeight': { valueType: 'RdlSize', handled: true },
+  'Paragraph.SpaceBefore': { valueType: 'RdlSize', handled: true },
+  'Paragraph.SpaceAfter': { valueType: 'RdlSize', handled: true },
   'Visibility.Hidden': { valueType: 'Boolean', handled: true },
   'Image.Value': { valueType: 'String', handled: true },
   'Image.Sizing': { valueType: 'Enum', handled: true },
+  'ChartAxis.LabelsAutoFitDisabled': { valueType: 'Boolean', handled: true },
+  'CustomProperty.Value': { valueType: 'String', handled: true },
   ...Object.fromEntries(BORDER_OWNERS.flatMap((owner) => [
     [`${owner}.Style`, { valueType: 'Enum', handled: true }],
     [`${owner}.Color`, { valueType: 'RdlColor', handled: true }],
@@ -171,6 +180,14 @@ function classifyElement(path, name, parentStatus) {
   if (name === 'df:DefaultFontFamily') return CapabilityStatus.SUPPORTED;
   if (name.startsWith('df:')) return CapabilityStatus.REJECTED;
   const local = localName(name);
+  // Chart custom properties are supported only in the ChartSeries/CustomProperties collection. Keeping
+  // this path-specific avoids turning unrelated extension/custom-property containers into silently
+  // accepted metadata.
+  if (['CustomProperties', 'CustomProperty', 'Name'].includes(local)) {
+    return /\.ChartSeries\.CustomProperties(?:\.CustomProperty(?:\.Name)?)?$/.test(path)
+      ? CapabilityStatus.SUPPORTED
+      : CapabilityStatus.REJECTED;
+  }
   if (METADATA_SUBTREES.has(local)) return CapabilityStatus.METADATA_ONLY;
   if (REJECTED_SUBTREES.has(local)) return CapabilityStatus.REJECTED;
   if (METADATA_ELEMENTS.has(local)) return CapabilityStatus.METADATA_ONLY;
@@ -185,7 +202,7 @@ function classifyDeclaredElement(name) {
 }
 
 function classifyDeclaredAttribute(name) {
-  if (name === 'Name' || name === 'MustUnderstand') return CapabilityStatus.SUPPORTED;
+  if (name === 'Name' || name === 'MustUnderstand' || name === 'EvaluationMode') return CapabilityStatus.SUPPORTED;
   return CapabilityStatus.REJECTED;
 }
 
@@ -213,6 +230,7 @@ function classifyAttribute(path, name, parentStatus) {
   const local = localName(name);
   if (local === 'Name') return CapabilityStatus.SUPPORTED;
   if (local === 'MustUnderstand') return CapabilityStatus.SUPPORTED;
+  if (local === 'EvaluationMode' && /\.TextRun\.Value\.@EvaluationMode$/.test(path)) return CapabilityStatus.SUPPORTED;
   if (local === 'TypeName' && name.includes('rd:')) return CapabilityStatus.SUPPORTED;
   if (local === 'xmlns' || name.includes('xmlns:') || local === 'schemaLocation') return CapabilityStatus.METADATA_ONLY;
   if (name.includes('xml:space')) return CapabilityStatus.METADATA_ONLY;
@@ -255,10 +273,12 @@ export function inspectRdlCapabilities(parsed, namespace) {
       return;
     }
 
+    const constantTextRunValue = localName(path.split('.').at(-1) || '') === 'Value'
+      && String(value['@_EvaluationMode'] || 'Auto').toLowerCase() === 'constant';
     for (const [name, child] of Object.entries(value)) {
       if (name === '?xml') continue;
       if (name === '#text') {
-        visit(child, path, parentStatus);
+        if (!constantTextRunValue) visit(child, path, parentStatus);
         continue;
       }
       if (name.startsWith('@_')) {

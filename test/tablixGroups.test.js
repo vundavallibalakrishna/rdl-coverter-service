@@ -29,6 +29,33 @@ function groupedRdl({ bodyCell, groupPageBreak = '', memberHidden = '', groupFil
  </ReportItems><Height>3in</Height><Style/></Body>
  <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth></Page></ReportSection></ReportSections></Report>`;
 }
+
+function nestedDuplicateRdl() {
+  return `<?xml version="1.0"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+ <DataSets><DataSet Name="D"><Fields>
+   <Field Name="Parent"><DataField>Parent</DataField></Field>
+   <Field Name="Child"><DataField>Child</DataField></Field>
+ </Fields><Query><CommandText>x</CommandText></Query></DataSet></DataSets>
+ <ReportSections><ReportSection><Body><ReportItems>
+  <Tablix Name="T"><TablixBody>
+   <TablixColumns><TablixColumn><Width>2in</Width></TablixColumn></TablixColumns>
+   <TablixRows><TablixRow><Height>0.25in</Height><TablixCells><TablixCell><CellContents>
+    <Textbox Name="status"><HideDuplicates>ChildGroup</HideDuplicates><Paragraphs><Paragraph><TextRuns><TextRun><Value>Not Assessed</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox>
+   </CellContents></TablixCell></TablixCells></TablixRow></TablixRows>
+  </TablixBody>
+  <TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
+  <TablixRowHierarchy><TablixMembers><TablixMember>
+   <Group Name="ParentGroup"><GroupExpressions><GroupExpression>=Fields!Parent.Value</GroupExpression></GroupExpressions></Group>
+   <TablixMembers><TablixMember>
+    <Group Name="ChildGroup"><GroupExpressions><GroupExpression>=Fields!Child.Value</GroupExpression></GroupExpressions></Group>
+    <TablixMembers><TablixMember><Group Name="Details"/></TablixMember></TablixMembers>
+   </TablixMember></TablixMembers>
+  </TablixMember></TablixMembers></TablixRowHierarchy>
+  <DataSetName>D</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.25in</Height><Width>2in</Width><Style/></Tablix>
+ </ReportItems><Height>3in</Height><Style/></Body>
+ <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth></Page></ReportSection></ReportSections></Report>`;
+}
 const tablixOf = (rdl) => parseRdl(rdl).body.items.find((item) => item.type === 'Tablix');
 const values = (rows) => rows.map((row) => row.cells.map((cell) => (cell.values || []).join('')).join('|'));
 
@@ -60,6 +87,17 @@ test('a group page break tags the first row of each new instance', () => {
   const t = tablixOf(groupedRdl({ bodyCell: '=Fields!Cat.Value', groupPageBreak: 'Start' }));
   const rows = materializeTablixRows(t, [{ Cat: 'A' }, { Cat: 'A' }, { Cat: 'B' }], {}, {}, {});
   assert.deepEqual(rows.map((row) => row.pageBreakBefore), [false, false, true]); // break before B
+});
+
+test('HideDuplicates resets for the same child value in a different parent group instance', () => {
+  const t = tablixOf(nestedDuplicateRdl());
+  const rows = materializeTablixRows(t, [
+    { Parent: 'A', Child: null },
+    { Parent: 'A', Child: null },
+    { Parent: 'B', Child: null },
+    { Parent: 'B', Child: null },
+  ], {}, {}, {});
+  assert.deepEqual(values(rows), ['Not Assessed', '', 'Not Assessed', '']);
 });
 
 test('HideIfNoRows, NoRowsMessage and ToggleItem no longer fail closed', () => {

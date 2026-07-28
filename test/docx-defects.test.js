@@ -68,8 +68,8 @@ test('PageNumber/TotalPages inside a tablix cell become live Word fields, not a 
   tb.value = '="Page " & Globals!PageNumber & " of " & Globals!TotalPages';
   tb.paragraphs = [[{ value: tb.value, markupType: 'None' }]];
   const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
-  assert.match(xml, /w:instr="PAGE"/);
-  assert.match(xml, /w:instr="NUMPAGES"/);
+  assert.match(xml, /<w:instrText[^>]*>PAGE<\/w:instrText>/);
+  assert.match(xml, /<w:instrText[^>]*>NUMPAGES<\/w:instrText>/);
   assert.doesNotMatch(xml, /Page 1 of 1/);
 });
 

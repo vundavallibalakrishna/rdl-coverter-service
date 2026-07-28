@@ -17,18 +17,28 @@ function booleanFlag(value, fallback = false) {
 }
 
 export function loadConfig(env = process.env) {
+  const strictFonts = env.RDL_STRICT_FONTS !== 'false';
+  const workerMemoryMb = positiveInteger(env.RDL_WORKER_MEMORY_MB, 512);
+  const workerMemoryMaxMb = Math.max(workerMemoryMb, positiveInteger(env.RDL_WORKER_MEMORY_MAX_MB, 2048));
   return Object.freeze({
     port: positiveInteger(env.PORT, 7070),
     host: env.HOST || '0.0.0.0',
     tempRoot: path.resolve(env.RDL_TEMP_ROOT || path.join(os.tmpdir(), 'rdl-converter')),
     fontDir: path.resolve(env.RDL_FONT_DIR || path.join(process.cwd(), 'fonts')),
-    strictFonts: env.RDL_STRICT_FONTS !== 'false',
+    strictFonts,
+    // Compatible fallbacks are explicit rather than silent. Development/non-strict rendering enables them
+    // by default; strict production rendering requires an affirmative opt-in so a declared family is never
+    // substituted merely because it is absent from the host.
+    allowCompatibleFontFallbacks: booleanFlag(env.RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS, !strictFonts),
     maxRdlBytes: positiveInteger(env.RDL_MAX_RDL_BYTES, 10 * 1024 * 1024),
     maxRequestBytes: positiveInteger(env.RDL_MAX_REQUEST_BYTES, 25 * 1024 * 1024),
     maxRows: positiveInteger(env.RDL_MAX_ROWS, 100_000),
     maxConcurrency: positiveInteger(env.RDL_MAX_CONCURRENCY, 2),
     renderTimeoutMs: positiveInteger(env.RDL_RENDER_TIMEOUT_MS, 120_000),
-    workerMemoryMb: positiveInteger(env.RDL_WORKER_MEMORY_MB, 512),
+    // Ordinary workers start at workerMemoryMb. A bounded, deterministic preflight may raise PDF-producing
+    // workers up to workerMemoryMaxMb for exceptionally wide or text-heavy reports.
+    workerMemoryMb,
+    workerMemoryMaxMb,
     maxXmlNodes: positiveInteger(env.RDL_MAX_XML_NODES, 250_000),
     maxXmlDepth: positiveInteger(env.RDL_MAX_XML_DEPTH, 256),
     docxNativePageFragments: booleanFlag(env.RDL_DOCX_NATIVE_PAGE_FRAGMENTS, false),

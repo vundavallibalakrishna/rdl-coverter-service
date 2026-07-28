@@ -24,6 +24,10 @@ const rdl = `<?xml version="1.0" encoding="utf-8"?>
       <Paragraph><TextRuns><TextRun><Value/><Style><FontFamily>Arial</FontFamily><FontSize>6pt</FontSize><FontWeight>Normal</FontWeight><Color>Black</Color></Style></TextRun></TextRuns></Paragraph>
       <Paragraph><TextRuns><TextRun><Value>LATE BOLD</Value><Style><FontFamily>Arial</FontFamily><FontSize>10pt</FontSize><FontWeight>Bold</FontWeight><Color>White</Color></Style></TextRun></TextRuns></Paragraph>
     </Paragraphs><Top>1.1in</Top><Left>0.1in</Left><Width>2in</Width><Height>0.5in</Height><Style><BackgroundColor>Blue</BackgroundColor></Style></Textbox>
+    <Textbox Name="DecoratedRuns"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns>
+      <TextRun><Value>UNDERLINED </Value><Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize><TextDecoration>Underline</TextDecoration></Style></TextRun>
+      <TextRun><Value>STRUCK</Value><Style><FontFamily>Times New Roman</FontFamily><FontSize>11pt</FontSize><TextDecoration>LineThrough</TextDecoration></Style></TextRun>
+    </TextRuns></Paragraph></Paragraphs><Top>1.65in</Top><Left>0.1in</Left><Width>2.5in</Width><Height>0.25in</Height><Style/></Textbox>
   </ReportItems><Height>2in</Height></Body>
   <Width>3in</Width><Page><PageWidth>3in</PageWidth><PageHeight>2in</PageHeight><TopMargin>0in</TopMargin><BottomMargin>0in</BottomMargin><LeftMargin>0in</LeftMargin><RightMargin>0in</RightMargin></Page>
 </Report>`;
@@ -58,6 +62,8 @@ test('preserves and renders font styles at each RDL text-run boundary', async (c
   assert.match(xml, /<b>BOLD<\/b>/);
   assert.match(xml, /<fontspec id="2"[^>]*color="#ffffff"/);
   assert.match(xml, /font="2"><b>LATE BOLD<\/b>/);
+  assert.match(xml, />UNDERLINED <\/text>/);
+  assert.match(xml, />STRUCK<\/text>/);
   assert.match(fonts, /Arial-BoldMT\s+CID TrueType\s+Identity-H\s+yes\s+yes\s+yes/);
   assert.match(fonts, /ArialMT\s+CID TrueType\s+Identity-H\s+yes\s+yes\s+yes/);
 });

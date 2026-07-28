@@ -1,6 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
-import { color, enforcedBottomBorder, isHidden, normalizeDatasets, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem, cellText, cellTextbox } from './common.js';
+import { ServiceError } from '../errors.js';
+import { CONTINUATION_MARKERS, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -20,10 +21,10 @@ function collectDocument(doc) {
   });
 }
 
-function applyFont(doc, config, style, context = {}) {
+function applyFont(doc, config, style, context = {}, text = '') {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
-  doc.font(pdfFont(config, styleValue(style.fontFamily, context, 'Arial'), bold, italic)).fontSize(styleSize(style.fontSize, context, 10) || 10).fillColor(styleColor(style.color, context));
+  doc.font(pdfFont(config, styleValue(style.fontFamily, context, 'Arial'), bold, italic, text)).fontSize(styleSize(style.fontSize, context, 10) || 10).fillColor(styleColor(style.color, context));
 }
 
 function drawBorderEdge(doc, x, y, width, height, side, border, context = {}) {
@@ -84,7 +85,7 @@ function renderedTextHeight(doc, text, width) {
 
 function lineHeightForStyle(doc, config, style, context) {
   applyFont(doc, config, style, context);
-  return doc.currentLineHeight(true);
+  return styleSize(style?.lineHeight, context, 0) || doc.currentLineHeight(true);
 }
 
 function layoutStyledText(doc, config, item, context, text, width) {
@@ -92,35 +93,50 @@ function layoutStyledText(doc, config, item, context, text, width) {
   if (!source) return null;
   if (source.text.length === 0) return { lines: [], height: 0 };
   const lines = [];
+  const startedParagraphs = new Set();
   let line = null;
-  const startLine = (style, paragraphStyle) => ({
-    runs: [],
-    width: 0,
-    height: lineHeightForStyle(doc, config, style || item.style, context),
-    paragraphStyle: paragraphStyle || item.style,
-    paragraphEnd: false,
-  });
+  const startLine = (style, paragraphStyle, paragraphIndex = 0) => {
+    const effectiveParagraphStyle = paragraphStyle || item.style;
+    const firstLine = !startedParagraphs.has(paragraphIndex);
+    startedParagraphs.add(paragraphIndex);
+    const before = firstLine ? styleSize(effectiveParagraphStyle?.spaceBefore, context, 0) : 0;
+    const contentHeight = lineHeightForStyle(doc, config, style || item.style, context);
+    return {
+      runs: [],
+      width: 0,
+      contentHeight,
+      before,
+      after: 0,
+      height: before + contentHeight,
+      paragraphStyle: effectiveParagraphStyle,
+      paragraphIndex,
+      paragraphEnd: false,
+    };
+  };
   const finishLine = (paragraphEnd = false) => {
     if (!line) line = startLine(item.style, item.style);
     line.paragraphEnd = paragraphEnd;
+    line.after = paragraphEnd ? styleSize(line.paragraphStyle?.spaceAfter, context, 0) : 0;
+    line.height = line.before + line.contentHeight + line.after;
     lines.push(line);
     line = null;
   };
   const addToken = (token, segment) => {
-    if (!line) line = startLine(segment.style, segment.paragraphStyle);
+    if (!line) line = startLine(segment.style, segment.paragraphStyle, segment.paragraphIndex);
     const whitespace = /^\s+$/.test(token);
-    applyFont(doc, config, segment.style, context);
+    applyFont(doc, config, segment.style, context, token);
     const tokenWidth = doc.widthOfString(token);
-    const tokenHeight = doc.currentLineHeight(true);
+    const tokenHeight = styleSize(segment.style?.lineHeight, context, 0) || doc.currentLineHeight(true);
     if (line.runs.length > 0 && line.width + tokenWidth > width) {
       finishLine(false);
-      line = startLine(segment.style, segment.paragraphStyle);
+      line = startLine(segment.style, segment.paragraphStyle, segment.paragraphIndex);
       // Wrapping consumes the separating whitespace, matching PDFKit's normal word-wrap behaviour.
       if (whitespace) return;
     }
     line.runs.push({ text: token, style: segment.style, width: tokenWidth });
     line.width += tokenWidth;
-    line.height = Math.max(line.height, tokenHeight);
+    line.contentHeight = Math.max(line.contentHeight, tokenHeight);
+    line.height = line.before + line.contentHeight;
   };
 
   for (const segment of source.segments) {
@@ -128,7 +144,7 @@ function layoutStyledText(doc, config, item, context, text, width) {
     for (const part of parts) {
       if (part === '') continue;
       if (part === '\n') {
-        if (!line) line = startLine(segment.style, segment.paragraphStyle);
+        if (!line) line = startLine(segment.style, segment.paragraphStyle, segment.paragraphIndex);
         finishLine(true);
         continue;
       }
@@ -144,6 +160,7 @@ function layoutStyledText(doc, config, item, context, text, width) {
 function drawStyledText(doc, config, item, context, layout, x, y, width) {
   let lineY = y;
   for (const line of layout.lines) {
+    const textY = lineY + line.before;
     const alignment = String(styleValue(line.paragraphStyle?.textAlign ?? item.style?.textAlign, context, 'left')).toLowerCase();
     let lineX = x;
     if (alignment === 'center') lineX += Math.max(0, (width - line.width) / 2);
@@ -153,12 +170,27 @@ function drawStyledText(doc, config, item, context, layout, x, y, width) {
       ? Math.max(0, width - line.width) / spaces
       : 0;
     for (const run of line.runs) {
-      applyFont(doc, config, run.style, context);
-      doc.text(run.text, lineX, lineY, {
-        lineBreak: false,
-        underline: /underline/i.test(String(styleValue(run.style?.textDecoration, context, 'None'))),
-        strike: /line.?through/i.test(String(styleValue(run.style?.textDecoration, context, 'None'))),
-      });
+      applyFont(doc, config, run.style, context, run.text);
+      const decoration = String(styleValue(run.style?.textDecoration, context, 'None'));
+      const underline = /underline/i.test(decoration);
+      const strike = /line.?through/i.test(decoration);
+      // PDFKit 0.17 computes a NaN decoration endpoint when underline/strike is combined with
+      // `lineBreak:false` (its fragment has no `textWidth`). Styled layout already measured the exact run
+      // width, so draw the decoration explicitly using that grounded geometry instead of asking PDFKit to
+      // re-measure. This also keeps the rule aligned with mixed-font runs.
+      doc.text(run.text, lineX, textY, { lineBreak: false });
+      if ((underline || strike) && run.width > 0) {
+        const fontSize = styleSize(run.style?.fontSize, context, 10) || 10;
+        const lineWidth = fontSize < 10 ? 0.5 : Math.floor(fontSize / 10);
+        const decorationY = underline ? textY + doc.currentLineHeight() - lineWidth : textY + doc.currentLineHeight() / 2;
+        doc.save()
+          .strokeColor(styleColor(run.style?.color, context, '#000000'))
+          .lineWidth(lineWidth)
+          .moveTo(lineX, decorationY)
+          .lineTo(lineX + run.width, decorationY)
+          .stroke()
+          .restore();
+      }
       lineX += run.width + justifyExtra * ((run.text.match(/ /g) || []).length);
     }
     lineY += line.height;
@@ -183,24 +215,40 @@ function drawTextbox(doc, config, item, x, y, context, override = {}) {
   const paddingLeft = styleSize(style.paddingLeft, context, 2) + (override.padLeft || 0);
   const innerWidth = Math.max(1, width - paddingLeft - padRight);
   const innerHeight = Math.max(1, height - padTop - padBottom);
-  const styledLayout = layoutStyledText(doc, config, item, context, text, innerWidth);
-  if (!styledLayout) applyFont(doc, config, style, context);
-  const measuredHeight = styledLayout?.height ?? renderedTextHeight(doc, text, innerWidth);
+  const writingMode = String(styleValue(style.writingMode, context, 'Default') || 'Default').toLowerCase();
+  const rotated = writingMode === 'rotate270' || writingMode === 'vertical';
+  const layoutWidth = rotated ? innerHeight : innerWidth;
+  const layoutHeight = rotated ? innerWidth : innerHeight;
+  const styledLayout = layoutStyledText(doc, config, item, context, text, layoutWidth);
+  if (!styledLayout) applyFont(doc, config, style, context, text);
+  const measuredHeight = styledLayout?.height ?? renderedTextHeight(doc, text, layoutWidth);
   // VerticalAlign can be an expression; resolve it before matching, otherwise the regex tests the raw
   // expression source (e.g. `=IIF(c,"Middle","Top")` always contains "Middle").
   const verticalAlign = String(styleValue(style.verticalAlign, context, 'top')).toLowerCase();
-  let textY = y + padTop;
-  if (/middle|center/.test(verticalAlign)) textY = y + Math.max(padTop, (height - measuredHeight) / 2);
-  if (/bottom/.test(verticalAlign)) textY = y + Math.max(padTop, height - measuredHeight - padBottom);
+  let localTextY = 0;
+  if (/middle|center/.test(verticalAlign)) localTextY = Math.max(0, (layoutHeight - measuredHeight) / 2);
+  if (/bottom/.test(verticalAlign)) localTextY = Math.max(0, layoutHeight - measuredHeight);
   // Clip text to the cell box so it can never bleed into an adjacent cell or, when the cell is
   // clamped at the page/footer boundary, into the reserved footer band. Background and borders are
   // drawn above (unclipped) so their edges stay crisp.
   doc.save().rect(x, y, width, height).clip();
-  if (styledLayout) drawStyledText(doc, config, item, context, styledLayout, x + paddingLeft, textY, innerWidth);
+  if (writingMode === 'rotate270') {
+    // Local horizontal text is mapped into the physical content box bottom-to-top:
+    //   physicalX = localY + left, physicalY = -localX + bottom.
+    // The textbox background and borders remain in the original coordinate system.
+    doc.transform(0, -1, 1, 0, x + paddingLeft, y + padTop + innerHeight);
+  } else if (writingMode === 'vertical') {
+    // SSRS Vertical writes Latin glyphs top-to-bottom. Map the horizontal local line clockwise into
+    // the physical box; East-Asian glyph shaping remains delegated to the selected font/PDFKit.
+    doc.transform(0, 1, -1, 0, x + paddingLeft + innerWidth, y + padTop);
+  } else {
+    doc.translate(x + paddingLeft, y + padTop);
+  }
+  if (styledLayout) drawStyledText(doc, config, item, context, styledLayout, 0, localTextY, layoutWidth);
   else {
-    doc.text(text, x + paddingLeft, textY, {
-      width: innerWidth,
-      height: innerHeight,
+    doc.text(text, 0, localTextY, {
+      width: layoutWidth,
+      height: layoutHeight,
       align: String(styleValue(style.textAlign, context, 'left')).toLowerCase(),
       lineBreak: true,
       ellipsis: !item.canGrow,
@@ -257,10 +305,17 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
 // rich-text run boundaries as PDF rather than a character-count approximation.
 export function measureTextboxHeight(doc, config, textbox, context, text, width) {
   if (!textbox || !text) return 0;
+  const writingMode = String(styleValue(textbox.style?.writingMode, context, 'Default') || 'Default').toLowerCase();
+  // A rotated textbox consumes the row's declared vertical extent; wrapping grows across the physical
+  // width, not down the page. Returning its cross-axis line height prevents Excel/DOCX row measurement
+  // from expanding a vertical header to the unrotated string height.
+  if (writingMode === 'rotate270' || writingMode === 'vertical') {
+    return styleSize(textbox.style?.fontSize, context, 10) || 10;
+  }
   const innerWidth = Math.max(1, width - styleSize(textbox.style.paddingLeft, context, 2) - styleSize(textbox.style.paddingRight, context, 2));
   const styledLayout = layoutStyledText(doc, config, textbox, context, text, innerWidth);
   if (styledLayout) return styledLayout.height;
-  applyFont(doc, config, textbox.style, context);
+  applyFont(doc, config, textbox.style, context, text);
   return doc.heightOfString(text, { width: innerWidth, lineGap: 0 });
 }
 
@@ -292,6 +347,7 @@ function splitTextForHeight(doc, config, textbox, context, text, width, height) 
 
 function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage, globals }) {
   const { rows, columns } = tablixRows(item, request, globals, model);
+  const enforceBottomClosure = shouldEnforceTablixBottom(rows);
   const datasets = normalizeDatasets(model, request);
   // A matrix expands to a data-dependent column grid wider than the design width; use its natural
   // total so columns are not scaled down. Static-column tablixes keep item's declared width scaling.
@@ -301,6 +357,34 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const placements = computeCellPlacements(rows, columnWidths.length);
   const rowIndexes = new Map(rows.map((row, index) => [row, index]));
   const outerContext = { parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets, fields: {} };
+  const showContinuationMarkers = continuationMarkersEnabled(request);
+
+  const markerDetails = (row) => {
+    const textbox = row?.cells?.map((cell) => cellTextbox(cell)).find(Boolean);
+    const style = textbox?.style || item.style || {};
+    const context = row
+      ? { ...outerContext, fields: row.fields || {} }
+      : outerContext;
+    const sourceSize = styleSize(style.fontSize, context, 10) || 10;
+    const fontSize = Math.max(7, sourceSize * 0.8);
+    return { style, context, fontSize, height: Math.max(10, fontSize * 1.5) };
+  };
+
+  const drawContinuationMarker = (label, row) => {
+    const { style, context, fontSize, height } = markerDetails(row);
+    doc.save();
+    doc.rect(startX, y, totalWidth, height).fill('#FFFFFF');
+    const family = styleValue(style.fontFamily, context, 'Arial');
+    doc.font(pdfFont(config, family, false, true, label))
+      .fontSize(fontSize)
+      .fillColor('#000000')
+      .text(label, startX + 2, y + Math.max(0, (height - fontSize) / 2 - 1), {
+        width: Math.max(1, totalWidth - 4), height, align: 'right', lineBreak: false,
+      });
+    doc.restore();
+    y += height;
+    addedHeight += height;
+  };
 
   // Grid occupancy map: which cell (and its owning row) covers each grid position, so a cell can find
   // the neighbour on each side. Populated from the placements plus col/row spans.
@@ -388,6 +472,111 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       if (edges[side]) collectEdge(x, y, width, height, side, edges[side].border, edges[side].context);
     }
   };
+  const nestedLayout = (nested, availableWidth) => {
+    const nestedParameters = nested.parameters || request.parameters || {};
+    const nestedDatasets = nested.datasets || datasets;
+    const nestedGlobals = nested.globals || globals;
+    const naturalColumns = nested.columns || nested.item.columns || [];
+    const naturalWidth = Math.max(1, naturalColumns.reduce((sum, value) => sum + value, 0));
+    const usableWidth = Math.max(1, availableWidth - Math.max(0, nested.item.left || 0));
+    const width = Math.min(naturalWidth, usableWidth);
+    const scale = width / naturalWidth;
+    const columns = naturalColumns.map((value) => value * scale);
+    const placements = computeCellPlacements(nested.rows || [], columns.length);
+    const heights = (nested.rows || []).map((row, rowIndex) => row.cells.reduce((maximum, cell, cellIndex) => {
+      const textbox = cellTextbox(cell);
+      const columnIndex = placements[rowIndex][cellIndex];
+      const cellWidth = cellGeometryPt(columns, columnIndex, cell.colSpan || 1).widthPt;
+      const context = {
+        fields: row.fields || {},
+        parameters: nestedParameters,
+        globals: nestedGlobals,
+        dataset: row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
+        datasets: nestedDatasets,
+      };
+      const textHeight = textbox && !cell.hidden
+        ? measureTextboxHeight(doc, config, textbox, context, cellText(cell), cellWidth)
+          + styleSize(textbox.style?.paddingTop, context, 2) + styleSize(textbox.style?.paddingBottom, context, 2)
+        : 0;
+      const childHeight = Math.max(0, ...(cell.nestedTablixes || []).map((child) => {
+        const layout = nestedLayout(child, cellWidth);
+        return (child.item.top || 0) + layout.height;
+      }));
+      return Math.max(maximum, textHeight, childHeight);
+    }, row.height || 0));
+    return { columns, placements, heights, width, height: heights.reduce((sum, value) => sum + value, 0) };
+  };
+  const drawNestedTablix = (nested, parentX, parentY, availableWidth) => {
+    const nestedParameters = nested.parameters || request.parameters || {};
+    const nestedDatasets = nested.datasets || datasets;
+    const nestedGlobals = nested.globals || globals;
+    const layout = nestedLayout(nested, availableWidth);
+    const start = {
+      x: parentX + (nested.item.left || 0),
+      y: parentY + (nested.item.top || 0),
+    };
+    const rowOffsets = [0];
+    layout.heights.forEach((height) => rowOffsets.push(rowOffsets[rowOffsets.length - 1] + height));
+    const columnOffsets = [0];
+    layout.columns.forEach((width) => columnOffsets.push(columnOffsets[columnOffsets.length - 1] + width));
+    for (const [rowIndex, row] of (nested.rows || []).entries()) {
+      for (const [cellIndex, cell] of row.cells.entries()) {
+        const columnIndex = layout.placements[rowIndex][cellIndex];
+        const colSpan = Math.max(1, cell.colSpan || 1);
+        const rowSpan = Math.max(1, cell.rowSpan || 1);
+        const x = start.x + columnOffsets[columnIndex];
+        const cellY = start.y + rowOffsets[rowIndex];
+        const width = columnOffsets[Math.min(layout.columns.length, columnIndex + colSpan)] - columnOffsets[columnIndex];
+        const height = rowOffsets[Math.min(layout.heights.length, rowIndex + rowSpan)] - rowOffsets[rowIndex];
+        const textbox = cellTextbox(cell);
+        const context = {
+          fields: row.fields || {},
+          parameters: nestedParameters,
+          globals: nestedGlobals,
+          dataset: row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
+          datasets: nestedDatasets,
+        };
+        const style = (cell.containerWrapped ? nested.item.style : textbox?.style) || nested.item.style || {};
+        const background = styleColor(style.backgroundColor, context, null);
+        if (background) doc.save().rect(x, cellY, width, height).fill(background).restore();
+        if (textbox && !cell.hidden) {
+          drawTextbox(doc, config, textbox, x, cellY, context, {
+            width,
+            height,
+            text: cellText(cell),
+            skipBorder: true,
+          });
+        }
+        const borders = style.borders || {};
+        drawEdges(x, cellY, width, height, Object.fromEntries(
+          ['top', 'right', 'bottom', 'left'].map((side) => {
+            const border = borders[side];
+            return [side, border && !/^none$/i.test(String(styleValue(border.style, context, 'None')))
+              ? { border, context }
+              : null];
+          }),
+        ));
+        for (const child of cell.nestedTablixes || []) drawNestedTablix(child, x, cellY, width);
+      }
+    }
+    const outer = nested.item.style?.borders || {};
+    const nestedOuterContext = {
+      parameters: nestedParameters,
+      globals: nestedGlobals,
+      dataset: nestedDatasets[nested.item.datasetName] || [],
+      datasets: nestedDatasets,
+      fields: {},
+    };
+    drawEdges(start.x, start.y, layout.width, layout.height, Object.fromEntries(
+      ['top', 'right', 'bottom', 'left'].map((side) => {
+        const border = outer[side];
+        return [side, border && !/^none$/i.test(String(styleValue(border.style, nestedOuterContext, 'None')))
+          ? { border, context: nestedOuterContext }
+          : null];
+      }),
+    ));
+    return layout.height;
+  };
   let y = startY;
   let fragmentStartY = startY;
   let firstFragment = true;
@@ -403,9 +592,10 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (firstFragment) collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'top', item.style?.borders?.top, outerContext);
     collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'left', item.style?.borders?.left, outerContext);
     collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'right', item.style?.borders?.right, outerContext);
-    // Hard rule: always close the fragment (and hence the table's last row) with a bottom border, even when
-    // the RDL leaves it None or the row overflows onto the next page.
-    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'bottom', enforcedBottomBorder(item.style), outerContext);
+    // Data fragments always close, including overflow pages. Static layout tablixes instead honor the
+    // declared bottom edge, so Border=None cannot create a decorative rule after headings or prose.
+    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'bottom', enforceBottomClosure
+      ? enforcedBottomBorder(item.style) : item.style?.borders?.bottom, outerContext);
     firstFragment = false;
     flushEdges(); // draw this page fragment's borders as merged, single strokes
   };
@@ -426,6 +616,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     height,
     measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
       + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
+    Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
+      (nested.item.top || 0) + nestedLayout(nested, layout.width).height
+    ))),
   ), row.height);
   const measuredHeights = rows.map((row) => measureRow(row));
 
@@ -433,7 +626,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // clamped to the reserved body area so it never bleeds into the footer band. When the value is taller
   // than the segment, the overflow is recorded in `pendingTail` so it continues on the next page instead
   // of being clipped; a value that fits leaves no tail and therefore repeats at the top of each page.
-  const drawSpanSegment = (span, endY) => {
+  const drawSpanSegment = (span, endY, finalSegment = false) => {
     const segmentHeight = Math.min(endY - span.segStartY, Math.max(0, pageBottom - span.segStartY));
     if (segmentHeight <= 0.5) return;
     span.pendingTail = null;
@@ -442,12 +635,32 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       if (tail && tail.length > 0) span.pendingTail = tail;
       drawTextbox(doc, config, span.textbox, span.x, span.segStartY, span.context, { width: span.width, height: segmentHeight, text: head, skipBorder: true });
     }
+    // A nested data region can live in a row-header cell whose owning group spans several physical parent
+    // rows. Those cells are rendered lazily by this open-span path, so drawing nested regions only from
+    // drawRowContent silently produced an empty merged cell. Render the child once in the first page
+    // segment that can contain it. If no segment can contain it, fail closed rather than dropping or
+    // clipping child rows; synchronized pagination of a row-spanned parent and oversized child is a
+    // different construct from the supported oversized child in an ordinary cell.
+    if (!span.nestedDrawn && span.nestedTablixes.length > 0) {
+      const requiredHeight = Math.max(...span.nestedTablixes.map((nested) => (
+        (nested.item.top || 0) + nestedLayout(nested, span.width).height
+      )));
+      if (requiredHeight <= segmentHeight + 0.5) {
+        for (const nested of span.nestedTablixes) drawNestedTablix(nested, span.x, span.segStartY, span.width);
+        span.nestedDrawn = true;
+      } else if (finalSegment) {
+        throw new ServiceError(
+          'UNSUPPORTED_FEATURE',
+          `Row-spanned nested tablix in ${item.name || 'unnamed'} exceeds its printable page segment`,
+        );
+      }
+    }
     drawEdges(span.x, span.segStartY, span.width, segmentHeight, span.edges);
   };
 
   // Close every span whose last spanned row has now been fully drawn, ending it at the current y.
   const closeSpansEndingAt = (rowIndex) => {
-    for (const span of openSpans) if (span.endRowIndex <= rowIndex) drawSpanSegment(span, y);
+    for (const span of openSpans) if (span.endRowIndex <= rowIndex) drawSpanSegment(span, y, true);
     openSpans = openSpans.filter((span) => span.endRowIndex > rowIndex);
   };
 
@@ -464,7 +677,20 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       // Merged (row-span) cells are drawn lazily via drawSpanSegment so they track the real extent of their
       // spanned rows across page splits; single-row cells draw here directly.
       if ((cell.rowSpan || 1) > 1) {
-        openSpans.push({ x, width, textbox, cell, text: texts[index] || '', context: cellContext, edges, segStartY: y, endRowIndex: rowIndex + (cell.rowSpan || 1) - 1 });
+        openSpans.push({
+          x,
+          width,
+          textbox,
+          cell,
+          text: texts[index] || '',
+          context: cellContext,
+          edges,
+          segStartY: y,
+          endRowIndex: rowIndex + (cell.rowSpan || 1) - 1,
+          sourceRow: row,
+          nestedTablixes: cell.nestedTablixes || [],
+          nestedDrawn: false,
+        });
         continue;
       }
       const renderedHeight = Math.min(height, Math.max(0, pageBottom - y));
@@ -472,6 +698,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       // Recursive (parent/child) groups render expanded with the first cell indented by depth.
       const padLeft = index === 0 && row.indentLevel ? row.indentLevel * 12 : 0;
       if (textbox && !cell.hidden) drawTextbox(doc, config, textbox, x, y, cellContext, { width, height: renderedHeight, text: texts[index] || '', skipBorder: true, padLeft });
+      for (const nested of cell.nestedTablixes || []) drawNestedTablix(nested, x, y, width);
       drawEdges(x, y, width, renderedHeight, edges);
     }
     y += height;
@@ -480,13 +707,19 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (rowComplete) closeSpansEndingAt(rowIndex);
   };
 
-  const startContinuationPage = () => {
+  const startContinuationPage = (continuedRow = null) => {
     // End each open span at this page's content bottom, break, repeat the headers, then re-open the spans
     // just below the repeated headers so their value redraws at the top of the new page.
+    // An open row-span proves that the same logical group crosses this page boundary, even when no single
+    // textbox needed line-level splitting. Label that boundary just like a split physical row.
+    const logicalContinuationRow = continuedRow || openSpans[0]?.sourceRow || null;
     for (const span of openSpans) drawSpanSegment(span, y);
+    // Close and flush the actual table fragment before breaking so the final data row retains its bottom
+    // border. The continuation annotation belongs only to the next page, above its repeated table header.
     closeOuterBorderFragment(y);
     addPage();
     y = addPage.bodyTop;
+    if (showContinuationMarkers && logicalContinuationRow) drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, logicalContinuationRow);
     fragmentStartY = y;
     for (const header of headers) drawRowContent(header, measureRow(header));
     // Continue overflowing values from where they were clipped; repeat values that fully fit.
@@ -509,6 +742,84 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // must split there; attempting another break would create an endless blank-page loop. Repeating headers
     // use their existing pagination path and must not recursively request a continuation page themselves.
     const atFreshContentStart = y <= addPage.bodyTop + repeatedHeaderHeight + 0.5;
+    const hasNestedTablix = row.cells.some((cell) => (cell.nestedTablixes || []).length > 0);
+    // A nested data region is a complete child grid. Move the containing row intact when it fits on a fresh
+    // page; splitting it as if it were plain textbox characters would lose child rows and shared borders.
+    // If the complete child grid is itself taller than a page, fail closed until recursive child pagination
+    // can preserve both grids rather than emitting a misleading partial table.
+    if (hasNestedTablix && y + measured > pageBottom) {
+      if (!atFreshContentStart) {
+        startContinuationPage();
+        measured = measureRow(row, remainingTexts);
+      }
+      if (y + measured > pageBottom) {
+        const nestedOwners = row.cells.flatMap((cell, cellIndex) => (cell.nestedTablixes || [])
+          .map((nested) => ({ cell, cellIndex, nested })));
+        const oversized = nestedOwners.filter(({ nested, cellIndex }) => (
+          (nested.item.top || 0) + nestedLayout(
+            nested,
+            layoutsForRow(row)[cellIndex]?.width || totalWidth,
+          ).height > freshPageCapacity
+        ));
+        // A bundled subreport is an independent child data region and may legitimately exceed one parent
+        // page. Split its physical child rows across parent page fragments. Multiple independently tall
+        // children in one parent row require synchronized grids and remain fail-closed.
+        if (oversized.length !== 1 || !oversized[0].nested.subreport) {
+          throw new ServiceError('UNSUPPORTED_FEATURE', `Nested tablix in ${item.name || 'unnamed'} exceeds one printable page`);
+        }
+        const owner = oversized[0];
+        const ownerLayout = layoutsForRow(row)[owner.cellIndex];
+        const nested = owner.nested;
+        const originalRows = nested.rows;
+        const leadingHeaders = [];
+        for (const nestedRow of originalRows) {
+          if (!nestedRow.isHeader) break;
+          leadingHeaders.push(nestedRow);
+        }
+        const dataRows = originalRows.slice(leadingHeaders.length);
+        const fullLayout = nestedLayout(nested, ownerLayout.width);
+        const heightByRow = new Map(originalRows.map((nestedRow, index) => [nestedRow, fullLayout.heights[index]]));
+        const headerHeight = leadingHeaders.reduce((sum, nestedRow) => sum + (heightByRow.get(nestedRow) || 0), 0);
+        let offset = 0;
+        let firstChildFragment = true;
+        try {
+          while (offset < dataRows.length || (dataRows.length === 0 && firstChildFragment)) {
+            const available = pageBottom - y;
+            const childBudget = Math.max(1, available - (nested.item.top || 0) - headerHeight);
+            let end = offset;
+            let used = 0;
+            while (end < dataRows.length) {
+              const next = heightByRow.get(dataRows[end]) || dataRows[end].height || 0;
+              if (end > offset && used + next > childBudget) break;
+              used += next;
+              end += 1;
+              if (used >= childBudget) break;
+            }
+            if (end === offset && offset < dataRows.length) end += 1;
+            nested.rows = [...leadingHeaders, ...dataRows.slice(offset, end)];
+            const fragmentTexts = firstChildFragment ? remainingTexts : remainingTexts.map(() => '');
+            const fragmentHeight = measureRow(row, fragmentTexts);
+            if (fragmentHeight > available + 0.5) {
+              throw new ServiceError(
+                'UNSUPPORTED_FEATURE',
+                `One nested subreport row in ${item.name || 'unnamed'} exceeds one printable page`,
+              );
+            }
+            const complete = end >= dataRows.length;
+            drawRowContent(row, fragmentHeight, fragmentTexts, complete);
+            offset = end;
+            firstChildFragment = false;
+            if (!complete) startContinuationPage(row);
+            if (dataRows.length === 0) break;
+          }
+        } finally {
+          nested.rows = originalRows;
+        }
+        return;
+      }
+      drawRowContent(row, measured, remainingTexts);
+      return;
+    }
     if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart) {
       startContinuationPage();
       measured = measureRow(row, remainingTexts);
@@ -540,7 +851,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const segmentHeight = hasContinuation ? availableHeight : Math.min(availableHeight, measureRow(row, heads));
       drawRowContent(row, segmentHeight, heads, !hasContinuation);
       remainingTexts = parts.map((part) => part.tail);
-      if (hasContinuation) startContinuationPage();
+      if (hasContinuation) {
+        startContinuationPage(row);
+      }
     }
   };
 
@@ -569,6 +882,100 @@ export async function renderPdf(model, request, config) {
   addPage();
 
   const datasets = normalizeDatasets(model, request);
+  const renderBodyItem = (item, x, y, context) => {
+    if (isHidden(item.hidden, context)) return { endY: y };
+    if (item.type === 'Tablix') {
+      return renderTablix({
+        doc,
+        config,
+        model,
+        item,
+        request,
+        startX: x,
+        startY: y,
+        pageBottom,
+        addPage,
+        globals,
+      });
+    }
+    if (item.type === 'Textbox' && item.canGrow) {
+      let remaining = textForItem(item, context);
+      let currentY = y;
+      let firstSegment = true;
+      const verticalPadding = styleSize(item.style?.paddingTop, context, 2)
+        + styleSize(item.style?.paddingBottom, context, 2);
+      const freshCapacity = Math.max(1, pageBottom - bodyTop);
+      while (true) {
+        const measured = measureTextboxHeight(doc, config, item, context, remaining, item.width)
+          + verticalPadding;
+        const desiredHeight = Math.max(firstSegment ? item.height : 0, measured);
+        const available = pageBottom - currentY;
+        if (desiredHeight <= available + 0.5) {
+          drawTextbox(doc, config, item, x, currentY, context, {
+            width: item.width,
+            height: desiredHeight,
+            text: remaining,
+          });
+          return { height: currentY + desiredHeight - y, endY: currentY + desiredHeight };
+        }
+        // Keep the complete textbox together when it fits on a fresh page. This mirrors the existing
+        // tablix-row policy and avoids creating a short first-page fragment solely because earlier
+        // coordinate-flow content consumed the remainder.
+        if (desiredHeight <= freshCapacity && currentY > bodyTop + 0.5) {
+          addPage();
+          currentY = bodyTop;
+          firstSegment = false;
+          continue;
+        }
+        if (available <= Math.max(10, styleSize(item.style?.fontSize, context, 10) || 10)) {
+          addPage();
+          currentY = bodyTop;
+          firstSegment = false;
+          continue;
+        }
+        const split = splitTextForHeight(
+          doc,
+          config,
+          item,
+          context,
+          remaining,
+          item.width,
+          available,
+        );
+        if (!split.head && split.tail) {
+          addPage();
+          currentY = bodyTop;
+          firstSegment = false;
+          continue;
+        }
+        drawTextbox(doc, config, item, x, currentY, context, {
+          width: item.width,
+          height: available,
+          text: split.head,
+        });
+        if (!split.tail) return { height: currentY + available - y, endY: currentY + available };
+        remaining = split.tail;
+        addPage();
+        currentY = bodyTop;
+        firstSegment = false;
+      }
+    }
+    if (item.type === 'Rectangle') {
+      const backgroundColor = styleColor(item.style.backgroundColor, context, null);
+      if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
+      drawBorder(doc, x, y, item.width, item.height, item.style, context);
+      let endY = y + item.height;
+      for (const child of [...item.items].sort((left, right) => (
+        left.zIndex - right.zIndex || left.top - right.top || left.left - right.left
+      ))) {
+        const rendered = renderBodyItem(child, x + child.left, y + child.top, context);
+        endY = Math.max(endY, rendered.endY || y);
+      }
+      return { height: Math.max(item.height, endY - y), endY };
+    }
+    drawSimpleItem(doc, config, model, item, x, y, context);
+    return { height: item.height, endY: y + item.height };
+  };
   const items = [...model.body.items].sort((left, right) => left.top - right.top || left.left - right.left || left.zIndex - right.zIndex);
   let cursorY = bodyTop;
   let previousDesignBottom = 0;
@@ -593,13 +1000,8 @@ export async function renderPdf(model, request, config) {
       pageHasContent = false;
     }
     const x = page.marginLeft + item.left;
-    if (item.type === 'Tablix') {
-      const rendered = renderTablix({ doc, config, model, item, request, startX: x, startY: y, pageBottom, addPage, globals });
-      cursorY = rendered.endY;
-    } else {
-      drawSimpleItem(doc, config, model, item, x, y, context);
-      cursorY = y + item.height;
-    }
+    const rendered = renderBodyItem(item, x, y, context);
+    cursorY = rendered.endY;
     pageHasContent = true;
     previousDesignBottom = Math.max(previousDesignBottom, item.top + item.height);
     if (/^(End|StartAndEnd)$/i.test(breakLocation)) {
