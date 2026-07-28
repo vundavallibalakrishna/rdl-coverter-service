@@ -33,6 +33,24 @@ function multipartBody(rdl, options) {
   return { boundary, payload: Buffer.concat(chunks) };
 }
 
+test('serves the open end-to-end render page with isolated same-origin browser behavior', async (context) => {
+  const { app } = await application(context);
+  for (const url of ['/', '/test-ui']) {
+    const response = await app.inject({ method: 'GET', url });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.headers['content-type'], /^text\/html/);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    assert.match(response.headers['content-security-policy'], /connect-src 'self'/);
+    assert.match(response.headers['content-security-policy'], /frame-ancestors 'none'/);
+    assert.match(response.body, /id="rdl-file"/);
+    assert.match(response.body, /id="json-file"/);
+    assert.match(response.body, /DOCX_EDITABLE/);
+    assert.match(response.body, /DOCX_VISUAL/);
+    assert.equal(response.body.includes("fetch('/v1/render'"), true);
+    assert.equal(response.body.includes('authorization'), false);
+  }
+});
+
 test('health, readiness, and analysis do not expose RDL queries', async (context) => {
   const { app } = await application(context);
   assert.equal((await app.inject({ method: 'GET', url: '/healthz' })).statusCode, 200);

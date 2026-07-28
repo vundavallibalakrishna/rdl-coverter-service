@@ -71,8 +71,21 @@ npx rdl-converter-service            # if installed as a dependency
 | --- | --- | --- |
 | `GET` | `/healthz` | Process liveness. |
 | `GET` | `/readyz` | Writable temp storage, required font variants, PDFKit, and Poppler readiness. `503` when not ready. |
+| `GET` | `/` or `/test-ui` | Open end-to-end page for uploading one RDL plus its request JSON and downloading a selected output. |
 | `POST` | `/v1/analyze` | Namespace, page settings, parameters, exact dataset fields, fonts, detected constructs, structured-DOCX drift risks and fail-closed errors. **Does not render.** |
 | `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, or `XLSX` artifact. |
+
+### Open test page
+
+Start the service and open `http://localhost:7070/` in a browser. Select an `.rdl` file and a JSON request
+containing its `parameters`, `datasets`, and optional bundled `subreports`, then choose the required output.
+The page posts the files to the same `/v1/render` endpoint used by API clients and downloads the completed
+artifact. Any `output` or `rdlBase64` property already present in the JSON is replaced by the page selection
+and uploaded RDL respectively.
+
+The page intentionally has no application authentication or role checks. It does not add CORS and remains
+subject to this service's private-network-only deployment boundary. Do not expose the service directly to
+the public internet.
 
 ### Analyze before you render
 

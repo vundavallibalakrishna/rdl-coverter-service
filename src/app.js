@@ -9,6 +9,7 @@ import { readiness } from './readiness.js';
 import { RenderRunner } from './worker/runner.js';
 import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
 import { fontAvailability } from './render/fonts.js';
+import { testUiPage } from './testUi.js';
 
 function safeHeaderValue(value) {
   return String(value ?? '').replace(/[\r\n\t]/g, ' ').replace(/[^\x20-\x7E]/g, '?').trim().slice(0, 200);
@@ -27,6 +28,19 @@ export async function buildApp(options = {}) {
   await app.register(multipart, {
     limits: { fileSize: config.maxRdlBytes, files: 1, fields: 8, fieldSize: Math.max(1, config.maxRequestBytes - config.maxRdlBytes), parts: 10 },
   });
+
+  const sendTestUi = async (_request, reply) => {
+    const page = testUiPage();
+    return reply
+      .header('Cache-Control', 'no-store')
+      .header('Content-Security-Policy', page.contentSecurityPolicy)
+      .header('Referrer-Policy', 'no-referrer')
+      .header('X-Content-Type-Options', 'nosniff')
+      .type('text/html; charset=utf-8')
+      .send(page.html);
+  };
+  app.get('/', sendTestUi);
+  app.get('/test-ui', sendTestUi);
 
   app.get('/healthz', async () => ({ status: 'ok', uptimeSeconds: Math.floor(process.uptime()) }));
   app.get('/readyz', async (_request, reply) => {
