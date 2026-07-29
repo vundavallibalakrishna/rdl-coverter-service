@@ -214,8 +214,10 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 
 `DOCX_EDITABLE` is editable but Word owns final layout, so its pagination will not match the PDF exactly.
 `POST /v1/analyze` returns `structuredEditable` with native-DOCX drift risks and the
-`structuredEditable.nativePageFragments.recommendation` value for the RDL shape. The optional
-`docx.nativePageFragments` render flag keeps real Word tables but must be certified per report/data set.
+`structuredEditable.nativePageFragments.recommendation` value for the RDL shape. Native page fragmentation
+is enabled by default: it keeps real Word tables, repeats declared headers, and closes each measured table
+fragment. Set `docx.nativePageFragments=false` to restore one continuous Word-owned table. Either mode must
+be certified per report/data family when pagination fidelity matters.
 
 Set `pagination.continuationMarkers` to `true` to label renderer-confirmed logical-row continuations in
 PDF and editable DOCX. Both formats place “Continued from previous page” above the next table fragment;

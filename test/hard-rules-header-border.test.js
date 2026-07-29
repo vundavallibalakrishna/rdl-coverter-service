@@ -74,6 +74,39 @@ test('Word fragment headroom scales with material font-metric variance, not isol
   assert.ok(wordFragmentSafety({ fontMixRatio: 0, italicRatio: 0, maxRowSpan: 64, mergeCellRatio: 0.2, advancedGroupRatio: 0.5 }) < 0.8);
 });
 
+test('the first native fragment subtracts its RDL page-relative Top before choosing rows', async () => {
+  const atPageTop = parseRdl(flatTablixRdl);
+  const belowPriorContent = parseRdl(flatTablixRdl.replace('<Top>0in</Top>', '<Top>2in</Top>'));
+  const explicitPageStart = parseRdl(flatTablixRdl.replace(
+    '<Top>0in</Top>',
+    '<PageBreak><BreakLocation>Start</BreakLocation></PageBreak><Top>2in</Top>',
+  ));
+  for (const model of [atPageTop, belowPriorContent, explicitPageStart]) {
+    const tablix = model.body.items.find((item) => item.type === 'Tablix');
+    tablix.style.borders.left = { style: 'Solid', color: '#000000', width: 1 };
+  }
+  const renderRequest = {
+    ...request(40),
+    docx: { nativePageFragments: true },
+  };
+  const firstTableRows = async (model) => {
+    const xml = await documentXml((await renderEditableDocx(model, renderRequest, config)).buffer);
+    const table = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] || '';
+    const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
+    assert.match(physicalRows.at(-1) || '', /<w:top w:val="single"/,
+      'the reserved closure strip must remain the last physical row');
+    return physicalRows.filter((row) => /Row \d+/.test(row)).length;
+  };
+
+  const topCount = await firstTableRows(atPageTop);
+  const offsetCount = await firstTableRows(belowPriorContent);
+  const explicitStartCount = await firstTableRows(explicitPageStart);
+  assert.ok(offsetCount < topCount,
+    `a table starting 2in down the page must receive fewer first-fragment rows (${offsetCount} < ${topCount})`);
+  assert.equal(explicitStartCount, topCount,
+    'an absolute Top at an explicit page-break start is the page origin, not consumed page space');
+});
+
 test('the last row of a bordered data tablix closes when its bottom edge is None', async () => {
   const m = parseRdl(flatTablixRdl);
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
@@ -82,7 +115,10 @@ test('the last row of a bordered data tablix closes when its bottom edge is None
   strip(tablix.style);
   for (const row of tablix.rows) for (const cell of row.cells) for (const item of cell.items) strip(item.style);
   tablix.style.borders.left = { style: 'Solid', color: '#123456', width: 2 };
-  const xml = await documentXml((await renderEditableDocx(m, request(3), config)).buffer);
+  const xml = await documentXml((await renderEditableDocx(m, {
+    ...request(3),
+    docx: { nativePageFragments: false },
+  }, config)).buffer);
   assert.match(xml, /<w:tblBorders>[\s\S]*?<w:bottom w:val="single" w:color="123456" w:sz="16"/);
   assert.match(xml, /<w:tcBorders>[\s\S]*?<w:bottom w:val="single"/);
 });
@@ -145,7 +181,9 @@ test('a vertical-merge owner reaching the last row carries the enforced bottom b
   for (const item of rowHeaderCell.items) strip(item.style);
 
   const xml = await documentXml((await renderEditableDocx(m, {
-    parameters: {}, datasets: { D: [{ V: 'SAME_GROUP' }, { V: 'SAME_GROUP' }] },
+    parameters: {},
+    datasets: { D: [{ V: 'SAME_GROUP' }, { V: 'SAME_GROUP' }] },
+    docx: { nativePageFragments: false },
   }, config)).buffer);
   const marker = xml.indexOf('SAME_GROUP');
   const ownerCell = xml.slice(xml.lastIndexOf('<w:tc>', marker), xml.indexOf('</w:tc>', marker));

@@ -1027,15 +1027,51 @@ export async function renderPdf(model, request, config) {
     return { height: item.height, endY: y + item.height };
   };
   const items = [...model.body.items].sort((left, right) => left.top - right.top || left.left - right.left || left.zIndex - right.zIndex);
+  // RDL body items are coordinate-positioned. Items with the same Top are peers in one horizontal
+  // design band, not consecutive flow blocks. Keep pagination-capable items on the established flow
+  // path: rendering two independently paginating objects beside each other needs synchronized page
+  // fragments, while fixed items can safely share their declared page-relative Y coordinate.
+  const isFixedCoordinateItem = (item) => {
+    if (item.type === 'Tablix' || (item.type === 'Textbox' && item.canGrow)) return false;
+    if (item.type === 'Rectangle') return (item.items || []).every(isFixedCoordinateItem);
+    return true;
+  };
+  const sameDesignTop = (left, right) => Math.abs((left.top || 0) - (right.top || 0)) <= 0.25;
+  const activeBreakLocation = (item, context) => {
+    const disabled = item.pageBreak ? isHidden(item.pageBreak.disabled, context) : true;
+    return disabled ? 'None' : String(item.pageBreak?.location || 'None');
+  };
   let cursorY = bodyTop;
   let previousDesignBottom = 0;
   let pageHasContent = false;
   let forcePageBreak = false;
-  for (const item of items) {
+  for (let itemIndex = 0; itemIndex < items.length;) {
+    const item = items[itemIndex];
     const context = { parameters: request.parameters || {}, globals, datasets, dataset: [], fields: {} };
-    if (isHidden(item.hidden, context)) continue;
-    const breakDisabled = item.pageBreak ? isHidden(item.pageBreak.disabled, context) : true;
-    const breakLocation = breakDisabled ? 'None' : String(item.pageBreak?.location || 'None');
+    if (isHidden(item.hidden, context)) {
+      itemIndex += 1;
+      continue;
+    }
+    const breakLocation = activeBreakLocation(item, context);
+    let band = [item];
+    if (isFixedCoordinateItem(item) && /^None$/i.test(breakLocation)) {
+      let nextIndex = itemIndex + 1;
+      while (nextIndex < items.length && sameDesignTop(item, items[nextIndex])) nextIndex += 1;
+      const peers = items
+        .slice(itemIndex + 1, nextIndex)
+        .filter((candidate) => !isHidden(candidate.hidden, context));
+      if (peers.every((candidate) => (
+        isFixedCoordinateItem(candidate)
+        && /^None$/i.test(activeBreakLocation(candidate, context))
+      ))) {
+        band = [item, ...peers];
+        itemIndex = nextIndex;
+      } else {
+        itemIndex += 1;
+      }
+    } else {
+      itemIndex += 1;
+    }
     if (forcePageBreak || (/^(Start|StartAndEnd)$/i.test(breakLocation) && pageHasContent)) {
       addPage();
       cursorY = bodyTop;
@@ -1044,16 +1080,31 @@ export async function renderPdf(model, request, config) {
     }
     const gap = pageHasContent ? Math.max(0, item.top - previousDesignBottom) : 0;
     let y = cursorY + gap;
-    if (y >= pageBottom || (item.type !== 'Tablix' && y + item.height > pageBottom && pageHasContent)) {
+    const bandBottomOffset = Math.max(...band.map((candidate) => (
+      candidate.top - item.top + candidate.height
+    )));
+    if (y >= pageBottom || (
+      band.every((candidate) => candidate.type !== 'Tablix')
+      && y + bandBottomOffset > pageBottom
+      && pageHasContent
+    )) {
       addPage();
       y = bodyTop;
       pageHasContent = false;
     }
-    const x = page.marginLeft + item.left;
-    const rendered = renderBodyItem(item, x, y, context);
-    cursorY = rendered.endY;
+    let bandEndY = y;
+    for (const candidate of band) {
+      const candidateY = y + candidate.top - item.top;
+      const x = page.marginLeft + candidate.left;
+      const rendered = renderBodyItem(candidate, x, candidateY, context);
+      bandEndY = Math.max(bandEndY, rendered.endY);
+      previousDesignBottom = Math.max(
+        previousDesignBottom,
+        candidate.top + candidate.height,
+      );
+    }
+    cursorY = bandEndY;
     pageHasContent = true;
-    previousDesignBottom = Math.max(previousDesignBottom, item.top + item.height);
     if (/^(End|StartAndEnd)$/i.test(breakLocation)) {
       forcePageBreak = true;
     }

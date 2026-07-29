@@ -789,6 +789,8 @@ function expandOversizedWordFragments(fragments, rowMetrics, rows, geometry, req
   return expanded;
 }
 
+const WORD_FRAGMENT_CLOSURE_HEIGHT = 1;
+
 function appendWordClosureRows(fragments, columnCount) {
   return fragments.map((fragment) => {
     const closure = {
@@ -797,7 +799,7 @@ function appendWordClosureRows(fragments, columnCount) {
       isStatic: true,
       // One point is the smallest height consistently painted by both Word and LibreOffice. Sub-twip
       // closure rows remain present in OOXML but LibreOffice can collapse their border completely.
-      height: 1,
+      height: WORD_FRAGMENT_CLOSURE_HEIGHT,
       fields: {},
       cells: [{ colSpan: columnCount, rowSpan: 1, items: [], values: [], hidden: false }],
     };
@@ -808,7 +810,15 @@ function appendWordClosureRows(fragments, columnCount) {
   });
 }
 
-function fragmentRowsForWord(model, rows, rowMetrics, columnCount, measurementRisk = {}) {
+function fragmentRowsForWord(
+  model,
+  rows,
+  rowMetrics,
+  columnCount,
+  measurementRisk = {},
+  firstFragmentTop = 0,
+  closureHeight = 0,
+) {
   const headerRows = rows.filter((row) => row.isHeader);
   const bodyRows = rows.filter((row) => !row.isHeader);
   if (bodyRows.length === 0) return [rows];
@@ -828,13 +838,19 @@ function fragmentRowsForWord(model, rows, rowMetrics, columnCount, measurementRi
   // for typographically uniform tables, then derive up to another 8% from the ACTUAL materialized cell
   // styles. This is content-agnostic: it responds to metric variance, not report names, row counts, or text.
   const safety = wordFragmentSafety(measurementRisk);
-  const capacity = Math.max(1, pageBodyHeight * safety - headerHeight);
+  const freshPageCapacity = Math.max(1, pageBodyHeight * safety - headerHeight - closureHeight);
+  // The first fragment may follow other report items on the same RDL page. Budgeting it as a fresh page
+  // lets Word push only the closing rule onto an implicit continuation page, leaving the visible fragment
+  // open. Subsequent fragments start after explicit pageBreakBefore paragraphs and regain full capacity.
+  // This offset is derived from the normalized RDL Top relative to the current explicit page-break origin.
+  const firstPageCapacity = Math.max(1, freshPageCapacity - Math.max(0, firstFragmentTop));
 
   const fragmentRanges = [];
   let currentStart = -1;
   let currentEnd = -1;
   let currentHeight = 0;
   for (let index = 0; index < bodyRows.length;) {
+    let capacity = fragmentRanges.length === 0 ? firstPageCapacity : freshPageCapacity;
     const row = bodyRows[index];
     let blockEnd = index;
     for (let cursor = index; cursor <= blockEnd && cursor < bodyRows.length; cursor += 1) {
@@ -865,6 +881,7 @@ function fragmentRowsForWord(model, rows, rowMetrics, columnCount, measurementRi
       currentStart = -1;
       currentEnd = -1;
       currentHeight = 0;
+      capacity = freshPageCapacity;
     }
     if (currentStart < 0) currentStart = index;
     currentEnd = blockEnd;
@@ -922,7 +939,7 @@ function fragmentRowsForWord(model, rows, rowMetrics, columnCount, measurementRi
   return fragments.length > 0 ? fragments : [rows];
 }
 
-function tableForTablix(model, item, request, config, measurementDoc, structuredOptions) {
+function tableForTablix(model, item, request, config, measurementDoc, structuredOptions, firstFragmentTop = 0) {
   const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
   const datasets = normalizeDatasets(model, request);
   const { rows, columns } = tablixRows(item, request, globals, model);
@@ -969,13 +986,25 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
   const hasRepeatingHeader = rows.some((row) => row.isHeader);
   const useNativePageFragments = structuredOptions?.nativePageFragments === true
     || (hasRepeatingHeader && hasMergedCells);
-  let fragments = useNativePageFragments ? fragmentRowsForWord(model, rows, rowMetrics, geometry.gridTwips.length, measurementRisk) : [rows];
+  let fragments = useNativePageFragments
+    ? fragmentRowsForWord(
+      model,
+      rows,
+      rowMetrics,
+      geometry.gridTwips.length,
+      measurementRisk,
+      firstFragmentTop,
+      enforceBottomClosure ? WORD_FRAGMENT_CLOSURE_HEIGHT : 0,
+    )
+    : [rows];
   const metricByRow = new Map(rows.map((row, index) => [row, rowMetrics[index]]));
   const keepWithNextByRow = new Map(rows.map((row, index) => [row, keepWithNext[index]]));
   const tableContext = { fields: {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
   if (useNativePageFragments) {
     const pageBodyHeight = freshPageCapacity + repeatedHeaderHeight;
-    const safeCapacity = Math.max(1, pageBodyHeight * wordFragmentSafety(measurementRisk) - repeatedHeaderHeight);
+    const safeCapacity = Math.max(1,
+      pageBodyHeight * wordFragmentSafety(measurementRisk) - repeatedHeaderHeight
+        - (enforceBottomClosure ? WORD_FRAGMENT_CLOSURE_HEIGHT : 0));
     fragments = expandOversizedWordFragments(fragments, rowMetrics, rows, geometry, request, globals, datasets,
       item.datasetName, config, measurementDoc, safeCapacity);
     // A fragment can end after some nested vertical spans have already terminated, leaving no physical cell
@@ -1279,17 +1308,30 @@ export async function renderEditableDocx(model, request, config, tempDir) {
   const measurementDoc = new PDFDocument({ autoFirstPage: false });
   measurementDoc.on('data', () => {});
   measurementDoc.addPage({ size: [model.page.width, model.page.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+  let explicitPageTop = 0;
   for (const item of [...model.body.items].sort((a, b) => a.top - b.top || a.left - b.left || a.zIndex - b.zIndex)) {
     if (isHidden(item.hidden, context)) continue;
     const pageBreak = item.pageBreak && !isHidden(item.pageBreak.disabled, context) ? String(item.pageBreak.location) : 'None';
+    const startsExplicitPage = forcePageBreak || /^(Start|StartAndEnd)$/i.test(pageBreak);
     // Start the next content on a fresh page with a minimal-height pageBreakBefore paragraph rather
     // than a standalone page-break run. A break run placed after page-filling content is pushed onto
     // the next page and then advances again, leaving a blank page; pageBreakBefore does not.
-    if ((forcePageBreak || /^(Start|StartAndEnd)$/i.test(pageBreak)) && children.length > 0) {
+    if (startsExplicitPage && children.length > 0) {
       children.push(new Paragraph({ pageBreakBefore: true, spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } }));
     }
+    if (startsExplicitPage) explicitPageTop = item.top || 0;
     forcePageBreak = false;
-    if (item.type === 'Tablix') children.push(...tableForTablix(model, item, request, measurementConfig, measurementDoc, structuredOptions));
+    if (item.type === 'Tablix') {
+      children.push(...tableForTablix(
+        model,
+        item,
+        request,
+        measurementConfig,
+        measurementDoc,
+        structuredOptions,
+        Math.max(0, (item.top || 0) - explicitPageTop),
+      ));
+    }
     else if (item.type === 'Chart') {
       children.push(await chartParagraph(model, item, request, config, tempDir, context, chartIndex));
       chartIndex += 1;

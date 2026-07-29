@@ -510,24 +510,29 @@ test('structured DOCX profile auto-apply ignores uncertified candidates unless e
   const profilePath = path.join(tempDir, 'profiles.json');
   await fs.writeFile(profilePath, JSON.stringify({
     profiles: [{
-      id: 'basic-uncertified-native-fragments',
+      id: 'basic-uncertified-continuous-table',
       certified: false,
       match: { definitionSha256: model.identity.definitionSha256 },
-      docx: { nativePageFragments: true },
+      docx: { nativePageFragments: false },
     }],
   }));
   const profiledConfig = { ...config, docxProfilePath: profilePath, docxProfileAuto: true };
   const analysis = analyzeStructuredEditableCompatibility(model, profiledConfig);
   assert.equal(analysis.profiles.available, 1);
-  assert.equal(analysis.profiles.matches[0].id, 'basic-uncertified-native-fragments');
+  assert.equal(analysis.profiles.matches[0].id, 'basic-uncertified-continuous-table');
   assert.equal(analysis.profiles.selected, null);
 
   const autoOptions = resolveStructuredDocxOptions(model, { ...request, docx: {} }, profiledConfig);
-  const explicitOptions = resolveStructuredDocxOptions(model, { ...request, docx: { profile: 'basic-uncertified-native-fragments' } }, profiledConfig);
-  assert.equal(autoOptions.nativePageFragments, false);
+  const disabledOptions = resolveStructuredDocxOptions(model, {
+    ...request,
+    docx: { nativePageFragments: false },
+  }, profiledConfig);
+  const explicitOptions = resolveStructuredDocxOptions(model, { ...request, docx: { profile: 'basic-uncertified-continuous-table' } }, profiledConfig);
+  assert.equal(autoOptions.nativePageFragments, true);
   assert.equal(autoOptions.profile.selected, null);
-  assert.equal(explicitOptions.nativePageFragments, true);
-  assert.equal(explicitOptions.profile.selected.id, 'basic-uncertified-native-fragments');
+  assert.equal(disabledOptions.nativePageFragments, false);
+  assert.equal(explicitOptions.nativePageFragments, false);
+  assert.equal(explicitOptions.profile.selected.id, 'basic-uncertified-continuous-table');
 });
 
 test('renders visual DOCX with one page image per PDF page', async (context) => {

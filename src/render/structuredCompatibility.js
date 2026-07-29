@@ -148,12 +148,13 @@ export function resolveStructuredDocxOptions(model, request = {}, config = {}) {
   const profile = matchStructuredDocxProfile(model, request, config, { strictRequested: true });
   const explicit = request.docx?.nativePageFragments;
   const legacyExplicit = request.docxNativePageFragments;
+  const profileValue = profile.selectedProfile?.docx?.nativePageFragments;
   const nativePageFragments = explicit === true || explicit === false
     ? explicit
     : legacyExplicit === true || legacyExplicit === false
       ? legacyExplicit
-      : profile.selectedProfile?.docx?.nativePageFragments === true
-        ? true
+      : profileValue === true || profileValue === false
+        ? profileValue
         : config?.docxNativePageFragments === true;
   return {
     nativePageFragments,
@@ -345,7 +346,7 @@ export function analyzeStructuredEditableCompatibility(model, config = {}, reque
       enabledByDefault: config?.docxNativePageFragments === true,
       requestOptions: ['docx.nativePageFragments', 'docxNativePageFragments', 'docx.profile'],
       recommendation: fragmentRecommendation,
-      note: 'This keeps real Word tables. It is a per-report certification knob, not a universal PDF-matching guarantee.',
+      note: 'This keeps real Word tables and is enabled by default. Set docx.nativePageFragments=false to restore one continuous Word-owned table; neither mode universally guarantees PDF pagination parity.',
     },
     profiles: {
       available: profile.available,

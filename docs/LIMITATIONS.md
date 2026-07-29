@@ -177,10 +177,12 @@ Word performs final layout, so page breaks land differently. `KeepTogether` and 
 reflowing document — that is a Word limitation, not an implementation gap. When page-for-page fidelity
 matters more than editing, use `DOCX_VISUAL` (a non-editable full-page image per page).
 
-The experimental `docx.nativePageFragments` render option (legacy alias: `docxNativePageFragments`) keeps
-content as native Word tables while splitting large tablixes at PDF-like page break estimates. It can improve
-reports where Word otherwise compresses too many rows onto a page, but it can make row-span-heavy reports
-worse. Enable it only for a certified RDL/data set after page-by-page Word export comparison.
+Native page fragmentation is enabled by default for `DOCX_EDITABLE`. It keeps content as native Word tables
+while splitting large tablixes at PDF-like page-break estimates, repeating declared headers, and physically
+closing each table fragment. It can improve reports where Word otherwise compresses too many rows onto a
+page, but row-span-heavy reports can still drift. Set `docx.nativePageFragments=false` (legacy alias:
+`docxNativePageFragments=false`) to restore one continuous Word-owned table. Certify the selected mode for
+each RDL/data family with a page-by-page Word export comparison.
 
 `/v1/analyze` returns `structuredEditable` with the native-DOCX risk level, specific drift risks, and the
 fragmentation recommendation for the RDL shape. That analysis is static: it does not replace rendering the

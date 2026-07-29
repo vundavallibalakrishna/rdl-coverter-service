@@ -305,13 +305,14 @@ tablix content in native cells, preserves RDL group row spans as editable merged
 declared embedded RDL images as pictures. Set `"excel": { "layoutMode": "DATA" }` for the legacy data-first
 stacked workbook; `sheetPerTablix` remains available only in that mode.
 
-`DOCX_EDITABLE` can optionally split large tablixes into multiple native Word tables using PDF-like page
-break estimates (`"docx": { "nativePageFragments": true }` on a render request; the legacy
-top-level `docxNativePageFragments: true` is still accepted; or `RDL_DOCX_NATIVE_PAGE_FRAGMENTS=true`).
-This preserves real table editability, but it is not universally better: some RDLs move closer to the PDF,
-while row-span-heavy reports can drift further. Treat it as a per-report certification knob, not a default
-guarantee. `/v1/analyze` returns `structuredEditable.nativePageFragments.recommendation` to tell callers
-whether to avoid, try, or ignore this option for the RDL shape.
+`DOCX_EDITABLE` splits large tablixes into multiple native Word tables by default using PDF-like page-break
+estimates. Each fragment repeats declared header rows and carries a physical closing border while remaining
+editable. Set `"docx": { "nativePageFragments": false }` on a render request (the legacy top-level
+`docxNativePageFragments: false` is still accepted), or set `RDL_DOCX_NATIVE_PAGE_FRAGMENTS=false`, to
+restore one continuous Word-owned table. Fragmentation is not a page-parity guarantee: some RDLs move closer
+to the PDF while row-span-heavy reports can drift further. `/v1/analyze` returns
+`structuredEditable.nativePageFragments.recommendation` so callers can decide whether to retain the default
+or opt out for a certified report/data family.
 
 For certified reports, you can also mount a structured DOCX profile file and let the service apply the
 certified options only to matching RDL definitions:
@@ -359,7 +360,7 @@ The service fails generation if package protection or a text-edit lock is detect
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
 | `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF` and `DOCX_VISUAL`; see [Supplying subreports](./docs/SUBREPORTS.md). |
 | `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, places “Continued from previous page” above the next table fragment for renderer-confirmed logical-row continuations. |
-| `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Experimental native-table page fragmentation for certified report/data combinations. |
+| `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Defaults to `true`; set `false` to restore one continuous Word-owned table. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
 | `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
 | `outputFileName` | — | Sanitized for `Content-Disposition`; also `Globals!ReportName`. |
@@ -435,7 +436,7 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_WORKER_MEMORY_MAX_MB` | `2048` | Hard cap for deterministic PDF workload-based heap scaling. Never lower than the baseline. |
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
-| `RDL_DOCX_NATIVE_PAGE_FRAGMENTS` | `false` | Experimental: split large `DOCX_EDITABLE` tablixes into native table fragments at PDF-like break estimates. Certify per RDL before enabling. |
+| `RDL_DOCX_NATIVE_PAGE_FRAGMENTS` | `true` | Split large `DOCX_EDITABLE` tablixes into editable native table fragments at PDF-like break estimates. Set `false` for continuous Word-owned tables. |
 | `RDL_DOCX_PROFILE_PATH` | unset | Optional JSON file containing certified structured-DOCX profiles matched by RDL hash/name/namespace. |
 | `RDL_DOCX_PROFILE_AUTO` | `false` | Automatically apply the first matching structured-DOCX profile. Keep off unless every profile is release-certified. |
 | `RDL_PDFTOPPM_PATH` | `pdftoppm` | Poppler binary for `DOCX_VISUAL`. |

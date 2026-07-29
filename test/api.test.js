@@ -64,6 +64,7 @@ test('health, readiness, and analysis do not expose RDL queries', async (context
   assert.equal(analysis.json().structuredEditable.exactPageParity, false);
   assert.equal(Array.isArray(analysis.json().structuredEditable.risks), true);
   assert.equal(analysis.json().structuredEditable.nativePageFragments.supported, true);
+  assert.equal(analysis.json().structuredEditable.nativePageFragments.enabledByDefault, true);
 });
 
 test('DOCX profile analysis and render reject missing or mismatched profile ids cleanly', async (context) => {
@@ -196,7 +197,7 @@ test('renders all DOCX modes through the public API with explicit layout and edi
     assert.equal(response.rawPayload.subarray(0, 2).toString(), 'PK');
     assert.equal(response.headers['x-docx-layout-mode'], expected[output].layout);
     assert.equal(response.headers['x-docx-editable-text-ratio'], expected[output].ratio);
-    if (output === 'DOCX_EDITABLE') assert.equal(response.headers['x-docx-native-page-fragments'], 'false');
+    if (output === 'DOCX_EDITABLE') assert.equal(response.headers['x-docx-native-page-fragments'], 'true');
     if (expected[output].numericPages) assert.equal(Number(response.headers['x-page-count']) >= 1, true);
     else assert.equal(response.headers['x-page-count'], 'unknown');
   }

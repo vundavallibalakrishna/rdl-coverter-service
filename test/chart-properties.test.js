@@ -6,7 +6,7 @@ import { normalizeDatasets } from '../src/render/common.js';
 import { materializeChart } from '../src/render/chartData.js';
 import { renderPdf } from '../src/render/pdf.js';
 
-const chartXml = ({ name, type, subtype = '', property, value, top }) => `
+const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1 }) => `
 <Chart Name="${name}">
   <ChartCategoryHierarchy><ChartMembers><ChartMember><Group Name="${name}Category"><GroupExpressions>
     <GroupExpression>=Fields!Category.Value</GroupExpression>
@@ -25,7 +25,7 @@ const chartXml = ({ name, type, subtype = '', property, value, top }) => `
     <ChartValueAxes><ChartAxis Name="Primary"><Style><FontFamily>Arial</FontFamily><FontSize>8pt</FontSize></Style>
       <LabelsAutoFitDisabled>true</LabelsAutoFitDisabled></ChartAxis></ChartValueAxes>
   </ChartArea></ChartAreas>
-  <DataSetName>D</DataSetName><Top>${top}in</Top><Left>0.1in</Left><Width>4in</Width><Height>2in</Height><Style/>
+  <DataSetName>D</DataSetName><Top>${top}in</Top><Left>${left}in</Left><Width>4in</Width><Height>2in</Height><Style/>
 </Chart>`;
 
 const rdl = (firstProperty = 'PointWidth') => `<?xml version="1.0" encoding="utf-8"?>
@@ -39,6 +39,20 @@ const rdl = (firstProperty = 'PointWidth') => `<?xml version="1.0" encoding="utf
     <Field Name="Amount"><DataField>Amount</DataField></Field>
   </Fields></DataSet></DataSets>
   <Page><PageWidth>4.5in</PageWidth><PageHeight>5in</PageHeight><TopMargin>0.1in</TopMargin>
+    <BottomMargin>0.1in</BottomMargin><LeftMargin>0.1in</LeftMargin><RightMargin>0.1in</RightMargin></Page>
+</Report>`;
+
+const sideBySideRdl = `<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <Body><ReportItems>
+    ${chartXml({ name: 'LeftChart', type: 'Column', property: 'PointWidth', value: '0.5', top: 0.1, left: 0.1 })}
+    ${chartXml({ name: 'RightChart', type: 'Shape', subtype: 'Pie', property: 'PieLineColor', value: 'Black', top: 0.1, left: 4.2 })}
+  </ReportItems><Height>2.2in</Height></Body><Width>8.2in</Width>
+  <DataSets><DataSet Name="D"><Fields>
+    <Field Name="Category"><DataField>Category</DataField></Field>
+    <Field Name="Amount"><DataField>Amount</DataField></Field>
+  </Fields></DataSet></DataSets>
+  <Page><PageWidth>8.5in</PageWidth><PageHeight>3in</PageHeight><TopMargin>0.1in</TopMargin>
     <BottomMargin>0.1in</BottomMargin><LeftMargin>0.1in</LeftMargin><RightMargin>0.1in</RightMargin></Page>
 </Report>`;
 
@@ -66,6 +80,12 @@ test('an unknown chart custom property remains fail-closed', () => {
 test('documented PointWidth, disabled auto-fit, and PieLineColor render to a valid selectable PDF', async () => {
   const result = await renderPdf(parseRdl(rdl()), request, config);
   assert.equal(result.buffer.subarray(0, 4).toString(), '%PDF');
+  assert.equal(result.pageCount, 1);
+  assert.ok(result.buffer.length > 2_000);
+});
+
+test('fixed charts with the same RDL Top render side by side on one PDF page', async () => {
+  const result = await renderPdf(parseRdl(sideBySideRdl), request, config);
   assert.equal(result.pageCount, 1);
   assert.ok(result.buffer.length > 2_000);
 });
