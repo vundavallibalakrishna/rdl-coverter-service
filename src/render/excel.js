@@ -821,9 +821,65 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     });
   });
 
+  // Measure a nested tablix using the same content-aware rule as its parent. Excel never auto-fits merged
+  // cells, so relying on wrapText alone clips growing text inside nested data regions. Cache by materialized
+  // nested instance: the same RDL item may occur under several group scopes with different rows and values.
+  const nestedMeasurements = new WeakMap();
+  const measureNestedTablix = (nested) => {
+    const cached = nestedMeasurements.get(nested);
+    if (cached) return cached;
+    const nestedRows = nested.rows || [];
+    const nestedColumns = nested.columns || nested.item.columns || [];
+    const nestedLayoutItem = nested.item.hasColumnGroups
+      ? { ...nested.item, columns: nestedColumns, width: nestedColumns.reduce((sum, width) => sum + width, 0) }
+      : { ...nested.item, columns: nestedColumns };
+    const { columnsPt } = resolveGridColumns(nestedLayoutItem);
+    const nestedPlacements = computeCellPlacements(nestedRows, columnsPt.length);
+    const heights = nestedRows.map((row) => Math.max(2, row.height || DEFAULT_ROW_POINTS));
+    // Store before descending so malformed recursive containment cannot recurse forever.
+    const result = { heights, columnsPt };
+    nestedMeasurements.set(nested, result);
+
+    nestedRows.forEach((row, rowIndex) => {
+      const context = {
+        fields: row.fields || {},
+        parameters: request.parameters || {},
+        globals,
+        dataset: row.scopeDataset || datasets[nested.item.datasetName] || [],
+        datasets,
+      };
+      row.cells.forEach((cell, cellIndex) => {
+        if (cell.hidden) return;
+        const start = nestedPlacements[rowIndex][cellIndex];
+        if (start === undefined || start < 0) return;
+        const { textbox, style } = cellStyle(nested.item, cell, context);
+        const span = Math.max(1, cell.colSpan || 1);
+        const rowSpan = Math.max(1, cell.rowSpan || 1);
+        const width = columnsPt.slice(start, start + span).reduce((sum, value) => sum + value, 0);
+        let required = 0;
+        const display = cellText(cell);
+        if (textbox?.canGrow && display) {
+          required = measureTextboxHeight(measureDoc, config, textbox, context, display, width)
+            + styleSize(style?.paddingTop, context, 2) + styleSize(style?.paddingBottom, context, 2);
+        }
+        for (const child of cell.nestedTablixes || []) {
+          const childMeasurement = measureNestedTablix(child);
+          required = Math.max(required,
+            (child.item.top || 0) + childMeasurement.heights.reduce((sum, height) => sum + height, 0));
+        }
+        if (required <= 0) return;
+        const endRow = Math.min(nestedRows.length - 1, rowIndex + rowSpan - 1);
+        const available = heights.slice(rowIndex, endRow + 1).reduce((sum, height) => sum + height, 0);
+        if (required > available) heights[endRow] += required - available;
+      });
+    });
+    return result;
+  };
+
   // Excel does not auto-fit merged cells. Measure every logical owner once, then grow the final row of its
-  // vertical span only when the declared combined row heights cannot contain the text. This preserves the
-  // RDL row proportions while keeping merged group labels readable.
+  // vertical span only when CanGrow is enabled and the declared combined row heights cannot contain the
+  // text. Nested tablixes contribute their measured height too. This preserves RDL row proportions and
+  // CanGrow=false semantics while keeping merged and nested group content fully readable.
   const measuredHeights = rows.map((row, index) => Math.max(
     2,
     row.height || DEFAULT_ROW_POINTS,
@@ -831,16 +887,48 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   ));
   for (const owner of owners) {
     const display = cellText(owner.cell);
-    if (!owner.textbox || !display) continue;
     const span = Math.max(1, owner.cell.colSpan || 1);
     const rowSpan = Math.max(1, owner.cell.rowSpan || 1);
     const width = point(columnOffsets[owner.start + span] - columnOffsets[owner.start]);
-    const required = measureTextboxHeight(measureDoc, config, owner.textbox, owner.context, display, width)
-      + styleSize(owner.style?.paddingTop, owner.context, 2) + styleSize(owner.style?.paddingBottom, owner.context, 2);
+    let required = 0;
+    if (owner.textbox?.canGrow && display) {
+      required = measureTextboxHeight(measureDoc, config, owner.textbox, owner.context, display, width)
+        + styleSize(owner.style?.paddingTop, owner.context, 2) + styleSize(owner.style?.paddingBottom, owner.context, 2);
+    }
+    for (const nested of owner.cell.nestedTablixes || []) {
+      const nestedMeasurement = measureNestedTablix(nested);
+      required = Math.max(required,
+        (nested.item.top || 0) + nestedMeasurement.heights.reduce((sum, height) => sum + height, 0));
+    }
+    if (required <= 0) continue;
     const endRow = Math.min(rows.length - 1, owner.rowIndex + rowSpan - 1);
     const available = measuredHeights.slice(owner.rowIndex, endRow + 1).reduce((sum, height) => sum + height, 0);
     if (required > available) measuredHeights[endRow] += required - available;
   }
+
+  // Replace declared child-row boundaries with their measured CanGrow boundaries before mapping them to
+  // physical Excel rows. Otherwise a nested row may grow in measurement but still be rendered into its old
+  // one-line interval.
+  const addMeasuredNestedYBoundaries = (nested, baseTop, target) => {
+    const measurement = measureNestedTablix(nested);
+    let cursor = point(baseTop + (nested.item.top || 0));
+    target.add(cursor);
+    (nested.rows || []).forEach((row, index) => {
+      const rowTop = cursor;
+      cursor = point(cursor + measurement.heights[index]);
+      target.add(cursor);
+      for (const cell of row.cells || []) {
+        for (const child of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(child, rowTop, target);
+      }
+    });
+  };
+  rows.forEach((row, rowIndex) => {
+    const boundaries = new Set([0, point(row.height || DEFAULT_ROW_POINTS)]);
+    for (const cell of row.cells || []) {
+      for (const nested of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(nested, 0, boundaries);
+    }
+    rowProfiles[rowIndex] = [...boundaries].sort((left, right) => left - right);
+  });
 
   // A logical parent row may contain a child grid with several physical rows. Split only that parent row
   // at the child-grid boundaries; ordinary surrounding cells are vertically merged across the resulting
@@ -872,7 +960,8 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     nestedColumns.forEach((width) => nestedOffsets.push(point(nestedOffsets.at(-1) + width)));
     const nestedOwners = nestedRows.map(() => new Array(nestedColumns.length).fill(null));
     const rowOffsets = [point(baseTop + (nested.item.top || 0))];
-    nestedRows.forEach((row) => rowOffsets.push(point(rowOffsets.at(-1) + (row.height || DEFAULT_ROW_POINTS))));
+    const nestedHeights = measureNestedTablix(nested).heights;
+    nestedRows.forEach((row, index) => rowOffsets.push(point(rowOffsets.at(-1) + nestedHeights[index])));
     for (const [rowIndex, row] of nestedRows.entries()) {
       const context = {
         fields: row.fields || {},

@@ -92,6 +92,18 @@ test('deep group headers retain stable hierarchy columns after hidden rows are r
   assert.deepEqual(categoryOwners.map(({ column, cell }) => [column, cell.colSpan || 1]), [[0, 1], [0, 1]]);
 });
 
+test('an advanced tablix applies HideIfNoRows to a static member subtree', () => {
+  const visible = parseRdl(nestedGridRdl()).body.items[0];
+  assert.equal(materializeTablixRows(visible, [], {}, {}, { D: [] }).length, 1);
+
+  const hiddenRdl = nestedGridRdl().replace(
+    '<TablixMember><TablixHeader><Size>1in</Size>',
+    '<TablixMember><HideIfNoRows>true</HideIfNoRows><TablixHeader><Size>1in</Size>',
+  );
+  const hidden = parseRdl(hiddenRdl).body.items[0];
+  assert.equal(materializeTablixRows(hidden, [], {}, {}, { D: [] }).length, 0);
+});
+
 test('the same stable nested grid renders through PDF and editable DOCX', async () => {
   const model = parseRdl(nestedGridRdl());
   const request = { outputFileName: 'nested-grid', parameters: {}, datasets: { D: data } };

@@ -74,6 +74,74 @@ test('renders a valid workbook that reloads with the expected header and data te
   assert.ok(findCell(ws, 'South'));
 });
 
+test('REPORT mode honors CanGrow for wrapped cell text and preserves a fixed CanGrow=false row', async () => {
+  const growingModel = structuredClone(model);
+  const tablix = growingModel.body.items.find((item) => item.type === 'Tablix');
+  tablix.columns[0] = 45.5;
+  tablix.width = tablix.columns.reduce((sum, width) => sum + width, 0);
+  const detailRow = tablix.rows.at(-1);
+  const textbox = detailRow.cells[0].items.find((item) => item.type === 'Textbox');
+  textbox.canGrow = true;
+  textbox.style.fontFamily = 'Arial';
+  textbox.style.fontSize = 8;
+  textbox.style.paddingLeft = 2;
+  textbox.style.paddingRight = 2;
+  for (const run of textbox.paragraphs.flat()) {
+    run.style.fontFamily = 'Arial';
+    run.style.fontSize = 8;
+  }
+  const growingRequest = {
+    ...request,
+    datasets: { ...request.datasets, Sales: [{ Name: 'establishment', Amount: 1 }] },
+  };
+  const growingSheet = await load((await renderExcel(growingModel, growingRequest, config, null)).buffer);
+  const growingCell = findCell(growingSheet, 'establishment');
+  assert.ok(growingCell);
+  assert.equal(growingCell.alignment?.wrapText, true);
+  assert.ok(
+    growingSheet.getRow(growingCell.row).height > detailRow.height,
+    `expected CanGrow row to exceed its declared ${detailRow.height}pt height`,
+  );
+
+  const fixedModel = structuredClone(growingModel);
+  fixedModel.body.items.find((item) => item.type === 'Tablix')
+    .rows.at(-1).cells[0].items.find((item) => item.type === 'Textbox').canGrow = false;
+  const fixedSheet = await load((await renderExcel(fixedModel, growingRequest, config, null)).buffer);
+  const fixedCell = findCell(fixedSheet, 'establishment');
+  assert.ok(fixedCell);
+  assert.equal(fixedCell.alignment?.wrapText, true);
+  assert.equal(fixedSheet.getRow(fixedCell.row).height, detailRow.height);
+});
+
+test('REPORT mode splits a CanGrow cell beyond Excel row-height limits without losing editability', async () => {
+  const tallModel = structuredClone(model);
+  const tablix = tallModel.body.items.find((item) => item.type === 'Tablix');
+  tablix.columns[0] = 72;
+  tablix.width = tablix.columns.reduce((sum, width) => sum + width, 0);
+  const textbox = tablix.rows.at(-1).cells[0].items.find((item) => item.type === 'Textbox');
+  textbox.canGrow = true;
+  textbox.style.fontFamily = 'Arial';
+  textbox.style.fontSize = 8;
+  const tallText = Array.from({ length: 160 }, (_, index) => `Line ${String(index + 1).padStart(3, '0')}`).join('\n');
+  const tallSheet = await load((await renderExcel(tallModel, {
+    ...request,
+    datasets: { ...request.datasets, Sales: [{ Name: tallText, Amount: 1 }] },
+  }, config, null)).buffer);
+  const foundCell = findCell(tallSheet, tallText);
+  assert.ok(foundCell, 'expected the complete value to remain in one editable cell');
+  const tallCell = foundCell.master || foundCell;
+  const physicalRows = [];
+  tallSheet.eachRow({ includeEmpty: true }, (row) => {
+    assert.ok((row.height || 0) <= 409, `row ${row.number} exceeds Excel's 409-point limit`);
+    if (row.number >= tallCell.row && (row.height || 0) > 0) physicalRows.push(row);
+  });
+  assert.ok(physicalRows.reduce((sum, row) => sum + row.height, 0) > 409);
+  const spanningMerge = (tallSheet.model.merges || []).find((range) => range.startsWith(`${tallCell.address}:`));
+  assert.ok(spanningMerge, 'expected the tall editable cell to span multiple native Excel rows');
+  const endRow = Number.parseInt(/\d+$/.exec(spanningMerge)?.[0] || '0', 10);
+  assert.ok(endRow > tallCell.row);
+});
+
 test('a Format()-wrapped numeric field becomes a live number with a translated format code', async () => {
   // basic.rdl renders Amount as =Format(Fields!Amount.Value, "N2"). It must arrive as the number 1234.5,
   // not the string "1,234.50", so it stays summable — with an N2-equivalent Excel format for display.

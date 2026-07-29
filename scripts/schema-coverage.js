@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { rdl2016SchemaCatalogue } from '../src/rdl/capabilities.js';
 
 const serviceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const outputPath = path.join(serviceRoot, 'tmp', 'output', 'rdl-2016-capability-catalogue.json');
+const outputPath = path.join(serviceRoot, 'tmp', 'rdl-2016-capability-catalogue.json');
 const catalogue = rdl2016SchemaCatalogue();
 
 await fs.mkdir(path.dirname(outputPath), { recursive: true });

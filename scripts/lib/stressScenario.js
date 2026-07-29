@@ -5,6 +5,16 @@ function border() {
   return { style: 'Solid', color: '#666666', width: 0.5 };
 }
 
+function openBottomBorders(color = '#666666', width = 0.5) {
+  const visible = { style: 'Solid', color, width };
+  return {
+    top: visible,
+    right: { ...visible, style: 'Dashed' },
+    bottom: { style: 'None', color, width: 0 },
+    left: visible,
+  };
+}
+
 function style(overrides = {}) {
   return {
     color: '#000000',
@@ -60,7 +70,7 @@ function member(overrides = {}) {
   };
 }
 
-export const STRESS_ROW_COUNT = 520;
+export const STRESS_ROW_COUNT = 470;
 export const STRESS_OVERFLOW_LINES = 220;
 
 export function createStressScenario() {
@@ -75,8 +85,9 @@ export function createStressScenario() {
     ['UniqueMarker', 'System.String'],
   ].map(([name, typeName]) => ({ name, dataField: name, typeName }));
   const columns = [60, 72, 50, 120, 220, 65, 70, 123];
-  const headerStyle = { backgroundColor: '#1f4e78', color: '#ffffff', fontWeight: 'Bold', textAlign: 'Center', verticalAlign: 'Middle' };
-  const subheaderStyle = { backgroundColor: '#d9eaf7', fontWeight: 'Bold', textAlign: 'Center', verticalAlign: 'Middle' };
+  const headerStyle = { backgroundColor: '#1f4e78', color: '#ffffff', fontFamily: 'Segoe UI', fontWeight: 'Bold', textAlign: 'Center', verticalAlign: 'Middle' };
+  const subheaderStyle = { backgroundColor: '#d9eaf7', fontFamily: 'Times New Roman', fontWeight: 'Bold', fontStyle: 'Italic', textAlign: 'Center', verticalAlign: 'Middle' };
+  const deliberatelyOpenBottom = { borders: openBottomBorders() };
   const rows = [
     {
       height: 20,
@@ -109,17 +120,24 @@ export function createStressScenario() {
     {
       height: 18,
       cells: [
-        cell('GroupCell', '=Fields!GroupKey.Value', { fontWeight: 'Bold' }),
-        cell('SubgroupCell', '=Fields!SubgroupKey.Value'),
-        cell('SequenceCell', '=Fields!Sequence.Value', { textAlign: 'Right' }),
-        cell('DescriptionCell', '=Fields!Description.Value'),
-        cell('OverflowCell', '=Fields!OverflowText.Value'),
-        cell('AmountCell', '=Format(Fields!Amount.Value, "N2")', { textAlign: 'Right' }),
+        cell('GroupCell', '=Fields!GroupKey.Value', { ...deliberatelyOpenBottom, fontWeight: 'Bold' }),
+        cell('SubgroupCell', '=Fields!SubgroupKey.Value', { ...deliberatelyOpenBottom, fontFamily: 'Times New Roman', fontStyle: 'Italic' }),
+        cell('SequenceCell', '=Fields!Sequence.Value', { ...deliberatelyOpenBottom, fontFamily: 'Segoe UI', textAlign: 'Right', textDecoration: 'Underline' }),
+        cell('DescriptionCell', '=Fields!Description.Value', {
+          ...deliberatelyOpenBottom,
+          fontFamily: '=IIF(Fields!Status.Value = "Escalated", "Times New Roman", IIF(Fields!Status.Value = "Review", "Segoe UI", "Arial"))',
+          fontWeight: '=IIF(Fields!Status.Value = "Escalated", "Bold", "Normal")',
+        }),
+        cell('OverflowCell', '=Fields!OverflowText.Value', { ...deliberatelyOpenBottom }),
+        cell('AmountCell', '=Format(Fields!Amount.Value, "N2")', { ...deliberatelyOpenBottom, fontFamily: 'Times New Roman', textAlign: 'Right' }),
         cell('StatusCell', '=Fields!Status.Value', {
+          ...deliberatelyOpenBottom,
+          fontFamily: 'Segoe UI',
+          fontWeight: 'Bold',
           textAlign: 'Center',
           backgroundColor: '=IIF(Fields!Status.Value = "Escalated", "Red", IIF(Fields!Status.Value = "Review", "Yellow", IIF(Fields!Status.Value = "Closed", "Lime", "White")))',
         }),
-        cell('MarkerCell', '=Fields!UniqueMarker.Value'),
+        cell('MarkerCell', '=Fields!UniqueMarker.Value', { ...deliberatelyOpenBottom, color: '#17365d' }),
       ],
     },
   ];
@@ -161,6 +179,7 @@ export function createStressScenario() {
     sortExpressions: [],
   };
   const endMarker = textbox('StressDocumentEnd', 'STRESS_DOCUMENT_END', {
+    fontFamily: 'Segoe UI',
     fontSize: 16,
     fontWeight: 'Bold',
     color: '#1f4e78',
@@ -207,7 +226,7 @@ export function createStressScenario() {
     renderingDatasets: ['StressData'],
     parameterDatasets: [],
     embeddedImages: {},
-    fonts: ['Arial'],
+    fonts: ['Arial', 'Times New Roman', 'Segoe UI'],
     features: { textboxes: 22, tablixes: 1, rectangles: 0, lines: 0, images: 0, groups: 2, pageBreaks: 1 },
     unsupported: [],
   };
@@ -237,6 +256,8 @@ export function createStressScenario() {
     outputFileName: 'rdl-table-stress-certification',
     parameters: {},
     datasets: { StressData: rowsData },
+    pagination: { continuationMarkers: true },
+    docx: { nativePageFragments: true },
   };
   return { model, request };
 }

@@ -76,15 +76,6 @@ export function validateRenderInput(model, request, limits) {
   return { totalRows, parameters: resolvedParameters };
 }
 
-function expressionUsesFields(value) {
-  return typeof value === 'string' && /Fields!/i.test(value);
-}
-
-function itemUsesFields(item) {
-  if (expressionUsesFields(item.value) || expressionUsesFields(item.hidden) || expressionUsesFields(JSON.stringify(item.paragraphs || []))) return true;
-  return (item.items || []).some(itemUsesFields);
-}
-
 function normalizeFields(row, definitions = []) {
   const normalized = { ...row };
   for (const field of definitions) {
@@ -480,9 +471,12 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
   };
   collectBreakGroups(tablix.rowMembers);
   const lastBreakKey = new Map();
-  const firstDynamic = tablix.rows.findIndex((row, index) => (
-    row.cells.some((cell) => cell.items.some(itemUsesFields)) || memberPaths[index]?.some((member) => member.group)
-  ));
+  // Static versus dynamic is declared by the TablixMember hierarchy, not inferred from expressions in
+  // its cells. Static members may legitimately reference Fields (for example, to provide an IIF fallback
+  // when the dataset is empty). A Group element, including a detail group without expressions, makes the
+  // corresponding member path dynamic.
+  const memberPathIsDynamic = (path) => (path || []).some((member) => member.group);
+  const firstDynamic = tablix.rows.findIndex((row, index) => memberPathIsDynamic(memberPaths[index]));
   // Hard rule: a tablix's static column-header rows (everything above the first dynamic/detail row) repeat on
   // every page, regardless of whether the RDL sets RepeatColumnHeaders / a member's RepeatOnNewPage. SSRS
   // leaves this opt-in, but a multi-page table whose header does not repeat is unreadable, so the service
@@ -495,7 +489,10 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
     const path = memberPaths[index] || [];
     const descriptors = headerDescriptors(path);
     const spans = headerSpans(descriptors, tablix.rowHeaderColumns || []);
-    const dynamic = row.cells.some((cell) => cell.items.some(itemUsesFields)) || path.some((member) => member.group);
+    const dynamic = memberPathIsDynamic(path);
+    // Static members remain visible on an empty data region unless the RDL explicitly opts into
+    // HideIfNoRows. Their Fields references evaluate against the empty context as Nothing.
+    if (!dynamic && sourceRows.length === 0 && path.some((member) => member.hideIfNoRows)) continue;
     const contexts = dynamic ? sourceRows : [sourceRows[0] || {}];
     for (const [rowIndex, fields] of contexts.entries()) {
       const { scopes, dataset, nestedDataset } = dynamic
@@ -702,6 +699,9 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
   function walkMembers(members, incomingRows, scopes, ancestorPath, indentLevel) {
     for (const member of members || []) {
+      // Apply HideIfNoRows before descending so a static container and its descendants follow the same
+      // empty-region visibility rule as a static leaf.
+      if (incomingRows.length === 0 && !member.group && member.hideIfNoRows) continue;
       const path = [...ancestorPath, member];
       const group = member.group;
       if (group?.parent) { walkRecursive(member, path, incomingRows, scopes, indentLevel); continue; }

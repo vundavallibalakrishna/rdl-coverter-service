@@ -90,3 +90,41 @@ test('nested tablix renders as native grids in PDF, editable DOCX, and XLSX REPO
   }));
   for (const value of ['A', 'Alpha', 'B', 'Beta']) assert.ok(values.includes(value), `missing ${value} in XLSX`);
 });
+
+test('XLSX REPORT propagates a nested tablix CanGrow height into its editable parent grid', async () => {
+  const model = parseRdl(rdl);
+  const baseline = await renderExcel(model, {
+    ...request,
+    datasets: { D: [{ Key: 'A', Detail: 'Short' }] },
+  }, config, null);
+  const longText = Array.from(
+    { length: 28 },
+    (_, index) => `Nested line ${String(index + 1).padStart(2, '0')} must remain visible`,
+  ).join('\n');
+  const grown = await renderExcel(model, {
+    ...request,
+    datasets: { D: [{ Key: 'A', Detail: longText }] },
+  }, config, null);
+  const rowHeightTotal = async (buffer) => {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
+    let total = 0;
+    workbook.worksheets[0].eachRow({ includeEmpty: true }, (row) => { total += row.height || 0; });
+    return { workbook, total };
+  };
+  const baselineResult = await rowHeightTotal(baseline.buffer);
+  const grownResult = await rowHeightTotal(grown.buffer);
+  assert.ok(
+    grownResult.total > baselineResult.total + 100,
+    `expected nested CanGrow content to increase physical row height (${grownResult.total} > ${baselineResult.total})`,
+  );
+  let renderedText = null;
+  grownResult.workbook.worksheets[0].eachRow((row) => row.eachCell((cell) => {
+    const value = typeof cell.value === 'object' && cell.value?.richText
+      ? cell.value.richText.map((run) => run.text).join('')
+      : cell.value;
+    if (value === longText) renderedText = cell;
+  }));
+  assert.ok(renderedText, 'expected all nested text to remain in one editable Excel cell');
+  assert.equal(renderedText.alignment?.wrapText, true);
+});
