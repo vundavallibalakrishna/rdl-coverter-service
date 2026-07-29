@@ -144,6 +144,30 @@ function scopeRows(scopeArgument, context) {
   return context.dataset || [];
 }
 
+// RunningValue/RowNumber give Nothing a different meaning from an omitted aggregate scope: it is the
+// outermost containing scope and therefore does not reset at each nested group. Materialization exposes
+// that processed (filtered/sorted) data-region row sequence through the dataset/data-region scope map.
+// Falling back to context.dataset preserves direct evaluator use where there is no tablix context.
+function runningScopeRows(scopeArgument, context) {
+  const scope = scopeArgument ? evaluateArgument(scopeArgument, context) : null;
+  if (scope !== null && scope !== undefined && scope !== '') {
+    if (context.scopes && Object.prototype.hasOwnProperty.call(context.scopes, scope)) return context.scopes[scope];
+    if (context.datasets?.[scope]) return context.datasets[scope];
+    return context.dataset || [];
+  }
+  if (
+    context.tablixDatasetName
+    && context.scopes
+    && Object.prototype.hasOwnProperty.call(context.scopes, context.tablixDatasetName)
+  ) return context.scopes[context.tablixDatasetName];
+  if (
+    context.tablixName
+    && context.scopes
+    && Object.prototype.hasOwnProperty.call(context.scopes, context.tablixName)
+  ) return context.scopes[context.tablixName];
+  return context.outermostDataset || context.dataset || [];
+}
+
 function toDate(value) {
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
   if (value === null || value === undefined || value === '') return null;
@@ -257,7 +281,7 @@ function evaluateFunction(name, args, context) {
   }
   if (normalized === 'countrows') return scopeRows(args[0], context).length;
   if (normalized === 'rownumber') {
-    const rows = scopeRows(args[0], context);
+    const rows = runningScopeRows(args[0], context);
     const index = context.fields ? rows.indexOf(context.fields) : -1;
     return (index >= 0 ? index : rows.length - 1) + 1;
   }
@@ -299,7 +323,7 @@ function evaluateFunction(name, args, context) {
     if (!AGGREGATE_FUNCTIONS.has(aggregateName)) {
       throw new ServiceError('UNSUPPORTED_FEATURE', `Unsupported RunningValue aggregate: ${args[1]}`);
     }
-    const rows = scopeRows(args[2], context);
+    const rows = runningScopeRows(args[2], context);
     const currentIndex = context.fields ? rows.indexOf(context.fields) : -1;
     const upto = currentIndex >= 0 ? rows.slice(0, currentIndex + 1) : rows;
     return aggregate(aggregateName, upto.map((row) => evaluateArgument(args[0], { ...context, fields: row })));

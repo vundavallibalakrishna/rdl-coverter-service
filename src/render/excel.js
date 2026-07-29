@@ -777,7 +777,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   const { rows, columns } = tablixLayout(item, request, globals, model, tablixCache);
   const placements = computeCellPlacements(rows, columns.length);
   const datasets = normalizeDatasets(model, request);
-  const enforceBottomClosure = shouldEnforceTablixBottom(rows);
+  const enforceBottomClosure = shouldEnforceTablixBottom(rows, item);
   const gridOwners = rows.map(() => new Array(columns.length).fill(null));
   const owners = [];
   const columnOffsets = [0];
@@ -916,7 +916,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
         if (numFmt) target.numFmt = numFmt;
         applyFillFontAlignment(target, owner.style || {}, owner.context);
-        target.border = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows));
+        target.border = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item));
         const childCellLeft = left;
         for (const child of cell.nestedTablixes || []) renderNested(child, childCellLeft, parentRowIndex, top);
       }

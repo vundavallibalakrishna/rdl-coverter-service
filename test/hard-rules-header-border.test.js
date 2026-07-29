@@ -1,6 +1,7 @@
 // Two hard rules the service enforces regardless of what the RDL declares:
 //  1. A tablix's static column-header rows repeat on every page.
-//  2. The last row of a data tablix is closed with a bottom border; static layout tablixes honor Border=None.
+//  2. The last row of a bordered data tablix is closed; borderless static or dynamic layout tablixes honor
+//     Border=None.
 // For a tablix that uses vertically-merged (rowSpan) cells — where Word disables native repeat-header — the
 // header is repeated by physically redrawing it per page (page-fragment mode). These tests assert the model
 // flagging, the shared border helper, and the emitted OpenXML on synthetic RDLs isolating each construct.
@@ -73,16 +74,17 @@ test('Word fragment headroom scales with material font-metric variance, not isol
   assert.ok(wordFragmentSafety({ fontMixRatio: 0, italicRatio: 0, maxRowSpan: 64, mergeCellRatio: 0.2, advancedGroupRatio: 0.5 }) < 0.8);
 });
 
-test('the last row of a tablix carries a bottom border even when the RDL declares None everywhere', async () => {
+test('the last row of a bordered data tablix closes when its bottom edge is None', async () => {
   const m = parseRdl(flatTablixRdl);
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
   const NONE = { style: 'None', color: '#000000', width: 1 };
   const strip = (style) => { if (style) style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } }; };
   strip(tablix.style);
   for (const row of tablix.rows) for (const cell of row.cells) for (const item of cell.items) strip(item.style);
+  tablix.style.borders.left = { style: 'Solid', color: '#123456', width: 2 };
   const xml = await documentXml((await renderEditableDocx(m, request(3), config)).buffer);
-  // With every declared border None, the only visible bottom rule can be the enforced last-row one.
-  assert.match(xml, /<w:bottom w:val="single"/);
+  assert.match(xml, /<w:tblBorders>[\s\S]*?<w:bottom w:val="single" w:color="123456" w:sz="16"/);
+  assert.match(xml, /<w:tcBorders>[\s\S]*?<w:bottom w:val="single"/);
 });
 
 test('a static borderless layout tablix honors Border=None instead of receiving a synthetic line', async () => {
@@ -98,10 +100,28 @@ test('a static borderless layout tablix honors Border=None instead of receiving 
 
   const renderRequest = request(0);
   const { rows } = tablixRows(tablix, renderRequest, { PageNumber: 1, TotalPages: 1 }, m);
-  assert.equal(shouldEnforceTablixBottom(rows), false);
+  assert.equal(shouldEnforceTablixBottom(rows, tablix), false);
   const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
   const table = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] || '';
   assert.match(table, /COLHDR/);
+  assert.doesNotMatch(table, /<w:bottom w:val="single"/);
+});
+
+test('a dynamic borderless narrative tablix honors Border=None instead of receiving a synthetic line', async () => {
+  const m = parseRdl(flatTablixRdl);
+  const tablix = m.body.items.find((item) => item.type === 'Tablix');
+  const NONE = { style: 'None', color: '#000000', width: 1 };
+  const strip = (style) => { if (style) style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } }; };
+  strip(tablix.style);
+  for (const row of tablix.rows) for (const cell of row.cells) for (const item of cell.items) strip(item.style);
+
+  const renderRequest = request(1);
+  const { rows } = tablixRows(tablix, renderRequest, { PageNumber: 1, TotalPages: 1 }, m);
+  assert.equal(rows.some((row) => row.isStatic === false), true, 'the narrative row remains data-bound');
+  assert.equal(shouldEnforceTablixBottom(rows, tablix), false);
+  const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
+  const table = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] || '';
+  assert.match(table, /Row 0/);
   assert.doesNotMatch(table, /<w:bottom w:val="single"/);
 });
 

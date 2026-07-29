@@ -111,11 +111,42 @@ export function textForItem(item, context) {
   return normalizeDisplayText(item.style?.format ? String(formatValue(value, styleValue(item.style.format, context))) : String(value));
 }
 
-// A materialized dynamic/data row identifies a data tablix whose physical fragments require a guaranteed
-// closing edge. Static tablixes are also used as borderless layout containers, so they must keep the RDL's
-// declared Border=None rather than receiving a synthetic rule.
-export function shouldEnforceTablixBottom(rows) {
-  return (rows || []).some((row) => row.isStatic === false);
+function styleDeclaresVisibleBorder(style) {
+  const sides = style?.borders || (style?.border
+    ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
+    : null);
+  return Object.values(sides || {}).some((border) => {
+    if (!border || border.style === undefined) return false;
+    // Expressions are border intent even when a particular row resolves to None. Literal None on every
+    // side is the RDL author's explicit declaration that this item is a borderless layout construct.
+    return typeof border.style === 'string' && border.style.startsWith('=')
+      ? true
+      : !/^none$/i.test(String(border.style));
+  });
+}
+
+function itemDeclaresVisibleBorder(item) {
+  if (!item) return false;
+  if (styleDeclaresVisibleBorder(item.style)) return true;
+  return (item.items || item.children || []).some(itemDeclaresVisibleBorder);
+}
+
+// A populated dynamic tablix is not necessarily a visual data grid: RDL commonly uses data-bound tablixes
+// as borderless narrative/layout containers. Enforce a physical closing edge only when the tablix actually
+// declares border intent at the table or cell-content level. This preserves fragment closure for bordered
+// grids while honoring an explicit Border=None throughout a dynamic prose section.
+export function shouldEnforceTablixBottom(rows, tablix) {
+  const hasDynamicRows = (rows || []).some((row) => row.isStatic === false);
+  if (!hasDynamicRows) return false;
+  if (styleDeclaresVisibleBorder(tablix?.style)) return true;
+  // Spans are structural grid intent even if individual sides are omitted. Their physical fragments must
+  // still close where a merged owner reaches a page/table boundary.
+  if ((rows || []).some((row) => (row.cells || []).some((cell) => (
+    (cell.rowSpan || 1) > 1 || (cell.colSpan || 1) > 1
+  )))) return true;
+  return (rows || []).some((row) => (row.cells || []).some((cell) => (
+    (cell.items || []).some(itemDeclaresVisibleBorder)
+  )));
 }
 
 // For data tablixes, the last row must be closed with a bottom border even when the RDL leaves the

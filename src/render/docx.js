@@ -926,7 +926,7 @@ function tableForTablix(model, item, request, config, measurementDoc, structured
   const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
   const datasets = normalizeDatasets(model, request);
   const { rows, columns } = tablixRows(item, request, globals, model);
-  const enforceBottomClosure = shouldEnforceTablixBottom(rows);
+  const enforceBottomClosure = shouldEnforceTablixBottom(rows, item);
   // Matrix tablixes expand to a data-dependent column grid; clamp uses the expanded natural width.
   const layoutItem = item.hasColumnGroups ? { ...item, columns, width: columns.reduce((sum, width) => sum + width, 0) } : item;
   const geometry = computeDocxTableGeometry(model, layoutItem);

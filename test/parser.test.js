@@ -172,6 +172,72 @@ test('RunningValue accumulates a running aggregate through the current row and k
   assert.throws(() => evaluateExpression('=RunningValue(Fields!id.Value, Median, Nothing)', { fields: dataset[0], dataset }), /Unsupported RunningValue aggregate/);
 });
 
+test('RunningValue and RowNumber treat Nothing as the outermost processed scope across nested groups', () => {
+  const rows = [
+    { category: 'A', id: 'x' },
+    { category: 'A', id: 'y' },
+    { category: 'B', id: 'y' },
+    { category: 'B', id: 'z' },
+  ];
+  const contexts = rows.map((fields) => {
+    const categoryRows = rows.filter((row) => row.category === fields.category);
+    return {
+      fields,
+      dataset: [fields],
+      outermostDataset: rows,
+      datasets: { Sales: rows },
+      scopes: {
+        Sales: rows,
+        RiskTable: rows,
+        Category: categoryRows,
+        Details: [fields],
+      },
+      tablixDatasetName: 'Sales',
+      tablixName: 'RiskTable',
+    };
+  });
+
+  assert.deepEqual(
+    contexts.map((context) => evaluateExpression('=RunningValue(Fields!id.Value, CountDistinct, Nothing)', context)),
+    [1, 2, 2, 3],
+  );
+  assert.deepEqual(
+    contexts.map((context) => evaluateExpression('=RunningValue(Fields!id.Value, CountDistinct, "Category")', context)),
+    [1, 2, 1, 2],
+  );
+  assert.deepEqual(
+    contexts.map((context) => evaluateExpression('=RunningValue(Fields!id.Value, CountDistinct, "RiskTable")', context)),
+    [1, 2, 2, 3],
+  );
+  assert.deepEqual(
+    contexts.map((context) => evaluateExpression('=RowNumber(Nothing)', context)),
+    [1, 2, 3, 4],
+  );
+});
+
+test('tablix materialization keeps RunningValue Nothing outside one-row nested group scopes after sorting', () => {
+  const model = parseRdl(fixture);
+  const tablix = model.body.items.find((item) => item.type === 'Tablix');
+  const detailMember = tablix.rowMembers[1];
+  detailMember.group.expressions = ['=Fields!Amount.Value'];
+  const numberTextbox = tablix.rows[1].cells[0].items[0];
+  numberTextbox.value = '=RunningValue(Fields!Amount.Value, CountDistinct, Nothing)';
+  numberTextbox.paragraphs[0][0].value = numberTextbox.value;
+  tablix.sortExpressions = [{ value: '=Fields!Amount.Value', direction: 'Ascending' }];
+  const source = [
+    { Name: 'thirty', Amount: 30 },
+    { Name: 'ten', Amount: 10 },
+    { Name: 'twenty-a', Amount: 20 },
+    { Name: 'twenty-b', Amount: 20 },
+  ];
+
+  const materialized = materializeTablixRows(tablix, source, {}, {}, { Sales: source });
+  assert.deepEqual(
+    materialized.filter((row) => !row.isHeader).map((row) => row.cells[0].values[0]),
+    ['1', '2', '2', '3'],
+  );
+});
+
 test('evaluates the newly supported expression functions', () => {
   const dataset = [{ n: 2 }, { n: 4 }, { n: 4 }, { n: 6 }];
   const at = (index) => ({ fields: dataset[index], dataset, datasets: {} });

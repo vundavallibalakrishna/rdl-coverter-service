@@ -167,6 +167,13 @@ function memberGroupsByName(members, target = new Map()) {
   return target;
 }
 
+function dataRegionScopes(tablix, rows) {
+  const scopes = {};
+  if (tablix.datasetName) scopes[tablix.datasetName] = rows;
+  if (tablix.name) scopes[tablix.name] = rows;
+  return scopes;
+}
+
 function groupValue(group, fields, parameters, globals, dataset, datasets, rowIndex) {
   if (!group) return null;
   if (!group.expressions?.length) return `row:${rowIndex}`;
@@ -440,7 +447,7 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
   // Scope map for a cell: named group instances containing this row + the innermost group's rows (the
   // SSRS default no-scope aggregate scope). Falls back to the whole dataset when there is no row group.
   const scopeContext = (path, fields, rowIndex) => {
-    const scopes = { [tablix.datasetName]: sourceRows };
+    const scopes = dataRegionScopes(tablix, sourceRows);
     let innermost = sourceRows;
     let nestedDataset = sourceRows;
     for (const member of path || []) {
@@ -493,16 +500,18 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
     for (const [rowIndex, fields] of contexts.entries()) {
       const { scopes, dataset, nestedDataset } = dynamic
         ? scopeContext(path, fields, rowIndex)
-        : { scopes: { [tablix.datasetName]: sourceRows }, dataset: sourceRows, nestedDataset: sourceRows };
+        : { scopes: dataRegionScopes(tablix, sourceRows), dataset: sourceRows, nestedDataset: sourceRows };
       const context = {
         fields,
         parameters,
         globals,
         dataset,
+        outermostDataset: sourceRows,
         nestedDataset,
         datasets,
         scopes,
         tablixDatasetName: tablix.datasetName,
+        tablixName: tablix.name,
         nestedTablixDepth: globals.__nestedTablixDepth || 0,
       };
       // Honor static Visibility.Hidden on the row and on any member in its path (a hidden group/row is
@@ -617,7 +626,7 @@ function matrixColumnData(tablix, sourceRows, parameters, globals, datasets) {
     }
     return leafCount;
   };
-  walk(tablix.columnMembers, sourceRows, { [tablix.datasetName]: sourceRows }, 0);
+  walk(tablix.columnMembers, sourceRows, dataRegionScopes(tablix, sourceRows), 0);
   return { leaves, headerRowsByLevel };
 }
 
@@ -722,7 +731,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
     }
   }
 
-  walkMembers(tablix.rowMembers, sourceRows, { [tablix.datasetName]: sourceRows }, [], 0);
+  walkMembers(tablix.rowMembers, sourceRows, dataRegionScopes(tablix, sourceRows), [], 0);
 
   // Visibility changes the physical row sequence, so remove hidden units before calculating vertical
   // spans. Counting a hidden unit and then dropping it later makes an ancestor span one row too far and
@@ -735,10 +744,12 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       parameters,
       globals,
       dataset: unit.dataset,
+      outermostDataset: sourceRows,
       nestedDataset: unit.nestedDataset,
       datasets,
       scopes: unit.scopes,
       tablixDatasetName: tablix.datasetName,
+      tablixName: tablix.name,
       nestedTablixDepth: globals.__nestedTablixDepth || 0,
     };
     return !evalHidden(template.hidden, context) && !unit.path.some((member) => evalHidden(member.hidden, context));
@@ -758,7 +769,17 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
   const output = [];
   for (const [index, unit] of visibleUnits.entries()) {
     const template = tablix.rows[unit.templateIndex];
-    const context = { fields: unit.fields, parameters, globals, dataset: unit.dataset, datasets, scopes: unit.scopes };
+    const context = {
+      fields: unit.fields,
+      parameters,
+      globals,
+      dataset: unit.dataset,
+      outermostDataset: sourceRows,
+      datasets,
+      scopes: unit.scopes,
+      tablixDatasetName: tablix.datasetName,
+      tablixName: tablix.name,
+    };
     const resolveScope = (scope) => scopeKey(scope, tablix, groups, unit.fields, parameters, globals, sourceRows, datasets, unit.emitIndex, unit.path);
 
     const descriptors = unitDescriptors[index];
@@ -803,10 +824,12 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           parameters,
           globals,
           dataset: intersection,
+          outermostDataset: sourceRows,
           nestedDataset: intersection,
           datasets,
           scopes: { ...unit.scopes, ...column.scopes },
           tablixDatasetName: tablix.datasetName,
+          tablixName: tablix.name,
           nestedTablixDepth: globals.__nestedTablixDepth || 0,
         };
         const cellResolve = (scope) => scopeKey(scope, tablix, groups, cellContext.fields, parameters, globals, sourceRows, datasets, unit.emitIndex, unit.path);
@@ -846,9 +869,11 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           parameters,
           globals,
           dataset: sourceRows,
+          outermostDataset: sourceRows,
           datasets,
-          scopes: { [tablix.datasetName]: sourceRows },
+          scopes: dataRegionScopes(tablix, sourceRows),
           tablixDatasetName: tablix.datasetName,
+          tablixName: tablix.name,
           nestedTablixDepth: globals.__nestedTablixDepth || 0,
         };
         cells.push({
@@ -866,9 +891,11 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           parameters,
           globals,
           dataset: header.rows,
+          outermostDataset: sourceRows,
           datasets,
           scopes: header.scopes,
           tablixDatasetName: tablix.datasetName,
+          tablixName: tablix.name,
           nestedTablixDepth: globals.__nestedTablixDepth || 0,
         };
         const headerResolve = (scope) => scopeKey(scope, tablix, groups, header.fields, parameters, globals, sourceRows, datasets, 0);

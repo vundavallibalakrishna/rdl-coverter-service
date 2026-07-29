@@ -347,7 +347,7 @@ function splitTextForHeight(doc, config, textbox, context, text, width, height) 
 
 function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage, globals }) {
   const { rows, columns } = tablixRows(item, request, globals, model);
-  const enforceBottomClosure = shouldEnforceTablixBottom(rows);
+  const enforceBottomClosure = shouldEnforceTablixBottom(rows, item);
   const datasets = normalizeDatasets(model, request);
   // A matrix expands to a data-dependent column grid wider than the design width; use its natural
   // total so columns are not scaled down. Static-column tablixes keep item's declared width scaling.
