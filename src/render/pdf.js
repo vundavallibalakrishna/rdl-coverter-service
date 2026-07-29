@@ -88,6 +88,33 @@ function lineHeightForStyle(doc, config, style, context) {
   return styleSize(style?.lineHeight, context, 0) || doc.currentLineHeight(true);
 }
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+function graphemes(text) {
+  return Array.from(graphemeSegmenter.segment(text), (part) => part.segment);
+}
+
+// Returns the largest non-empty grapheme prefix that fits `width`. Exact PDF font metrics are used rather
+// than character counts so the same rule works for proportional fonts, bold/italic variants, combining
+// marks, emoji sequences and expression-selected families. If one grapheme is intrinsically wider than the
+// cell, return it alone: no legal line break can make that glyph narrower, and advancing guarantees progress.
+function fittingGraphemeEnd(doc, parts, start, width) {
+  let low = start + 1;
+  let high = parts.length;
+  let best = start;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = parts.slice(start, middle).join('');
+    if (doc.widthOfString(candidate) <= width) {
+      best = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best > start ? best : start + 1;
+}
+
 function layoutStyledText(doc, config, item, context, text, width) {
   const source = styledSegmentsForText(item, context, text);
   if (!source) return null;
@@ -133,10 +160,33 @@ function layoutStyledText(doc, config, item, context, text, width) {
       // Wrapping consumes the separating whitespace, matching PDFKit's normal word-wrap behaviour.
       if (whitespace) return;
     }
-    line.runs.push({ text: token, style: segment.style, width: tokenWidth });
-    line.width += tokenWidth;
-    line.contentHeight = Math.max(line.contentHeight, tokenHeight);
-    line.height = line.before + line.contentHeight;
+    if (whitespace || tokenWidth <= width) {
+      line.runs.push({ text: token, style: segment.style, width: tokenWidth });
+      line.width += tokenWidth;
+      line.contentHeight = Math.max(line.contentHeight, tokenHeight);
+      line.height = line.before + line.contentHeight;
+      return;
+    }
+
+    // A token wider than an otherwise-empty line must wrap within the word. Treating it as indivisible
+    // draws it past the inner cell width; the mandatory cell clip then truncates the suffix. Split only on
+    // Unicode grapheme boundaries so no surrogate pair, combining mark or joined emoji is corrupted.
+    const parts = graphemes(token);
+    let start = 0;
+    while (start < parts.length) {
+      const end = fittingGraphemeEnd(doc, parts, start, width);
+      const fragment = parts.slice(start, end).join('');
+      const fragmentWidth = doc.widthOfString(fragment);
+      line.runs.push({ text: fragment, style: segment.style, width: fragmentWidth });
+      line.width += fragmentWidth;
+      line.contentHeight = Math.max(line.contentHeight, tokenHeight);
+      line.height = line.before + line.contentHeight;
+      start = end;
+      if (start < parts.length) {
+        finishLine(false);
+        line = startLine(segment.style, segment.paragraphStyle, segment.paragraphIndex);
+      }
+    }
   };
 
   for (const segment of source.segments) {
