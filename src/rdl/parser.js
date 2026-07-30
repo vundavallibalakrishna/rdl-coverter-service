@@ -455,7 +455,22 @@ function parseParameters(report) {
 function parseDatasets(report) {
   return asArray(report.DataSets?.DataSet).map((dataset) => ({
     name: dataset['@_Name'],
-    fields: asArray(dataset.Fields?.Field).map((field) => ({ name: field['@_Name'], dataField: textValue(field.DataField, field['@_Name']), typeName: textValue(field['rd:TypeName'] || field.TypeName, 'System.String') })),
+    // A Field carries either a DataField (bound to a query result column) or a Value (computed from other
+    // fields). Only a bound one is a key in the posted rows, so the two must stay distinguishable — see
+    // rdl/fields.js. Without this a calculated field inherits its Name as a DataField and is then demanded
+    // of data that can never contain it.
+    fields: asArray(dataset.Fields?.Field).map((field) => {
+      const dataField = field.DataField === undefined || field.DataField === null ? '' : textValue(field.DataField, '');
+      const expression = field.Value === undefined || field.Value === null ? '' : textValue(field.Value, '');
+      const calculated = !dataField && expression !== '';
+      return {
+        name: field['@_Name'],
+        dataField: dataField || field['@_Name'],
+        calculated,
+        value: calculated ? expression : undefined,
+        typeName: textValue(field['rd:TypeName'] || field.TypeName, 'System.String'),
+      };
+    }),
     parameterNames: asArray(dataset.Query?.QueryParameters?.QueryParameter).map((parameter) => parameter['@_Name']),
     hasQuery: Boolean(dataset.Query?.CommandText || dataset.Query?.CommandType),
   }));

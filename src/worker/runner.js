@@ -122,7 +122,12 @@ export class RenderRunner {
           if (!settled && code !== 0) finish(reject, new ServiceError('RENDER_FAILED', `Render worker stopped unexpectedly (${exitSignal || code})`, 500));
         });
         child.on('message', (message) => {
-          if (message?.type === 'failed') finish(reject, new ServiceError(message.error.code, message.error.message, message.error.statusCode, message.error.details));
+          if (message?.type === 'failed') {
+            const failure = new ServiceError(message.error.code, message.error.message, message.error.statusCode, message.error.details);
+            // Server-side only: the underlying exception behind a scrubbed RENDER_FAILED (see renderWorker).
+            if (message.diagnostic) failure.diagnostic = message.diagnostic;
+            finish(reject, failure);
+          }
           if (message?.type === 'completed') finish(resolve, message);
         });
         child.send({ type: 'render', tempDir, rdlPath, requestPath, config: this.config });

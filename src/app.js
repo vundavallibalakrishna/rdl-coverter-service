@@ -90,6 +90,7 @@ export async function buildApp(options = {}) {
       docxProfileId: rendered.docxProfile?.id,
       docxProfileCertified: rendered.docxProfile?.certified,
       docxNativePageFragments: rendered.docxNativePageFragments,
+      fontSubstitutions: rendered.fontSubstitutions?.length ? rendered.fontSubstitutions : undefined,
       durationMs,
     }, 'RDL rendering completed');
     reply
@@ -107,6 +108,13 @@ export async function buildApp(options = {}) {
       reply.header('X-Docx-Profile-Certified', String(rendered.docxProfile.certified === true));
     }
     if (rendered.docxNativePageFragments !== undefined) reply.header('X-Docx-Native-Page-Fragments', String(rendered.docxNativePageFragments));
+    // Characters the declared font could not draw were drawn in another installed font. The render
+    // succeeded, so this is reported alongside the document rather than as an error.
+    if (rendered.fontSubstitutions?.length) {
+      reply.header('X-Font-Substitutions', safeHeaderValue(
+        rendered.fontSubstitutions.map((entry) => `${entry.requested}=>${entry.substituted} (${entry.reason}, ${entry.runs})`).join('; '),
+      ));
+    }
     return reply.send(rendered.buffer);
   });
 
@@ -115,7 +123,10 @@ export async function buildApp(options = {}) {
     if (error instanceof ServiceError) safe = error;
     else if (error?.code === 'FST_ERR_CTP_BODY_TOO_LARGE' || error?.statusCode === 413) safe = new ServiceError('RDL_INVALID', 'Request exceeds the configured size limit', 413);
     else safe = toServiceError(error);
-    request.log.error({ requestId: request.id, code: safe.code, statusCode: safe.statusCode }, 'RDL request failed');
+    // safe.diagnostic carries the real exception behind a scrubbed RENDER_FAILED (see renderWorker). It is
+    // logged here and deliberately left out of the reply below, which stays free of report-derived detail.
+    const diagnostic = safe.diagnostic || (safe.cause ? { name: safe.cause.name, message: safe.cause.message, stack: safe.cause.stack } : undefined);
+    request.log.error({ requestId: request.id, code: safe.code, statusCode: safe.statusCode, diagnostic }, 'RDL request failed');
     if (safe.code === 'BUSY') reply.header('Retry-After', safe.details?.retryAfterSeconds || 5);
     return reply.code(safe.statusCode).header('X-Request-Id', request.id).send({ error: { code: safe.code, message: safe.message, details: safe.details } });
   });

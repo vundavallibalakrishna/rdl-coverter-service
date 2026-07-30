@@ -1,5 +1,6 @@
 import { ServiceError } from '../errors.js';
 import { evaluateExpression, formatValue } from './expression.js';
+import { isBoundField, normalizeRowFields, rowKeyFor } from './fields.js';
 import { flattenCellItems, RENDERABLE_CELL_ITEMS } from './helpers.js';
 import { normalizeDisplayText, renderMarkupText } from './text.js';
 
@@ -69,23 +70,28 @@ export function validateRenderInput(model, request, limits) {
     for (const [index, row] of rows.entries()) {
       if (!row || typeof row !== 'object' || Array.isArray(row)) throw new ServiceError('FIELD_MISSING', `Dataset ${dataset.name} row ${index} must be an object`);
       for (const field of dataset.fields) {
-        if (!(field.dataField in row)) throw new ServiceError('FIELD_MISSING', `Dataset ${dataset.name} row ${index} is missing field ${field.dataField}`);
+        // A calculated field is computed from its siblings, never supplied by the caller (see rdl/fields.js).
+        if (!isBoundField(field)) continue;
+        if (rowKeyFor(row, field.dataField) === undefined) {
+          throw new ServiceError(
+            'FIELD_MISSING',
+            `Dataset ${dataset.name} row ${index} is missing field ${field.dataField}`,
+            400,
+            // Column names, not row values: without them this error cannot be diagnosed without the RDL
+            // and the query side by side, which is exactly the position it used to leave callers in.
+            { dataset: dataset.name, field: field.dataField, availableFields: Object.keys(row).slice(0, 100) },
+          );
+        }
       }
     }
   }
   return { totalRows, parameters: resolvedParameters };
 }
 
-function normalizeFields(row, definitions = []) {
-  const normalized = { ...row };
-  for (const field of definitions) {
-    // Nested data regions receive the already-normalized rows from their containing group scope. Preserve
-    // that internal field value when the original DataField key is no longer present; this also makes
-    // normalization idempotent without weakening the request validator's exact-DataField requirement.
-    if (Object.hasOwn(row, field.dataField)) normalized[field.name] = row[field.dataField];
-    else if (!Object.hasOwn(normalized, field.name)) normalized[field.name] = undefined;
-  }
-  return normalized;
+// Kept as a thin alias so both call sites in this module read as before; the shared implementation lives
+// in rdl/fields.js because the renderers normalize the same rows and must agree on what a field means.
+function normalizeFields(row, definitions = [], context = {}) {
+  return normalizeRowFields(row, definitions, context);
 }
 
 function evaluateItemText(item, context) {
@@ -371,7 +377,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
 }
 
 export function prepareTablixData(tablix, rows, parameters, globals = {}, datasets = {}) {
-  const normalized = (Array.isArray(rows) ? rows : []).map((row) => normalizeFields(row, tablix.datasetFields));
+  const normalized = (Array.isArray(rows) ? rows : []).map((row) => normalizeFields(row, tablix.datasetFields, { parameters, globals, datasets }));
   // Apply both tablix-level filters and row-group member filters (a group filter removes rows that fall
   // outside the group, e.g. a series/category exclusion).
   const activeFilters = [...(tablix.filters || []), ...collectMemberGroupFilters(tablix.rowMembers)];

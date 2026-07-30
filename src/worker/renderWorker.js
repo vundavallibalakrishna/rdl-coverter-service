@@ -6,7 +6,7 @@ import { parseRdl } from '../rdl/parser.js';
 import { resolveBundledSubreports } from '../rdl/subreports.js';
 import { validateRenderInput } from '../rdl/validation.js';
 import { renderDocument } from '../render/index.js';
-import { checkFonts } from '../render/fonts.js';
+import { checkFonts, takeFontSubstitutions } from '../render/fonts.js';
 
 process.on('message', async (message) => {
   if (message?.type !== 'render') return;
@@ -42,9 +42,24 @@ process.on('message', async (message) => {
       docxProfile: rendered.docxProfile,
       docxNativePageFragments: rendered.docxNativePageFragments,
       sceneStats: rendered.sceneStats,
+      // Which declared families could not draw some run and what drew it instead. A coverage substitution
+      // is deliberate but still a deviation from the report's declared styling, so it is reported rather
+      // than silent — the worker's stdio is discarded, making the completion message the only way out.
+      fontSubstitutions: takeFontSubstitutions(),
     });
   } catch (error) {
     const safe = toServiceError(error);
-    process.send?.({ type: 'failed', error: { code: safe.code, message: safe.message, statusCode: safe.statusCode, details: safe.details } });
+    process.send?.({
+      type: 'failed',
+      error: { code: safe.code, message: safe.message, statusCode: safe.statusCode, details: safe.details },
+      // RENDER_FAILED deliberately scrubs the message before it reaches the caller, and this worker's
+      // stdio is discarded, so an unexpected exception would otherwise leave no trace anywhere at all.
+      // Carry the real one back for the server-side log only; it never enters the HTTP response.
+      diagnostic: safe === error ? undefined : {
+        name: error?.name,
+        message: error?.message,
+        stack: typeof error?.stack === 'string' ? error.stack.split('\n').slice(0, 12).join('\n') : undefined,
+      },
+    });
   }
 });

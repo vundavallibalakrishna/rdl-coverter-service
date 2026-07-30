@@ -1,4 +1,5 @@
 import { evaluateExpression, formatValue } from '../rdl/expression.js';
+import { normalizeRowFields } from '../rdl/fields.js';
 import { materializeTablixColumns, materializeTablixRows } from '../rdl/validation.js';
 import { normalizeDisplayText, renderMarkupText } from '../rdl/text.js';
 import { toPoints } from '../units.js';
@@ -166,11 +167,11 @@ export function enforcedBottomBorder(style) {
 }
 
 export function normalizeDatasets(model, request) {
-  return Object.fromEntries(model.datasets.map((dataset) => [dataset.name, (request.datasets?.[dataset.name] || []).map((row) => {
-    const normalized = { ...row };
-    for (const field of dataset.fields) normalized[field.name] = row[field.dataField];
-    return normalized;
-  })]));
+  const context = { parameters: request.parameters || {} };
+  return Object.fromEntries(model.datasets.map((dataset) => [
+    dataset.name,
+    (request.datasets?.[dataset.name] || []).map((row) => normalizeRowFields(row, dataset.fields, context)),
+  ]));
 }
 
 // Returns the materialized rows AND the grid column widths. For static-column tablixes `columns`

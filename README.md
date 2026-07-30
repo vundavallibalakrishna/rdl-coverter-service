@@ -146,8 +146,9 @@ curl -X POST http://localhost:7070/v1/render \
 `X-Docx-Layout-Mode` plus
 `X-Docx-Editable-Text-Ratio`. Structured DOCX responses also include
 `X-Docx-Native-Page-Fragments`; if a profile was applied they include `X-Docx-Profile-Id` and
-`X-Docx-Profile-Certified`. The artifact is rendered completely before any header is sent, so a `200` means
-a finished file.
+`X-Docx-Profile-Certified`. Any response whose declared font could not draw some character also includes
+`X-Font-Substitutions` (see [Fonts](#fonts)). The artifact is rendered completely before any header is
+sent, so a `200` means a finished file.
 
 `DOCX_EDITABLE` returns `X-Page-Count: unknown` — Word performs its own final pagination. `PDF`,
 `DOCX_VISUAL` returns exact page counts.
@@ -407,10 +408,10 @@ JSON body: `{ "error": { "code", "message", "details" } }`, with stable codes:
 | `PARAMETER_INVALID` | 400 | Parameter missing or wrong type. |
 | `DATASET_MISSING` | 400 | The RDL needs a dataset you did not supply. |
 | `FIELD_MISSING` | 400 | Rows are missing a required `DataField`. |
-| `FONT_MISSING` | 503 | A required font is unavailable. See [Fonts](#fonts). |
+| `FONT_MISSING` | 503 | A declared font has no file on the render host. Characters an *installed* font cannot draw are substituted instead — see [Fonts](#fonts). |
 | `BUSY` | 503 | At capacity. Includes `Retry-After`. |
 | `RENDER_TIMEOUT` | 504 | Exceeded `RDL_RENDER_TIMEOUT_MS`. |
-| `RENDER_FAILED` | 500 / 499 | Worker died, or client disconnected mid-render. |
+| `RENDER_FAILED` | 500 / 499 | Worker died, or client disconnected mid-render. The response message is scrubbed by design; the underlying exception is logged server-side as the `diagnostic` field of the `RDL request failed` log line. |
 
 Messages are deliberately free of report content — see [Security model](#security-model).
 
@@ -453,15 +454,46 @@ opt-in and off by default.
 Font metrics drive layout. Wrong fonts means wrong pagination, so production is **strict by default**: a
 missing font is `FONT_MISSING` (503) rather than a silent substitution that quietly shifts every page break.
 
+Two different conditions are treated differently, because they are not the same problem:
+
+| Condition | Behaviour |
+| --- | --- |
+| The declared family has **no file** on this host | Strict mode fails closed (`FONT_MISSING`, 503). Substituting would change the advance widths of every run, and therefore every page break. |
+| The declared family **is installed but has no glyph** for some character | The run is drawn in an installed font that does cover it. Never fails. |
+
+The second case is a property of a few characters, not of the document: Arial has no `✓` (U+2713), `✗`
+(U+2717) or `☹` (U+2639), and no Latin family covers CJK or Indic. The declared font still draws every
+other run at its own metrics, so a single character in a single cell must not cost the whole export. No
+flag gates this — the alternative is a 503 for a report that renders correctly everywhere else.
+
+- Coverage stand-ins are tried metric-compatible first (Liberation Sans has Arial's advance widths, so when
+  it covers the run the page breaks are identical to SSRS), then widest-coverage: Segoe UI Symbol, Noto
+  Sans Symbols 2, Arial Unicode MS, Lucida Sans Unicode, Microsoft Sans Serif, DejaVu Sans, Noto Sans.
+  A candidate is used only when it covers **the whole run** — a face covering the missing character but not
+  the surrounding text would trade one unrenderable character for an unrenderable run.
+- A candidate must also be **embeddable**, not merely cover the text. PDFKit subsets an embedded TrueType
+  font by decoding each glyph it used; colour fonts (COLR/CBDT/sbix — Segoe UI Emoji is one) return glyphs
+  with no decoder and abort the render with `glyph._decode is not a function` at the very end, as an opaque
+  `RENDER_FAILED` 500. fontkit reports coverage for those glyphs happily, so coverage alone is not a safe
+  test. Colour fonts are therefore skipped, including when the report declares one directly.
+- When nothing on the host covers the run, the declared font is kept and only the characters it lacks come
+  out as `.notdef`, as SSRS renders them. The export still succeeds.
+- Substitutions are reported, never silent: the `X-Font-Substitutions` response header and the
+  `fontSubstitutions` field of the render log line list `requested => substituted (reason, runs)`.
+- To widen coverage without a code change, drop a single-face file into `RDL_FONT_DIR`:
+  `NotoSansSymbols2-Regular.ttf`, `NotoSansCJK-Regular.ttf`, or `NotoSansDevanagari-Regular.ttf`. Font
+  collections (`.ttc`, e.g. Windows `Nirmala.ttc` / `msgothic.ttc`) are **not** usable — a collection needs
+  a face name that the path-based font handoff to PDFKit cannot carry.
 - Licensed fonts are **never committed to the repository or baked into the image** (see `AGENTS.md`). Mount
   them at runtime into `RDL_FONT_DIR` (`/app/fonts` in the container).
 - Reports commonly need Arial, Times New Roman, and — for the Combined Assurance profile — Segoe UI and
   Segoe UI Symbol (the legend glyphs). Segoe UI is licensed on the client machine.
 - `Segoe UI Emoji` may use a mounted `NotoEmoji-Regular.ttf` as an explicitly enabled compatible PDF
-  fallback. The renderer validates the actual glyphs before layout and embedding; supplementary-plane emoji
-  never fall through to Helvetica. Enable this in strict mode only with
-  `RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS=true`.
-- `GET /readyz` reports exactly which variants are missing.
+  fallback for the *absent-family* case. The renderer validates the actual glyphs before layout and
+  embedding; supplementary-plane emoji never fall through to Helvetica. Enable this in strict mode only
+  with `RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS=true`.
+- `GET /readyz` reports exactly which variants are missing. Note it checks file *presence*, not glyph
+  coverage — a host can be ready and still substitute for individual characters.
 - `RDL_STRICT_FONTS=false` substitutes them for local development. Never in production.
 
 ## Security model
