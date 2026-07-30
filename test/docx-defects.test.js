@@ -102,9 +102,14 @@ test('an embedded image is typed from its real bytes, not a wrong declared MIMET
     [{ width: 254_000, height: 254_000 }, { width: 254_000, height: 254_000 }],
     'DrawingML must preserve the exact 20pt trace box instead of rounding it up to a clipping 27px',
   );
+  assert.equal((documentXml.match(/<wp:anchor\b/g) || []).length, 2);
+  assert.equal((documentXml.match(/<wp:inline\b/g) || []).length, 0);
+  assert.equal((documentXml.match(/<wp:positionH relativeFrom="character">/g) || []).length, 2);
+  assert.equal((documentXml.match(/<wp:positionV relativeFrom="paragraph">/g) || []).length, 2);
+  assert.equal((documentXml.match(/\blayoutInCell="1"/g) || []).length, 2);
   assert.match(
     documentXml,
-    /<w:spacing\b(?=[^>]*w:line="400")(?=[^>]*w:lineRule="exact")[^>]*\/>[\s\S]{0,300}<w:drawing>/,
+    /<w:spacing\b(?=[^>]*w:line="1")(?=[^>]*w:lineRule="exact")[^>]*\/>[\s\S]{0,300}<w:drawing>/,
   );
 });
 
@@ -135,7 +140,7 @@ test('a free-form body Rectangle preserves its children vertical spacing (not cr
   assert.match(xml, /MIDDLE/);
 });
 
-test('a centered free-form image is horizontally centered from its box position (generic, not per-report)', async () => {
+test('a free-form image floats at its canonical owner-cell position instead of a text baseline', async () => {
   const { PNG } = await import('pngjs');
   const png = new PNG({ width: 4, height: 4 });
   png.data.fill(0x80);
@@ -150,8 +155,9 @@ test('a centered free-form image is horizontally centered from its box position 
     items: [{ type: 'Image', name: 'L', source: 'Embedded', value: 'LOGO', sizing: 'FitProportional', top: 0, left: 150, width: 100, height: 60, style: {} }],
   }];
   const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
-  // The image's paragraph must carry centre justification (derived from Left/Width), and the image embeds.
-  assert.match(xml, /<w:jc w:val="center"\/>[\s\S]*?<w:drawing>/);
+  assert.match(xml, /<wp:anchor\b[^>]*\blayoutInCell="1"/);
+  assert.match(xml, /<wp:positionH relativeFrom="character"><wp:posOffset>\d+<\/wp:posOffset><\/wp:positionH>/);
+  assert.match(xml, /<wp:positionV relativeFrom="paragraph"><wp:posOffset>\d+<\/wp:posOffset><\/wp:positionV>/);
 });
 
 test('a narrow shaded free-form box confines its fill to the RDL Width (single-cell table), not full column', async () => {

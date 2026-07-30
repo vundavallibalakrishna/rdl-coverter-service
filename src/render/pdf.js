@@ -1484,7 +1484,13 @@ export async function renderPdf(model, request, config, options = {}) {
               422,
             );
           }
-          bandEndY = Math.max(bandEndY, rendered.endY || childY);
+          const renderedEndY = rendered.endY ?? childY;
+          // Y coordinates are page-local. Once a single-child band advances to another page, its
+          // final-page endpoint replaces the prior-page band coordinate; comparing the two with
+          // Math.max would retain a stale Y and can push otherwise fitting later bands forward.
+          bandEndY = globals.PageNumber === pageNumberBeforeChild
+            ? Math.max(bandEndY, renderedEndY)
+            : renderedEndY;
         }
         if (band.items.length > 1 && globals.PageNumber !== pageNumberAtBandStart) {
           throw new ServiceError(

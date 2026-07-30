@@ -7,6 +7,7 @@ import {
   Document,
   Footer,
   HeightRule,
+  HorizontalPositionRelativeFrom,
   ImageRun,
   LineRuleType,
   PageOrientation,
@@ -20,8 +21,10 @@ import {
   TableLayoutType,
   TableRow,
   TextRun,
+  TextWrappingType,
   UnderlineType,
   VerticalAlignTable,
+  VerticalPositionRelativeFrom,
   WidthType,
 } from 'docx';
 import JSZip from 'jszip';
@@ -67,6 +70,10 @@ function pointsToDrawingPixels(points) {
   // 56.667px to 57px (42.75pt), so Word clips it until the row is manually enlarged. Preserve the point
   // measurement through the EMU conversion instead.
   return (Number(points || 0) / 72) * 96;
+}
+
+function pointsToDrawingEmus(points) {
+  return Math.round(Number(points || 0) * 12_700);
 }
 
 function cleanColor(value, fallback = '000000') {
@@ -330,14 +337,16 @@ async function pictureForItem(item, resources, model, request, config, tempDir, 
     }
   }
   return new Paragraph({
-    alignment: AlignmentType.CENTER,
-    // An inline picture participates in Word line layout. A one-twip line clips or suppresses pictures
-    // that fill their traced cell (most visibly repeated page-header logos). Use the PDF-resolved picture
-    // height as the exact native line box; the enclosing table row and cell remain fixed to the same trace.
+    // Inline drawings are aligned to a text baseline. In Microsoft Word an exact line as tall as a large
+    // chart places that baseline inside the line box, so the picture can protrude upward into preceding
+    // PDF regions even though its enclosing row is exact. Images and charts are the only report items that
+    // the page-locked contract permits as drawings, so float them at the origin of their canonical owner
+    // cell and keep their anchor paragraph physically negligible. Cell-relative positioning also remains
+    // stable in Word footer stories and avoids page offsets being applied twice by alternate OOXML viewers.
     spacing: {
       before: 0,
       after: 0,
-      line: Math.max(1, pointsToTwips(height)),
+      line: 1,
       lineRule: LineRuleType.EXACT,
     },
     children: [new ImageRun({
@@ -346,6 +355,23 @@ async function pictureForItem(item, resources, model, request, config, tempDir, 
       transformation: {
         width: Math.max(1, pointsToDrawingPixels(width)),
         height: Math.max(1, pointsToDrawingPixels(height)),
+      },
+      floating: {
+        horizontalPosition: {
+          relative: HorizontalPositionRelativeFrom.CHARACTER,
+          offset: pointsToDrawingEmus(Math.max(0, (item.width - width) / 2)),
+        },
+        verticalPosition: {
+          relative: VerticalPositionRelativeFrom.PARAGRAPH,
+          offset: pointsToDrawingEmus(Math.max(0, (item.height - height) / 2)),
+        },
+        allowOverlap: true,
+        lockAnchor: true,
+        behindDocument: false,
+        layoutInCell: true,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        wrap: { type: TextWrappingType.NONE },
+        zIndex: Math.max(1, Math.round(Number(item.zIndex || 0)) + 1),
       },
     })],
   });
@@ -625,15 +651,21 @@ async function nativePageFooter(
     reserveSectionAnchor: false,
   });
   return new Footer({
-    children: [await pageTable(
-      grid,
-      resources,
-      model,
-      request,
-      config,
-      tempDir,
-      chartCounter,
-    )],
+    // A footer story ending in a table makes Word synthesize a terminal paragraph whose height is
+    // renderer-dependent. Materialize the required paragraph with the same one-twip exact geometry used
+    // by empty grid cells so it cannot enlarge the footer band and steal space from the page body.
+    children: [
+      await pageTable(
+        grid,
+        resources,
+        model,
+        request,
+        config,
+        tempDir,
+        chartCounter,
+      ),
+      emptyFooterParagraph(),
+    ],
   });
 }
 
@@ -695,7 +727,9 @@ async function tableCellFor(grid, row, column, placement, resources, model, requ
       rowSpan,
       margins,
       verticalAlign: owner?.kind === 'image' || owner?.kind === 'chart'
-        ? VerticalAlignTable.CENTER
+        // The floating picture is positioned from this paragraph's top edge. Centering a negligible
+        // anchor paragraph inside a tall owner cell moves the entire drawing down by half the cell height.
+        ? VerticalAlignTable.TOP
         : verticalAlignment(owner?.verticalAlign),
       shading: background ? { type: ShadingType.CLEAR, fill: cleanColor(background), color: 'auto' } : undefined,
       borders: resolvedCellBorders(box, owner, grid.decorators, grid.lines),
@@ -816,7 +850,11 @@ function pageProperties(page, index) {
       margin: {
         top: 0,
         right: 0,
-        bottom: 0,
+        // The canonical body grid already stops before the PDF footer. A small negative bottom margin
+        // gives Word's mandatory end-of-section paragraph a non-visible flow allowance below that fixed
+        // grid, instead of forcing a mathematically full final table row onto another physical page.
+        // Footer placement is governed independently by the exact w:footer distance below.
+        bottom: -pointsToTwips(SECTION_ANCHOR_POINTS),
         left: 0,
         header: 0,
         footer: pointsToTwips(footerDistance),
@@ -944,7 +982,19 @@ async function addFontVariants(buffer, embeddedFonts) {
   for (const name of drawingParts) {
     const file = zip.file(name);
     if (!file) continue;
-    const xml = await file.async('string');
+    let xml = await file.async('string');
+    if (name === 'word/document.xml') {
+      // docx emits an 18pt document grid in every section by default. Microsoft Word applies it to the
+      // otherwise-empty section paragraph after each page table, turning the intended one-twip anchor
+      // into an 18pt line and pushing a near-full final row onto a new page. Page-locked output uses
+      // explicit point/twip geometry throughout, so a document grid is both unnecessary and incorrect.
+      xml = xml
+        .replace(/<w:docGrid\b[^>]*\/>/g, '')
+        .replace(
+          /<w:p><w:pPr>(?=<w:sectPr\b)/g,
+          '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"/>',
+        );
+    }
     zip.file(name, xml.replace(
       /(<wp:docPr\b[^>]*\bid=")\d+(")/g,
       (_match, prefix, suffix) => `${prefix}${nextDrawingId++}${suffix}`,

@@ -105,6 +105,7 @@ test('page-locked DOCX contains one native fixed page grid per PDF page and all 
   assert.equal((documentXml.match(/<w:sectPr(?:\s|>)/g) || []).length, rendered.pageCount);
   assert.equal((documentXml.match(/<w:tblLayout w:type="fixed"\/>/g) || []).length, rendered.pageCount);
   assert.ok((documentXml.match(/<w:trHeight[^>]*w:hRule="exact"/g) || []).length > 0);
+  assert.doesNotMatch(documentXml, /<w:docGrid\b/);
   const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
     .map((match) => match[1])
     .join('');
@@ -119,6 +120,92 @@ test('page-locked DOCX contains one native fixed page grid per PDF page and all 
   assert.equal((fontTableXml.match(/<w:embedBoldItalic\b/g) || []).length, 1);
   assert.equal((fontTableXml.match(/\bw:subsetted="0"/g) || []).length, 4);
   assert.equal(fontParts.length, 4);
+});
+
+test('section anchors and footer terminators cannot snap page-locked geometry to Word’s document grid', async () => {
+  const paged = structuredClone(baseModel);
+  const secondPage = structuredClone(paged.body.items.find((item) => item.type === 'Textbox'));
+  secondPage.name = 'SecondPageAnchorProbe';
+  secondPage.value = 'SECOND_PAGE_ANCHOR_PROBE';
+  secondPage.paragraphs = [['SECOND_PAGE_ANCHOR_PROBE']];
+  secondPage.pageBreak = { location: 'Start', disabled: 'false' };
+  paged.body.items.push(secondPage);
+  const footerText = structuredClone(paged.body.items.find((item) => item.type === 'Textbox'));
+  footerText.name = 'FooterTerminatorProbe';
+  footerText.value = 'FOOTER_TERMINATOR_PROBE';
+  footerText.paragraphs = [['FOOTER_TERMINATOR_PROBE']];
+  footerText.left = 0;
+  footerText.top = 0;
+  footerText.width = 160;
+  footerText.height = 16;
+  paged.page.footer = {
+    height: 20,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [footerText],
+  };
+
+  const rendered = await renderEditableDocx(paged, request, config);
+  const zip = await JSZip.loadAsync(rendered.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  const footerXml = await zip.file('word/footer1.xml').async('string');
+
+  assert.doesNotMatch(documentXml, /<w:docGrid\b/);
+  assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-40")/);
+  assert.match(
+    documentXml,
+    /<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><w:sectPr\b/,
+  );
+  assert.match(
+    footerXml,
+    /<\/w:tbl><w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><\/w:pPr>/,
+  );
+});
+
+test('a near-full PDF page preserves traced row heights and uses only the non-visible section flow allowance', async () => {
+  const nearFull = structuredClone(baseModel);
+  nearFull.page.width = 300;
+  nearFull.page.height = 200;
+  nearFull.page.marginTop = 0;
+  nearFull.page.marginRight = 0;
+  nearFull.page.marginBottom = 0;
+  nearFull.page.marginLeft = 0;
+  nearFull.page.header = {
+    height: 10,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [],
+  };
+  const body = structuredClone(baseModel.body.items.find((item) => item.type === 'Textbox'));
+  body.name = 'NearFullBody';
+  body.value = 'NEAR_FULL_BODY';
+  body.paragraphs = [['NEAR_FULL_BODY']];
+  body.left = 0;
+  body.top = 0;
+  body.width = 100;
+  body.height = 170;
+  body.canGrow = false;
+  nearFull.body.items = [body];
+  const footer = structuredClone(body);
+  footer.name = 'NearFullFooter';
+  footer.value = 'NEAR_FULL_FOOTER';
+  footer.paragraphs = [['NEAR_FULL_FOOTER']];
+  footer.top = 0;
+  footer.height = 16;
+  nearFull.page.footer = {
+    height: 20,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [footer],
+  };
+
+  const rendered = await renderEditableDocx(nearFull, request, config);
+  const zip = await JSZip.loadAsync(rendered.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+
+  // The 10pt PDF spacer remains exactly 200 twips; pagination capacity comes only from the section margin.
+  assert.match(documentXml, /<w:trHeight w:val="200" w:hRule="exact"\/>/);
+  assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-40")/);
 });
 
 test('multi-row PDF footer content is isolated in one native footer part outside body pagination', async () => {

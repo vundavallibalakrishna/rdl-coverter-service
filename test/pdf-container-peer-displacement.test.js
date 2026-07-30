@@ -33,6 +33,30 @@ const rdl = `<?xml version="1.0"?>
  </ReportSection></ReportSections>
 </Report>`;
 
+const pageAdvanceRdl = `<?xml version="1.0"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+ <ReportSections><ReportSection><Body><ReportItems>
+  <Rectangle Name="Container"><ReportItems>
+   <Textbox Name="Prelude"><CanGrow>false</CanGrow><KeepTogether>true</KeepTogether>
+    <Paragraphs><Paragraph><TextRuns><TextRun><Value>PRELUDE</Value></TextRun></TextRuns></Paragraph></Paragraphs>
+    <Top>0in</Top><Left>0in</Left><Height>2.5in</Height><Width>3in</Width><Style/>
+   </Textbox>
+   <Textbox Name="Mandate"><CanGrow>true</CanGrow><KeepTogether>true</KeepTogether>
+    <Paragraphs><Paragraph><TextRuns><TextRun><Value>MANDATE</Value></TextRun></TextRuns></Paragraph></Paragraphs>
+    <Top>2.55in</Top><Left>0in</Left><Height>1in</Height><Width>3in</Width><Style/>
+   </Textbox>
+   <Textbox Name="Approach"><CanGrow>true</CanGrow><KeepTogether>true</KeepTogether>
+    <Paragraphs><Paragraph><TextRuns><TextRun><Value>APPROACH</Value></TextRun></TextRuns></Paragraph></Paragraphs>
+    <Top>3.6in</Top><Left>0in</Left><Height>1.1in</Height><Width>3in</Width><Style/>
+   </Textbox>
+  </ReportItems><Top>0in</Top><Left>0in</Left><Height>4.7in</Height><Width>3in</Width><Style/></Rectangle>
+ </ReportItems><Height>4.7in</Height><Style/></Body>
+ <Page><PageHeight>4in</PageHeight><PageWidth>4in</PageWidth>
+  <LeftMargin>0.25in</LeftMargin><RightMargin>0.25in</RightMargin>
+  <TopMargin>0.25in</TopMargin><BottomMargin>0.25in</BottomMargin>
+ </Page></ReportSection></ReportSections>
+</Report>`;
+
 test('a growing tablix displaces later rectangle peers while same-band peers remain aligned', async () => {
   const model = parseRdl(rdl);
   const rows = Array.from({ length: 15 }, (_, index) => ({ V: `ROW_${String(index + 1).padStart(2, '0')}` }));
@@ -64,4 +88,39 @@ test('a growing tablix displaces later rectangle peers while same-band peers rem
     Math.abs(tableToLegendGap - 3.6) <= 0.25,
     'the RDL gap between the table and legend is preserved after the table grows across pages',
   );
+});
+
+test('a rectangle continues from the final child position after that child advances a page', async () => {
+  const rendered = await renderPdf(parseRdl(pageAdvanceRdl), {
+    parameters: {},
+    datasets: {},
+  }, config, { captureLayoutTrace: true });
+
+  const pageFor = (itemName) => rendered.layoutTrace.pages.findIndex((page) => (
+    page.items.some((item) => item.itemName === itemName)
+  ));
+  assert.equal(pageFor('Prelude'), 0);
+  assert.equal(pageFor('Mandate'), 1);
+  assert.equal(
+    pageFor('Approach'),
+    1,
+    'the next child uses the preceding child final-page end position rather than its stale prior-page Y',
+  );
+});
+
+test('a rectangle still advances a later child when it genuinely cannot fit after a page advance', async () => {
+  const nonFittingRdl = pageAdvanceRdl.replace(
+    '<Top>3.6in</Top><Left>0in</Left><Height>1.1in</Height>',
+    '<Top>3.6in</Top><Left>0in</Left><Height>3.4in</Height>',
+  );
+  const rendered = await renderPdf(parseRdl(nonFittingRdl), {
+    parameters: {},
+    datasets: {},
+  }, config, { captureLayoutTrace: true });
+
+  const pageFor = (itemName) => rendered.layoutTrace.pages.findIndex((page) => (
+    page.items.some((item) => item.itemName === itemName)
+  ));
+  assert.equal(pageFor('Mandate'), 1);
+  assert.equal(pageFor('Approach'), 2);
 });
