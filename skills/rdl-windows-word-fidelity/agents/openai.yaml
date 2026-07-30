@@ -1,0 +1,4 @@
+interface:
+  display_name: "RDL Windows Word Fidelity"
+  short_description: "Certify editable DOCX against canonical PDF"
+  default_prompt: "Use $rdl-windows-word-fidelity to certify a page-locked editable DOCX in Windows Word."

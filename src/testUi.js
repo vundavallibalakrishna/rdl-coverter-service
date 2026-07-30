@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 const OUTPUT_OPTIONS = [
   ['PDF', 'PDF', 'Fixed layout with selectable text'],
-  ['DOCX_EDITABLE', 'Word · Editable', 'Native tables and editable content'],
+  ['DOCX_EDITABLE', 'Word · Windows Paged', 'PDF-locked native tables and editable text'],
   ['DOCX_VISUAL', 'Word · Visual', 'Exact PDF pages as images'],
   ['XLSX', 'Excel', 'Native cells and workbook formatting'],
 ];

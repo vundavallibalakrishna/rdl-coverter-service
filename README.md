@@ -43,7 +43,7 @@ Use it two ways, both supported and both backed by the identical pipeline:
 `GET /readyz` (or `readiness(config)`) reports whether all three are actually satisfied.
 
 Microsoft Word is **not** installed or invoked by the service. All DOCX modes are generated as OOXML on
-Linux; Word for Mac/Windows is used only as the authoritative release-certification viewer.
+Linux. Microsoft Word for Windows is the sole `DOCX_EDITABLE` release-certification viewer.
 
 ## Quick start
 
@@ -143,15 +143,11 @@ curl -X POST http://localhost:7070/v1/render \
 
 `Content-Type`, sanitized `Content-Disposition`, `Content-Length`, `X-Request-Id`, `X-Page-Count`,
 `X-Render-Duration-Ms`; XLSX responses also include `X-Xlsx-Layout-Mode`. DOCX responses use
-`X-Docx-Layout-Mode` plus
-`X-Docx-Editable-Text-Ratio`. Structured DOCX responses also include
-`X-Docx-Native-Page-Fragments`; if a profile was applied they include `X-Docx-Profile-Id` and
-`X-Docx-Profile-Certified`. Any response whose declared font could not draw some character also includes
-`X-Font-Substitutions` (see [Fonts](#fonts)). The artifact is rendered completely before any header is
-sent, so a `200` means a finished file.
+`X-Docx-Layout-Mode` plus `X-Docx-Editable-Text-Ratio`. The artifact is rendered completely before any
+header is sent, so a `200` means a finished file.
 
-`DOCX_EDITABLE` returns `X-Page-Count: unknown` — Word performs its own final pagination. `PDF`,
-`DOCX_VISUAL` returns exact page counts.
+`PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL` return numeric canonical PDF page counts. `DOCX_EDITABLE` reports
+`X-Docx-Layout-Mode: windows-paged-editable`.
 
 ---
 
@@ -290,66 +286,23 @@ guaranteed temp cleanup. That isolation is a property of the pipeline, not of th
 | Mode | How it is produced | Text | Page count |
 | --- | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. | Selectable | Exact |
-| `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables and text. | Editable | Unknown — Word paginates |
+| `DOCX_EDITABLE` | Native OpenXML built from the canonical PDF renderer's resolved layout trace. It is not a screenshot or an external PDF conversion. | Editable | Canonical PDF count |
 | `DOCX_VISUAL` | Renders PDF, rasterizes every page at 300 DPI, one full-page floating image per Word page. | Images | Exact |
 | `XLSX` | Native Excel workbook. The default `REPORT` layout creates one native-cell worksheet per explicit RDL section; `DATA` preserves the legacy stacked/per-tablix export. | Live cells | Not paginated (`null`) |
 
-Because Word performs `DOCX_EDITABLE` pagination itself, the service cannot know the count: the library
-returns `pageCount: null` and the HTTP layer sends `X-Page-Count: unknown`. `XLSX` is also `pageCount: null`
-(a spreadsheet is continuous; Excel decides print pagination). The other modes return numeric page counts.
+`DOCX_EDITABLE` generates the canonical PDF internally, records its resolved page geometry, and constructs
+one native fixed-layout Word section for each PDF page. Tables and text remain editable; PDF-measured line
+breaks, grids, row heights, borders, headers, footers, and fonts are materialized explicitly. Declared RDL
+images and charts may remain pictures. The result is designed and certified only for Microsoft Word on
+Windows; editing may change later pagination. Unsupported Word geometry fails closed.
 
-Choose `DOCX_EDITABLE` when users need normal Word table editing and reflow (Word owns pagination, so page
-breaks will not match the PDF). Choose `DOCX_VISUAL` when page-for-page fidelity matters and editing is not
-required — it is one full-page image per page. Choose the default XLSX `REPORT` layout for an editable,
-PDF-styled workbook without PDF pagination. It splits only at explicit RDL page breaks, keeps layout and
-tablix content in native cells, preserves RDL group row spans as editable merged regions, and permits only
-declared embedded RDL images as pictures. Set `"excel": { "layoutMode": "DATA" }` for the legacy data-first
-stacked workbook; `sheetPerTablix` remains available only in that mode.
+The former continuous renderer, document profiles, and native-fragment switches have been removed.
+`docx.nativePageFragments`, `docxNativePageFragments`, `docx.profile`, and their former environment settings
+are rejected with `RDL_INVALID`.
 
-`DOCX_EDITABLE` splits large tablixes into multiple native Word tables by default using PDF-like page-break
-estimates. Each fragment repeats declared header rows and carries a physical closing border while remaining
-editable. Set `"docx": { "nativePageFragments": false }` on a render request (the legacy top-level
-`docxNativePageFragments: false` is still accepted), or set `RDL_DOCX_NATIVE_PAGE_FRAGMENTS=false`, to
-restore one continuous Word-owned table. Fragmentation is not a page-parity guarantee: some RDLs move closer
-to the PDF while row-span-heavy reports can drift further. `/v1/analyze` returns
-`structuredEditable.nativePageFragments.recommendation` so callers can decide whether to retain the default
-or opt out for a certified report/data family.
-
-For certified reports, you can also mount a structured DOCX profile file and let the service apply the
-certified options only to matching RDL definitions:
-
-```json
-{
-  "profiles": [
-    {
-      "id": "incident-dashboard-native",
-      "certified": true,
-      "match": {
-        "definitionSha256": "sha256-from-v1-analyze"
-      },
-      "docx": {
-        "nativePageFragments": true
-      }
-    }
-  ]
-}
-```
-
-Set `RDL_DOCX_PROFILE_PATH=/app/config/docx-profiles.json`. With
-`RDL_DOCX_PROFILE_AUTO=false`, callers opt in using `"docx": { "profile": "incident-dashboard-native" }`.
-With `RDL_DOCX_PROFILE_AUTO=true`, the first matching profile with `certified: true` is applied
-automatically. Candidate profiles generated by `certify:docx` intentionally remain `certified: false`; they
-match in `/v1/analyze` but do not auto-apply until a reviewer marks them certified after the exact SSRS
-reference run. Explicit request selection (`"docx": { "profile": "..." }`) is still allowed for QA.
-Request flags such as `"docx": { "nativePageFragments": false }` override the profile.
-Profile files are validated before use. Each profile must have a unique header-safe `id`
-(`A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `-`; max 128 characters), a `match` object containing
-`definitionSha256`, `name`, or `namespace`, and only known `docx` options. Duplicate IDs, unknown rendering
-keys, malformed SHA-256 hashes, and unsafe IDs fail closed with `CONFIG_INVALID`.
-
-Fixed position does not mean read-only content. Fixed DOCX packages have no Word document/write protection,
-every drawing anchor is emitted unlocked, and every visible report text line can be edited in its text box.
-The service fails generation if package protection or a text-edit lock is detected.
+Choose `DOCX_VISUAL` when editability is unnecessary and a raster page image is acceptable. Choose the
+default XLSX `REPORT` layout for an editable, PDF-styled workbook without PDF pagination. Set
+`"excel": { "layoutMode": "DATA" }` for the legacy data-first workbook.
 
 ## The request
 
@@ -359,9 +312,8 @@ The service fails generation if package protection or a text-edit lock is detect
 | `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
-| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF` and `DOCX_VISUAL`; see [Supplying subreports](./docs/SUBREPORTS.md). |
+| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL`; see [Supplying subreports](./docs/SUBREPORTS.md). |
 | `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, places “Continued from previous page” above the next table fragment for renderer-confirmed logical-row continuations. |
-| `docx.nativePageFragments` | — | `DOCX_EDITABLE` only. Defaults to `true`; set `false` to restore one continuous Word-owned table. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
 | `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
 | `outputFileName` | — | Sanitized for `Content-Disposition`; also `Globals!ReportName`. |
@@ -437,13 +389,10 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_WORKER_MEMORY_MAX_MB` | `2048` | Hard cap for deterministic PDF workload-based heap scaling. Never lower than the baseline. |
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
-| `RDL_DOCX_NATIVE_PAGE_FRAGMENTS` | `true` | Split large `DOCX_EDITABLE` tablixes into editable native table fragments at PDF-like break estimates. Set `false` for continuous Word-owned tables. |
-| `RDL_DOCX_PROFILE_PATH` | unset | Optional JSON file containing certified structured-DOCX profiles matched by RDL hash/name/namespace. |
-| `RDL_DOCX_PROFILE_AUTO` | `false` | Automatically apply the first matching structured-DOCX profile. Keep off unless every profile is release-certified. |
 | `RDL_PDFTOPPM_PATH` | `pdftoppm` | Poppler binary for `DOCX_VISUAL`. |
 | `RDL_BORDER_WIDTH_FLOOR_PT` | `0` | Minimum PDF border stroke, in points. `0` honours the RDL exactly. |
 | `LOG_LEVEL` | `info` | Fastify log level. |
-| `RDL_SAMPLES_DIR` | `tmp/samples` | Dev only. Where client samples live for tests and smoke scripts. See [Client samples](#client-samples). |
+| `RDL_SAMPLES_DIR` | `<repo>/tmp` | Dev only. Where client samples live for tests and smoke scripts. See [Client samples](#client-samples). |
 
 `RDL_BORDER_WIDTH_FLOOR_PT` exists for a reported "uneven borders" symptom that turned out to be viewer
 sub-pixel rasterization, not stroke width. A floor only makes borders *heavier*, not more uniform, so it is
@@ -486,8 +435,8 @@ flag gates this — the alternative is a 503 for a report that renders correctly
   a face name that the path-based font handoff to PDFKit cannot carry.
 - Licensed fonts are **never committed to the repository or baked into the image** (see `AGENTS.md`). Mount
   them at runtime into `RDL_FONT_DIR` (`/app/fonts` in the container).
-- Reports commonly need Arial, Times New Roman, and — for the Combined Assurance profile — Segoe UI and
-  Segoe UI Symbol (the legend glyphs). Segoe UI is licensed on the client machine.
+- Reports commonly need Arial, Times New Roman, Segoe UI, and Segoe UI Symbol. The exact consumed
+  regular/bold/italic/bold-italic faces must be mounted.
 - `Segoe UI Emoji` may use a mounted `NotoEmoji-Regular.ttf` as an explicitly enabled compatible PDF
   fallback for the *absent-family* case. The renderer validates the actual glyphs before layout and
   embedding; supplementary-plane emoji never fall through to Helvetica. Enable this in strict mode only
@@ -551,13 +500,13 @@ sorts, nested and dynamic groups, merged cells, repeated headers, per-side borde
 safe HTML-to-text normalization, z-order, keep-together, page settings and breaks, and a catalogued safe
 expression subset. Expression-capable paragraph spacing and line height are resolved per row, and
 `TextRun/Value@EvaluationMode="Constant"` preserves a leading `=` as literal text. Caller-bundled,
-invocation-scoped tablix subreports render in PDF and visual DOCX; unresolved subreports and subreports in
-editable DOCX/XLSX remain fail-closed. Maps, gauges, custom code, and non-embedded images are rejected.
+invocation-scoped tablix subreports render in PDF, editable DOCX, and visual DOCX; unresolved subreports and
+subreports in XLSX remain fail-closed. Maps, gauges, custom code, and non-embedded images are rejected.
 
 To ask the service instead of reading docs, `POST /v1/analyze`. To dump the whole schema catalogue:
 
 ```bash
-npm run audit:schema   # tmp/output/rdl-2016-capability-catalogue.json
+npm run audit:schema   # tmp/rdl-2016-capability-catalogue.json
 ```
 
 Of the 695 declared names in Microsoft's 2016 schema (691 elements, 4 attributes): **169** `SUPPORTED`,
@@ -582,8 +531,8 @@ suite needs them.
 ### Client samples
 
 Client RDLs, request fixtures, and row data are **client property and are never committed**. They carry real
-report definitions, queries, and row values, so they live in **`tmp/samples/`** — outside version control —
-not in the repository.
+report definitions, queries, and row values, so they live directly in **`tmp/`** — outside version control —
+not in a report/run/format subfolder.
 
 A fresh clone therefore legitimately has no samples, and that is not a broken checkout. Tests and scripts
 that need them **skip** rather than fail:
@@ -593,7 +542,7 @@ that need them **skip** rather than fail:
 ﹣ the incident dashboard with charts passes the capability gate (skipped)
 ```
 
-To run the sample-backed tests, put the client files in `tmp/samples/`, or point at them elsewhere:
+To run the sample-backed tests, put the client files directly in `tmp/`, or point at them elsewhere:
 
 ```bash
 RDL_SAMPLES_DIR="/secure/path/to/client-samples" npm test
@@ -618,14 +567,13 @@ npm run audit:schema
 npm run verify:stress -- --require-pass
 npm run verify:stress:nested -- --require-pass
 npm run verify:reference -- "/path/to/report.rdl" "/path/to/reference.pdf" "/path/to/hydration.json"
-npm run certify:docx -- "/path/to/report.rdl" "/path/to/request.json" "/path/to/ssrs-reference.pdf" --renderer=word --exact-inputs --require-match
+npm run certify:windows-word -- "/path/to/report.rdl" "/path/to/request.json" "/path/to/reference.pdf"
 ```
 
 Inspect representative PDF/DOCX output. **An HTTP `200` is not verification.**
 
-- **`verify:stress`** renders a deterministic 470-row table as direct PDF and structured editable DOCX,
-  then converts the DOCX back to PDF. Its canonical PDF must be 30–40 pages; structured-DOCX page count is
-  advisory because Word/LibreOffice own native-table pagination. The gate requires exact-once row and
+- **`verify:stress`** renders a deterministic 470-row table as direct PDF and page-locked editable DOCX.
+  Its canonical PDF must be 30–40 pages. The gate requires exact-once row and
   oversized-cell markers, native tables, repeated headers, interlocking horizontal/vertical merges, and a
   structurally closed bottom border on every explicit table fragment. It also raster-checks the complete
   bottom rule on every table-bearing PDF and DOCX page, including pages created by a cell taller than the
@@ -638,21 +586,17 @@ Inspect representative PDF/DOCX output. **An HTTP `200` is not verification.**
   all-page raster-border gates against a deterministic five-level hierarchy. It combines repeatable
   multi-band headers, nested row-header spans, group headers/footers and scoped totals, conditional
   visibility/styles, explicit group page breaks, and three independently page-taller editable cells. The
-  canonical PDF is constrained to 30–40 pages; editable Word pagination remains advisory. Oversized Word
-  rows must be split into bounded native rows, and every emitted page fragment must carry a continuous
-  full-grid closing rule. Artifacts are direct children of `tmp/`.
+  canonical PDF is constrained to 30–40 pages. Every emitted PDF-derived page fragment must carry a
+  continuous full-grid closing rule. Artifacts are direct children of `tmp/`.
 - **`verify:reference`** renders a hydrated PDF, compares page count and dimensions, checks text anchors,
   rasterizes the first three pages at 144 DPI, and writes a comparison report. Add `--exact-inputs
   --require-match` **only** when the hydration and font versions come from the exact SSRS reference run.
-- **`certify:docx`** renders the canonical PDF plus both structured DOCX variants (`nativePageFragments`
-  off/on), exports the DOCX through Microsoft Word for Mac or LibreOffice, compares page count, dimensions,
-  extracted text, and OpenXML editability, then writes a `docx-profile-candidate.json` matched by
-  `identity.definitionSha256`. Use `--renderer=word --exact-inputs --require-match` for release
-  certification. Without the exact SSRS reference PDF/data/fonts, it produces a candidate only and reports
-  the blocker explicitly.
-  Without `--exact-inputs` it reports regression evidence but will never mark output certified. Page-count or
-  pixel differences against a reference built from different rows are not certification failures by
-  themselves.
+- **`certify:windows-word`** builds the page-locked DOCX, invokes the bundled PowerShell/COM harness on a
+  Windows QA host, forces Word pagination, exports to PDF without updating fields, audits the package, and
+  compares it with the canonical PDF at 144 DPI. Release certification requires exact page count and
+  dimensions, identical displayed text and ordering, geometry within 0.5 pt, and no page with more than
+  0.5% of pixels differing by over 16 colour levels. Word for Mac, LibreOffice, Google Docs, and browser
+  previews are not certification authorities.
 
 ## Project layout
 
@@ -672,8 +616,11 @@ src/
     functions/      The 101-function registry
     format.js       .NET format-string engine
   render/
-    pdf.js          PDF renderer (PDFKit)
-    docx.js         Native OpenXML renderer (editable)
+    pdf.js          PDF renderer and canonical layout trace producer
+    layoutTrace.js  Deterministic point-based PDF layout manifest
+    docx.js         Windows-paged editable DOCX entry point
+    pagedDocx.js    Trace-driven native Word section/table renderer
+    windowsWordCompatibility.js  Word platform limits and request policy
     visualDocx.js   Rasterized full-page DOCX
     excel.js        Native XLSX renderer
     chart.js        Vector charts
@@ -682,12 +629,10 @@ src/
     runner.js       Concurrency admission, timeouts, temp lifecycle
     renderWorker.js Forked worker: parse → font check → validate → render
 scripts/
-  lib/samples.js    Resolves client samples (tmp/samples, or RDL_SAMPLES_DIR)
+  lib/samples.js    Resolves client samples (tmp, or RDL_SAMPLES_DIR)
   …                 Smoke, stress, reference, and schema-audit tooling
 test/               Node test-runner suite
 tmp/                All generated output AND client samples. Git-ignored in full.
-  samples/          Client RDLs, request fixtures, row data — never committed
-  output/           Renders, verifier reports, rasterized pages
 ```
 
 Contributors: read `AGENTS.md` first. It carries the authoritative architecture, security invariants,

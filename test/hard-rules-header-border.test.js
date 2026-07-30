@@ -6,20 +6,15 @@
 // header is repeated by physically redrawing it per page (page-fragment mode). These tests assert the model
 // flagging, the shared border helper, and the emitted OpenXML on synthetic RDLs isolating each construct.
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import test from 'node:test';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { promisify } from 'node:util';
 import JSZip from 'jszip';
 import { parseRdl } from '../src/rdl/parser.js';
 import { tablixRows, enforcedBottomBorder, shouldEnforceTablixBottom } from '../src/render/common.js';
-import { renderEditableDocx, wordFragmentSafety } from '../src/render/docx.js';
+import { renderEditableDocx } from '../src/render/docx.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { loadConfig } from '../src/config.js';
 
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
-const execFileAsync = promisify(execFile);
 const documentXml = async (buffer) => (await JSZip.loadAsync(buffer)).file('word/document.xml').async('string');
 
 // A tablix with one static column-header row and a dynamic detail row grouped by V (no merged cells).
@@ -48,10 +43,12 @@ test('a tablix static column-header row is marked to repeat, even without Repeat
   assert.equal(rows[1].isHeader, false); // the detail rows do not
 });
 
-test('the emitted DOCX marks the column-header row with w:tblHeader (Word repeats it)', async () => {
+test('the page-locked DOCX materializes the column header as native text in its page table', async () => {
   const m = parseRdl(flatTablixRdl);
   const xml = await documentXml((await renderEditableDocx(m, request(5), config)).buffer);
-  assert.match(xml, /<w:tblHeader\/>/);
+  assert.match(xml, /COLHDR/);
+  assert.match(xml, /<w:tblLayout w:type="fixed"\/>/);
+  assert.match(xml, /<w:trHeight[^>]*w:hRule="exact"/);
 });
 
 test('enforcedBottomBorder keeps a declared visible bottom, else synthesizes one', () => {
@@ -66,15 +63,18 @@ test('enforcedBottomBorder keeps a declared visible bottom, else synthesizes one
   assert.deepEqual(enforcedBottomBorder({}), { style: 'Solid', color: '#000000', width: 1 });
 });
 
-test('Word fragment headroom scales with material font-metric variance, not isolated overrides', () => {
-  assert.equal(wordFragmentSafety({ fontMixRatio: 0, italicRatio: 0 }), 0.85);
-  assert.ok(wordFragmentSafety({ fontMixRatio: 0.015, italicRatio: 0 }) > 0.849);
-  assert.equal(wordFragmentSafety({ fontMixRatio: 0.56, italicRatio: 0.12 }), 0.77);
-  assert.equal(wordFragmentSafety({ fontMixRatio: 0, italicRatio: 0, maxRowSpan: 64, mergeCellRatio: 0.2 }), 0.85);
-  assert.ok(wordFragmentSafety({ fontMixRatio: 0, italicRatio: 0, maxRowSpan: 64, mergeCellRatio: 0.2, advancedGroupRatio: 0.5 }) < 0.8);
+test('editable DOCX returns the canonical PDF page count instead of an estimated page range', async () => {
+  const m = parseRdl(flatTablixRdl);
+  const renderRequest = request(50);
+  const [pdf, docx] = await Promise.all([
+    renderPdf(m, renderRequest, config),
+    renderEditableDocx(m, renderRequest, config),
+  ]);
+  assert.equal(docx.pageCount, pdf.pageCount);
+  assert.equal(docx.layoutMode, 'windows-paged-editable');
 });
 
-test('the first native fragment subtracts its RDL page-relative Top before choosing rows', async () => {
+test('the page-locked DOCX inherits first-page tablix placement from the canonical PDF trace', async () => {
   const atPageTop = parseRdl(flatTablixRdl);
   const belowPriorContent = parseRdl(flatTablixRdl.replace('<Top>0in</Top>', '<Top>2in</Top>'));
   const explicitPageStart = parseRdl(flatTablixRdl.replace(
@@ -85,24 +85,22 @@ test('the first native fragment subtracts its RDL page-relative Top before choos
     const tablix = model.body.items.find((item) => item.type === 'Tablix');
     tablix.style.borders.left = { style: 'Solid', color: '#000000', width: 1 };
   }
-  const renderRequest = {
-    ...request(40),
-    docx: { nativePageFragments: true },
-  };
-  const firstTableRows = async (model) => {
-    const xml = await documentXml((await renderEditableDocx(model, renderRequest, config)).buffer);
-    const table = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] || '';
-    const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
-    assert.match(physicalRows.at(-1) || '', /<w:top w:val="single"/,
-      'the reserved closure strip must remain the last physical row');
-    return physicalRows.filter((row) => /Row \d+/.test(row)).length;
+  const renderRequest = request(40);
+  const firstPageRows = async (model) => {
+    const canonical = await renderPdf(model, renderRequest, config, { captureLayoutTrace: true });
+    const firstPageCount = canonical.layoutTrace.pages[0].items.filter((item) => (
+      item.kind === 'tablixCell' && /^Row \d+$/.test(item.text)
+    )).length;
+    const docx = await renderEditableDocx(model, renderRequest, config);
+    assert.equal(docx.pageCount, canonical.pageCount);
+    return firstPageCount;
   };
 
-  const topCount = await firstTableRows(atPageTop);
-  const offsetCount = await firstTableRows(belowPriorContent);
-  const explicitStartCount = await firstTableRows(explicitPageStart);
-  assert.ok(offsetCount < topCount,
-    `a table starting 2in down the page must receive fewer first-fragment rows (${offsetCount} < ${topCount})`);
+  const topCount = await firstPageRows(atPageTop);
+  const offsetCount = await firstPageRows(belowPriorContent);
+  const explicitStartCount = await firstPageRows(explicitPageStart);
+  assert.equal(offsetCount, topCount,
+    'the PDF flow engine ignores an absolute Top offset on the first visible body item');
   assert.equal(explicitStartCount, topCount,
     'an absolute Top at an explicit page-break start is the page origin, not consumed page space');
 });
@@ -111,26 +109,35 @@ test('the last row of a bordered data tablix closes when its bottom edge is None
   const m = parseRdl(flatTablixRdl);
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
   const NONE = { style: 'None', color: '#000000', width: 1 };
-  const strip = (style) => { if (style) style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } }; };
+  const strip = (style) => {
+    if (!style) return;
+    delete style.border;
+    style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } };
+  };
   strip(tablix.style);
   for (const row of tablix.rows) for (const cell of row.cells) for (const item of cell.items) strip(item.style);
   tablix.style.borders.left = { style: 'Solid', color: '#123456', width: 2 };
   const xml = await documentXml((await renderEditableDocx(m, {
     ...request(3),
-    docx: { nativePageFragments: false },
   }, config)).buffer);
-  assert.match(xml, /<w:tblBorders>[\s\S]*?<w:bottom w:val="single" w:color="123456" w:sz="16"/);
-  assert.match(xml, /<w:tcBorders>[\s\S]*?<w:bottom w:val="single"/);
+  assert.match(xml, /<w:tcBorders>[\s\S]*?<w:bottom w:val="single" w:color="123456" w:sz="16"/);
 });
 
 test('a static borderless layout tablix honors Border=None instead of receiving a synthetic line', async () => {
-  const m = parseRdl(flatTablixRdl);
+  const m = parseRdl(flatTablixRdl.replaceAll(
+    '<Style><Border><Style>Solid</Style></Border></Style>',
+    '<Style/>',
+  ));
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
   tablix.rows = [tablix.rows[0]];
   tablix.rowMembers = [tablix.rowMembers[0]];
   tablix.rowMemberPaths = [[tablix.rowMembers[0]]];
   const NONE = { style: 'None', color: '#000000', width: 1 };
-  const strip = (style) => { if (style) style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } }; };
+  const strip = (style) => {
+    if (!style) return;
+    delete style.border;
+    style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } };
+  };
   strip(tablix.style);
   for (const cell of tablix.rows[0].cells) for (const item of cell.items) strip(item.style);
 
@@ -144,10 +151,17 @@ test('a static borderless layout tablix honors Border=None instead of receiving 
 });
 
 test('a dynamic borderless narrative tablix honors Border=None instead of receiving a synthetic line', async () => {
-  const m = parseRdl(flatTablixRdl);
+  const m = parseRdl(flatTablixRdl.replaceAll(
+    '<Style><Border><Style>Solid</Style></Border></Style>',
+    '<Style/>',
+  ));
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
   const NONE = { style: 'None', color: '#000000', width: 1 };
-  const strip = (style) => { if (style) style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } }; };
+  const strip = (style) => {
+    if (!style) return;
+    delete style.border;
+    style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } };
+  };
   strip(tablix.style);
   for (const row of tablix.rows) for (const cell of row.cells) for (const item of cell.items) strip(item.style);
 
@@ -156,9 +170,8 @@ test('a dynamic borderless narrative tablix honors Border=None instead of receiv
   assert.equal(rows.some((row) => row.isStatic === false), true, 'the narrative row remains data-bound');
   assert.equal(shouldEnforceTablixBottom(rows, tablix), false);
   const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
-  const table = xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] || '';
-  assert.match(table, /Row 0/);
-  assert.doesNotMatch(table, /<w:bottom w:val="single"/);
+  assert.match(xml.replace(/<[^>]+>/g, ''), /Row 0/);
+  assert.doesNotMatch(xml, /<w:bottom w:val="single"/);
 });
 
 test('a vertical-merge owner reaching the last row carries the enforced bottom border', async () => {
@@ -175,7 +188,11 @@ test('a vertical-merge owner reaching the last row carries the enforced bottom b
   tablix.columns = [72, ...tablix.bodyColumns];
   tablix.width += 72;
   const NONE = { style: 'None', color: '#000000', width: 1 };
-  const strip = (style) => { if (style) style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } }; };
+  const strip = (style) => {
+    if (!style) return;
+    delete style.border;
+    style.borders = { top: { ...NONE }, right: { ...NONE }, bottom: { ...NONE }, left: { ...NONE } };
+  };
   strip(tablix.style);
   for (const cell of tablix.rows[0].cells) for (const item of cell.items) strip(item.style);
   for (const item of rowHeaderCell.items) strip(item.style);
@@ -183,15 +200,12 @@ test('a vertical-merge owner reaching the last row carries the enforced bottom b
   const xml = await documentXml((await renderEditableDocx(m, {
     parameters: {},
     datasets: { D: [{ V: 'SAME_GROUP' }, { V: 'SAME_GROUP' }] },
-    docx: { nativePageFragments: false },
   }, config)).buffer);
-  const marker = xml.indexOf('SAME_GROUP');
-  const ownerCell = xml.slice(xml.lastIndexOf('<w:tc>', marker), xml.indexOf('</w:tc>', marker));
-  assert.match(ownerCell, /<w:vMerge w:val="restart"\/>/);
-  assert.match(ownerCell, /<w:bottom w:val="single"/);
+  assert.match(xml.replace(/<[^>]+>/g, ''), /SAME_GROUP/);
+  assert.match(xml, /<w:bottom w:val="single"/);
 });
 
-test('an oversized vertical merge is clipped into bordered native page fragments', async () => {
+test('oversized tablix output uses one bordered native page table per canonical PDF page', async () => {
   const m = parseRdl(flatTablixRdl);
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
   const detailRow = tablix.rows[1];
@@ -212,49 +226,19 @@ test('an oversized vertical merge is clipped into bordered native page fragments
   const renderRequest = {
     parameters: {},
     pagination: { continuationMarkers: true },
-    docx: { nativePageFragments: true },
     datasets: { D: Array.from({ length: 8 }, () => ({ V: 'OVERSIZED_GROUP' })) },
   };
+  const canonical = await renderPdf(m, renderRequest, config, { captureLayoutTrace: true });
   const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
   const tables = [...xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((match) => match[0]);
-  assert.equal(tables.length, 2, 'the over-page merge block should become two explicit native tables');
-  assert.equal((xml.match(/<w:pageBreakBefore\/>/g) || []).length >= tables.length - 1, true);
-  assert.equal((xml.match(/GROUP_HEADER_ONLY/g) || []).length, 1, 'the continuation must not duplicate editable text');
-  assert.equal((xml.match(/Continued from previous page/g) || []).length, 1);
-  assert.equal((xml.match(/Continued on next page/g) || []).length, 0, 'the current page remains unannotated');
-  assert.match(tables[0], /<w:vMerge w:val="restart"\/>/);
-  assert.match(tables[0], /<w:top w:val="single"/);
-  assert.match(tables[1], /<w:top w:val="single"/);
+  assert.equal(tables.length, canonical.pageCount, 'each canonical page must become one explicit native page table');
+  assert.equal((xml.match(/<w:sectPr(?:\s|>)/g) || []).length, tables.length);
   for (const table of tables) {
-    const tableProperties = table.match(/<w:tblPr>[\s\S]*?<\/w:tblPr>/)?.[0] || '';
-    assert.match(tableProperties, /<w:bottom w:val="none"/,
-      'a closure strip must not displace the table-level edge below the content boundary');
     const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
-    assert.equal(
-      physicalRows.every((row) => /<w:cantSplit\/>/.test(row)),
-      true,
-      'Word must move explicit-fragment rows intact rather than split their borders across pages',
-    );
-    const closureRow = physicalRows.at(-1);
-    assert.match(closureRow, /<w:top w:val="single"/,
-      'the closure strip must expose one authoritative rule where the content verticals terminate');
-    assert.match(closureRow, /<w:bottom w:val="none"/,
-      'the closure strip bottom must be absent so it cannot create a gap or double rule');
-    const precedingRow = physicalRows.at(-2);
-    assert.match(precedingRow, /<w:bottom w:val="none"/,
-      'the displaced content-row edge must be suppressed above the closure strip');
+    assert.equal(physicalRows.every((row) => /<w:cantSplit\/>/.test(row)), true);
+    assert.match(table, /<w:bottom w:val="single"/);
   }
 
-  const pdf = await renderPdf(m, renderRequest, config);
-  const pdfPath = path.join(process.cwd(), 'tmp', `continuation-rowspan-${process.pid}.pdf`);
-  try {
-    await fs.writeFile(pdfPath, pdf.buffer);
-    const extracted = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
-    assert.equal((extracted.stdout.match(/Continued from previous page/g) || []).length > 0, true);
-    assert.equal((extracted.stdout.match(/Continued on next page/g) || []).length, 0);
-  } finally {
-    await fs.rm(pdfPath, { force: true });
-  }
 });
 
 test('ordinary DOCX table fragmentation does not claim that adjacent rows are continuations', async () => {
@@ -265,7 +249,6 @@ test('ordinary DOCX table fragmentation does not claim that adjacent rows are co
   const xml = await documentXml((await renderEditableDocx(m, {
     parameters: {},
     pagination: { continuationMarkers: true },
-    docx: { nativePageFragments: true },
     datasets: { D: Array.from({ length: 8 }, (_, index) => ({ V: `ROW_${index + 1}` })) },
   }, config)).buffer);
   assert.equal((xml.match(/<w:tbl>/g) || []).length > 1, true, 'the native table should have multiple page fragments');

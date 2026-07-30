@@ -75,8 +75,11 @@ test('nested tablix renders as native grids in PDF, editable DOCX, and XLSX REPO
   const docx = await renderEditableDocx(model, request, config);
   const zip = await JSZip.loadAsync(docx.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  assert.equal((documentXml.match(/<w:tbl[ >]/g) || []).length, 3);
-  for (const value of ['Alpha', 'Beta']) assert.match(documentXml, new RegExp(value));
+  assert.equal((documentXml.match(/<w:tbl[ >]/g) || []).length, 1);
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  for (const value of ['Alpha', 'Beta']) assert.match(nativeText, new RegExp(value));
 
   const xlsx = await renderExcel(model, request, config, null);
   const workbook = new ExcelJS.Workbook();

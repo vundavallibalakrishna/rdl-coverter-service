@@ -39,8 +39,6 @@ process.on('message', async (message) => {
       totalRows: validation.totalRows + subreports.bundledRows,
       layoutMode: rendered.layoutMode,
       editableTextRatio: rendered.editableTextRatio,
-      docxProfile: rendered.docxProfile,
-      docxNativePageFragments: rendered.docxNativePageFragments,
       sceneStats: rendered.sceneStats,
       // Which declared families could not draw some run and what drew it instead. A coverage substitution
       // is deliberate but still a deviation from the report's declared styling, so it is reported rather

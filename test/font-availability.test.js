@@ -8,7 +8,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { buildApp } from '../src/app.js';
-import { fontAvailability, pdfFont, resolveFontFile, takeFontSubstitutions } from '../src/render/fonts.js';
+import { fontAvailability, pdfFont, resolveFontFile, renderableGlyphText, takeFontSubstitutions } from '../src/render/fonts.js';
 import { loadConfig } from '../src/config.js';
 
 // A real, parseable font file from this host, whatever it happens to have. The glyph-coverage tests need
@@ -38,6 +38,14 @@ async function withEnv(name, value, fn) {
 }
 
 const ALL_VARIANTS = ['bold', 'bolditalic', 'italic', 'regular'];
+
+test('font coverage ignores layout controls while retaining every visible glyph', () => {
+  assert.equal(
+    renderableGlyphText(`Line 1\n\tLine 2\uFEFF\u200D\uFE0F`),
+    'Line 1Line 2',
+  );
+  assert.equal(renderableGlyphText('• Assurance 😊'), '• Assurance 😊');
+});
 
 test('fontAvailability marks an absent declared family unavailable with every variant missing', () => {
   const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });

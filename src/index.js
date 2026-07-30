@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import { loadConfig } from './config.js';
 import { ServiceError } from './errors.js';
 import { analyzeParsedRdl, analyzeRdl, parseRdl } from './rdl/parser.js';
-import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
+import { analyzeWindowsWordCompatibility } from './render/windowsWordCompatibility.js';
 import { RenderRunner } from './worker/runner.js';
 
 export { buildApp } from './app.js';
@@ -13,7 +13,7 @@ export { loadConfig } from './config.js';
 export { ServiceError, toServiceError } from './errors.js';
 export { analyzeParsedRdl, analyzeRdl, parseRdl } from './rdl/parser.js';
 export { OUTPUTS } from './render/index.js';
-export { analyzeStructuredEditableCompatibility, shouldUseNativePageFragments } from './render/structuredCompatibility.js';
+export { analyzeWindowsWordCompatibility } from './render/windowsWordCompatibility.js';
 export { RenderRunner } from './worker/runner.js';
 export { checkFonts } from './render/fonts.js';
 export { readiness } from './readiness.js';
@@ -60,7 +60,7 @@ export async function createConverter(options = {}) {
         maxXmlDepth: config.maxXmlDepth,
       });
       const result = analyzeParsedRdl(model);
-      result.structuredEditable = analyzeStructuredEditableCompatibility(model, config);
+      result.windowsWordEditable = analyzeWindowsWordCompatibility(model, config);
       return result;
     },
 
@@ -72,7 +72,8 @@ export async function createConverter(options = {}) {
      *   `datasets` values are arrays of row objects keyed by exact RDL `DataField` names.
      *   `subreports` maps child ReportName to its base64 RDL and invocation-scoped rows.
      * @returns {Promise<{ buffer: Buffer, mimeType: string, extension: string,
-     *   pageCount: number|null, size: number, totalRows: number }>}
+     *   pageCount: number|null, size: number, totalRows: number, layoutMode?: string,
+     *   editableTextRatio?: number }>}
      */
     async render({ rdl, signal, ...request }) {
       return runner.render({ rdlBuffer: toBuffer(rdl), request, signal });

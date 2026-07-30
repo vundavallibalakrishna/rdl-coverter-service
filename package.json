@@ -15,6 +15,8 @@
   "files": [
     "src/",
     "docs/",
+    "skills/",
+    "scripts/certify-windows-word.js",
     "README.md",
     "AGENTS.md",
     "CLAUDE.md",
@@ -31,8 +33,7 @@
     "generate:samples": "node scripts/generate-sample-requests.js",
     "smoke:sample": "node scripts/render-sample.js",
     "verify:reference": "node scripts/verify-reference-sample.js",
-    "certify:docx": "node scripts/certify-docx-profile.js",
-    "collect:docx-profiles": "node scripts/collect-docx-profiles.js",
+    "certify:windows-word": "node scripts/certify-windows-word.js",
     "verify:local-summary": "node scripts/local-readiness-summary.js",
     "verify:stress": "node scripts/stress-certification.js",
     "verify:stress:nested": "node scripts/stress-certification.js --nested",

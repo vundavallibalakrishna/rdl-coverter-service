@@ -70,7 +70,7 @@ test('the Combined Assurance hydration consumes its certified row-header, style,
   assert.equal(Math.round(model.page.height * 100) / 100, 595.28);
 });
 
-test('the client Combined Assurance sample declares all three static tablix rows as repeating headers', {
+test('the client Combined Assurance sample declares its two static tablix rows as repeating headers', {
   skip: hasSamples('Combined Assurance Reports Excel.rdl', 'combined-assurance-excel-request.json') ? false : MISSING_SAMPLES,
 }, async () => {
   const [rdl, requestText] = await Promise.all([
@@ -84,8 +84,11 @@ test('the client Combined Assurance sample declares all three static tablix rows
 
   assert.deepEqual(
     assurance.rowMembers.slice(0, 3).map((member) => ({ repeatOnNewPage: member.repeatOnNewPage, keepWithGroup: member.keepWithGroup })),
-    Array.from({ length: 3 }, () => ({ repeatOnNewPage: true, keepWithGroup: 'After' })),
+    [
+      { repeatOnNewPage: true, keepWithGroup: 'After' },
+      { repeatOnNewPage: true, keepWithGroup: 'After' },
+      { repeatOnNewPage: false, keepWithGroup: 'None' },
+    ],
   );
-  assert.deepEqual(rows.slice(0, 3).map((row) => row.isHeader), [true, true, true]);
-  assert.equal(rows[3].isHeader, false);
+  assert.deepEqual(rows.slice(0, 3).map((row) => row.isHeader), [true, true, false]);
 });

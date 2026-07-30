@@ -127,10 +127,10 @@ export function resolveBundledSubreports(model, request, config) {
   ], (item) => {
     if (item.type === 'Subreport') hasSubreports = true;
   });
-  if (hasSubreports && !['PDF', 'DOCX_VISUAL'].includes(String(request.output || '').toUpperCase())) {
+  if (hasSubreports && !['PDF', 'DOCX_VISUAL', 'DOCX_EDITABLE'].includes(String(request.output || '').toUpperCase())) {
     throw new ServiceError(
       'UNSUPPORTED_FEATURE',
-      'Bundled subreports are supported only for PDF and visual DOCX output',
+      'Bundled subreports are supported only for PDF and DOCX output',
       400,
       { features: ['Subreport'] },
     );

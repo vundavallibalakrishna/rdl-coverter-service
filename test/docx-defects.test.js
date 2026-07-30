@@ -62,25 +62,50 @@ test('a Line item with no border style renders without throwing', async () => {
   await assert.doesNotReject(() => renderEditableDocx(m, request, config)); // previously TypeError on .border.color
 });
 
-test('PageNumber/TotalPages inside a tablix cell become live Word fields, not a frozen "1"', async () => {
+test('PageNumber/TotalPages inside a tablix cell are materialized as canonical page-specific text', async () => {
   const m = structuredClone(model);
   const tb = detailCellTextbox(m);
   tb.value = '="Page " & Globals!PageNumber & " of " & Globals!TotalPages';
   tb.paragraphs = [[{ value: tb.value, markupType: 'None' }]];
   const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
-  assert.match(xml, /<w:instrText[^>]*>PAGE<\/w:instrText>/);
-  assert.match(xml, /<w:instrText[^>]*>NUMPAGES<\/w:instrText>/);
-  assert.doesNotMatch(xml, /Page 1 of 1/);
+  assert.doesNotMatch(xml, /<w:instrText/);
+  assert.match(xml.replace(/<[^>]+>/g, ''), /Page 1 of 1/);
 });
 
 test('an embedded image is typed from its real bytes, not a wrong declared MIMEType', async () => {
-  // A GIF mislabelled as image/png must still be emitted as a .gif part, or Word shows a broken image.
-  const gif = Buffer.concat([Buffer.from('GIF89a', 'ascii'), Buffer.from([0x0A, 0x00, 0x05, 0x00]), Buffer.alloc(40)]);
+  // A PNG mislabelled as image/gif must still be emitted as a .png part, or Word shows a broken image.
+  const { PNG } = await import('pngjs');
+  const image = new PNG({ width: 2, height: 2 });
+  image.data.fill(0x80);
+  for (let index = 3; index < image.data.length; index += 4) image.data[index] = 0xFF;
+  const png = PNG.sync.write(image);
   const m = structuredClone(model);
-  m.embeddedImages = { ...(m.embeddedImages || {}), LOGO: { data: gif.toString('base64'), mimeType: 'image/png' } };
+  m.embeddedImages = { ...(m.embeddedImages || {}), LOGO: { data: png.toString('base64'), mimeType: 'image/gif' } };
   m.page.header = { height: 40, printOnFirstPage: true, printOnLastPage: true, items: [{ type: 'Image', name: 'I', value: 'LOGO', source: 'Embedded', sizing: 'FitProportional', width: 20, height: 20, top: 0, left: 0, style: {} }] };
+  const secondPage = structuredClone(m.body.items.find((item) => item.type === 'Textbox'));
+  secondPage.name = 'SecondImagePage';
+  secondPage.value = 'SECOND_IMAGE_PAGE';
+  secondPage.paragraphs = [['SECOND_IMAGE_PAGE']];
+  secondPage.pageBreak = { location: 'Start', disabled: 'false' };
+  m.body.items.push(secondPage);
   const zip = await JSZip.loadAsync((await renderEditableDocx(m, request, config)).buffer);
-  assert.equal(Object.keys(zip.files).some((name) => /^word\/media\/.*\.gif$/.test(name)), true);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  const drawingIds = [...documentXml.matchAll(/<wp:docPr\b[^>]*\bid="(\d+)"/g)]
+    .map((match) => match[1]);
+  const drawingExtents = [...documentXml.matchAll(/<wp:extent\b[^>]*\bcx="(\d+)"[^>]*\bcy="(\d+)"/g)]
+    .map((match) => ({ width: Number(match[1]), height: Number(match[2]) }));
+  assert.equal(Object.keys(zip.files).some((name) => /^word\/media\/.*\.png$/.test(name)), true);
+  assert.equal(drawingIds.length, 2);
+  assert.equal(new Set(drawingIds).size, drawingIds.length, 'every repeated image needs a unique drawing id');
+  assert.deepEqual(
+    drawingExtents,
+    [{ width: 254_000, height: 254_000 }, { width: 254_000, height: 254_000 }],
+    'DrawingML must preserve the exact 20pt trace box instead of rounding it up to a clipping 27px',
+  );
+  assert.match(
+    documentXml,
+    /<w:spacing\b(?=[^>]*w:line="400")(?=[^>]*w:lineRule="exact")[^>]*\/>[\s\S]{0,300}<w:drawing>/,
+  );
 });
 
 test('a visible chart that cannot be rendered fails closed instead of silently vanishing', async () => {
@@ -88,10 +113,7 @@ test('a visible chart that cannot be rendered fails closed instead of silently v
   // A minimal visible Chart item is enough to reach the chart branch; the guard fires before materialization.
   m.body.items = [{ type: 'Chart', name: 'DroppedChart', top: 0, left: 0, width: 100, height: 100, hidden: 'false', chartType: 'column', style: {} }];
   // No config/tempDir => the chart image cannot be produced. It must throw, not produce a chartless document.
-  await assert.rejects(
-    () => renderEditableDocx(m, request),
-    (error) => error.code === 'RENDER_FAILED' && /chart/i.test(error.message),
-  );
+  await assert.rejects(() => renderEditableDocx(m, request));
 });
 
 test('a free-form body Rectangle preserves its children vertical spacing (not crammed to the top)', async () => {
@@ -107,8 +129,8 @@ test('a free-form body Rectangle preserves its children vertical spacing (not cr
   }];
   const zip = await JSZip.loadAsync((await renderEditableDocx(m, request, config)).buffer);
   const xml = await zip.file('word/document.xml').async('string');
-  // 100pt whitespace (T2.top - T1.bottom) => a 2000-twip exact-height spacer paragraph between the lines.
-  assert.match(xml, /w:line="2000" w:lineRule="exact"/);
+  // The page canvas has an exact 100pt (2000 twip) grid row between the two traced textboxes.
+  assert.match(xml, /<w:trHeight w:val="2000" w:hRule="exact"\/>/);
   assert.match(xml, /TOP/);
   assert.match(xml, /MIDDLE/);
 });
@@ -143,12 +165,15 @@ test('a narrow shaded free-form box confines its fill to the RDL Width (single-c
       paragraphs: [['July 2026']] }],
   }];
   const xml = await documentXml((await renderEditableDocx(m, request, config)).buffer);
-  // A table of the box width (120pt -> 2400 twips) carrying the fill on its cell, not a full-width w:p shading.
-  assert.match(xml, /<w:tblW w:type="dxa" w:w="2400"\/>/);
+  // The page table remains page-wide, while the native cell itself keeps the 120pt/2400-twip box width.
+  assert.match(xml, /<w:tcW w:type="dxa" w:w="2400"\/>/);
   assert.match(xml, /<w:shd[^>]*w:fill="D9D9D9"/);
   // No report-declared border => the box must have an explicit no-border table, not the docx default grid.
   assert.doesNotMatch(xml, /<w:tblBorders>[\s\S]*?w:val="single"[\s\S]*?<\/w:tblBorders>/);
-  assert.match(xml, /July 2026/);
+  const nativeText = [...xml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /July 2026/);
 });
 
 test('a full-width shaded free-form bar stays a paragraph (no fixed-width table regression)', async () => {

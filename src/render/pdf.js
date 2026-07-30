@@ -2,15 +2,49 @@ import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
 import { CONTINUATION_MARKERS, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
-import { pdfFont } from './fonts.js';
+import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { drawChart } from './chart.js';
+import {
+  attachLayoutTrace,
+  beginLayoutTracePage,
+  createLayoutTrace,
+  finalizeLayoutTrace,
+  recordLayoutItem,
+  selectLayoutTracePage,
+} from './layoutTrace.js';
 
 // Minimum border stroke width (points), set from config at the start of each render. A floor lets thin
 // 1pt hairlines render at a crisp, uniform weight instead of rounding unevenly across screen zoom levels.
 let borderWidthFloor = 0;
+const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
+
+function containerLayoutBands(items) {
+  const ordered = [...items].sort((left, right) => (
+    (left.top || 0) - (right.top || 0)
+    || (left.left || 0) - (right.left || 0)
+    || (left.zIndex || 0) - (right.zIndex || 0)
+  ));
+  const bands = [];
+  for (const item of ordered) {
+    const top = item.top || 0;
+    const bottom = top + (item.height || 0);
+    const band = bands[bands.length - 1];
+    const coincidentTop = band
+      && Math.abs(top - band.top) <= COINCIDENT_EDGE_TOLERANCE_PT;
+    const overlapsBand = band
+      && top < band.designBottom - COINCIDENT_EDGE_TOLERANCE_PT;
+    if (!band || (!coincidentTop && !overlapsBand)) {
+      bands.push({ top, designBottom: bottom, items: [item] });
+      continue;
+    }
+    band.designBottom = Math.max(band.designBottom, bottom);
+    band.items.push(item);
+  }
+  return bands;
+}
 
 function collectDocument(doc) {
   return new Promise((resolve, reject) => {
@@ -25,6 +59,146 @@ function applyFont(doc, config, style, context = {}, text = '') {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
   doc.font(pdfFont(config, styleValue(style.fontFamily, context, 'Arial'), bold, italic, text)).fontSize(styleSize(style.fontSize, context, 10) || 10).fillColor(styleColor(style.color, context));
+}
+
+function resolvedTraceFont(config, style, context, text = '') {
+  const bold = /bold|600|700|800|900/i.test(String(styleValue(style?.fontWeight, context, 'Normal')));
+  const italic = /italic/i.test(String(styleValue(style?.fontStyle, context, 'Normal')));
+  const family = String(styleValue(style?.fontFamily, context, 'Arial'));
+  const file = pdfFont(config, family, bold, italic, text);
+  const size = styleSize(style?.fontSize, context, 10) || 10;
+  return {
+    family,
+    file,
+    size,
+    bold,
+    italic,
+    underline: /underline/i.test(String(styleValue(style?.textDecoration, context, 'None'))),
+    strike: /line.?through/i.test(String(styleValue(style?.textDecoration, context, 'None'))),
+    color: styleColor(style?.color, context, '#000000'),
+    metrics: fontVerticalMetrics(file, size),
+  };
+}
+
+function resolvedTraceBorder(border, context = {}) {
+  if (!border) return null;
+  const style = String(styleValue(border.style, context, 'None'));
+  const width = styleSize(border.width, context, 1);
+  const borderColor = styleColor(border.color, context, '#000000');
+  if (/^none$/i.test(style) || !borderColor || width <= 0) return null;
+  return { style, width, color: borderColor };
+}
+
+function resolvedTraceBorders(style, context = {}, explicitEdges = null) {
+  if (explicitEdges) {
+    return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => {
+      const edge = explicitEdges[side];
+      return [side, edge ? resolvedTraceBorder(edge.border, edge.context || context) : null];
+    }));
+  }
+  const sides = style?.borders || (style?.border
+    ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
+    : {});
+  return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => (
+    [side, resolvedTraceBorder(sides?.[side], context)]
+  )));
+}
+
+function traceTextbox(doc, config, item, x, y, context, details) {
+  if (details.trace === false) return;
+  const layout = details.styledLayout;
+  const fallbackFont = resolvedTraceFont(config, item.style || {}, context, details.text);
+  let lineOffset = details.localTextY || 0;
+  const innerWidth = Math.max(1, details.width - details.padding.left - details.padding.right);
+  const lines = layout?.lines?.map((line) => {
+    const alignment = String(
+      styleValue(line.paragraphStyle?.textAlign ?? item.style?.textAlign, context, 'left'),
+    ).toLowerCase();
+    const alignedOffset = alignment === 'center'
+      ? Math.max(0, (innerWidth - line.width) / 2)
+      : alignment === 'right'
+        ? Math.max(0, innerWidth - line.width)
+        : 0;
+    const spaces = line.runs.reduce((count, run) => count + ((run.text.match(/ /g) || []).length), 0);
+    const justifyExtra = alignment === 'justify' && !line.paragraphEnd && spaces > 0
+      ? Math.max(0, innerWidth - line.width) / spaces
+      : 0;
+    const absoluteTextTop = y + details.padding.top + lineOffset + line.before;
+    let runX = x + details.padding.left + alignedOffset;
+    const runs = line.runs.map((run) => {
+      const font = resolvedTraceFont(config, run.style || item.style || {}, context, run.text);
+      const tracedRun = {
+        text: run.text,
+        x: runX,
+        y: absoluteTextTop,
+        baseline: font.metrics ? absoluteTextTop + font.metrics.ascender : null,
+        width: run.width,
+        font,
+      };
+      runX += run.width + justifyExtra * ((run.text.match(/ /g) || []).length);
+      return tracedRun;
+    });
+    const traced = {
+      width: line.width,
+      height: line.height,
+      contentHeight: line.contentHeight,
+      before: line.before,
+      after: line.after,
+      top: details.padding.top + lineOffset,
+      textTop: details.padding.top + lineOffset + line.before,
+      x: x + details.padding.left + alignedOffset,
+      y: absoluteTextTop,
+      baseline: runs.length > 0 ? Math.max(...runs.map((run) => run.baseline || absoluteTextTop)) : absoluteTextTop,
+      paragraphEnd: line.paragraphEnd,
+      wrapped: !line.paragraphEnd,
+      alignment,
+      runs,
+    };
+    lineOffset += line.height;
+    return traced;
+  }) || String(details.text ?? '').split('\n').map((text, index) => {
+    const contentHeight = fallbackFont.size * 1.2;
+    const textTop = details.padding.top + (details.localTextY || 0) + index * contentHeight;
+    const absoluteTextTop = y + textTop;
+    const runX = x + details.padding.left;
+    const baseline = fallbackFont.metrics
+      ? absoluteTextTop + fallbackFont.metrics.ascender
+      : absoluteTextTop;
+    return {
+      width: null,
+      height: contentHeight,
+      contentHeight,
+      before: 0,
+      after: 0,
+      top: textTop,
+      textTop,
+      x: runX,
+      y: absoluteTextTop,
+      baseline,
+      paragraphEnd: true,
+      wrapped: false,
+      alignment: String(styleValue(item.style?.textAlign, context, 'left')).toLowerCase(),
+      runs: [{ text, x: runX, y: absoluteTextTop, baseline, width: null, font: fallbackFont }],
+    };
+  });
+  recordLayoutItem(doc, {
+    kind: details.traceMeta?.kind || 'textbox',
+    itemName: item.name || null,
+    zIndex: item.zIndex || 0,
+    x,
+    y,
+    width: details.width,
+    height: details.height,
+    text: String(details.text ?? ''),
+    lines,
+    writingMode: details.writingMode,
+    verticalAlign: String(styleValue(item.style?.verticalAlign, context, 'top')).toLowerCase(),
+    padding: details.padding,
+    textOffsetY: details.localTextY || 0,
+    backgroundColor: styleColor(item.style?.backgroundColor, context, null),
+    borders: resolvedTraceBorders(item.style, context, details.traceEdges),
+    ...details.traceMeta,
+  });
 }
 
 function drawBorderEdge(doc, x, y, width, height, side, border, context = {}) {
@@ -278,6 +452,23 @@ function drawTextbox(doc, config, item, x, y, context, override = {}) {
   let localTextY = 0;
   if (/middle|center/.test(verticalAlign)) localTextY = Math.max(0, (layoutHeight - measuredHeight) / 2);
   if (/bottom/.test(verticalAlign)) localTextY = Math.max(0, layoutHeight - measuredHeight);
+  traceTextbox(doc, config, item, x, y, context, {
+    trace: override.trace,
+    traceMeta: override.traceMeta,
+    traceEdges: override.traceEdges,
+    width,
+    height,
+    text,
+    styledLayout,
+    writingMode,
+    padding: {
+      top: padTop,
+      right: padRight,
+      bottom: padBottom,
+      left: paddingLeft,
+    },
+    localTextY,
+  });
   // Clip text to the cell box so it can never bleed into an adjacent cell or, when the cell is
   // clamped at the page/footer boundary, into the reserved footer band. Background and borders are
   // drawn above (unclipped) so their edges stay crisp.
@@ -316,6 +507,17 @@ function drawImage(doc, model, item, x, y, context = {}) {
   const image = model.embeddedImages[styleValue(item.value, context, item.value)];
   if (!image?.data) return;
   const data = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
+  recordLayoutItem(doc, {
+    kind: 'image',
+    itemName: item.name || null,
+    embeddedImage: styleValue(item.value, context, item.value),
+    sizing: String(styleValue(item.sizing, context, 'FitProportional') || 'FitProportional'),
+    zIndex: item.zIndex || 0,
+    x,
+    y,
+    width: item.width,
+    height: item.height,
+  });
   // Honour the RDL Image Sizing. FitProportional (the RDL default) scales to fit the box while keeping
   // aspect; Fit stretches to fill the box exactly (SSRS behaviour — the box, not the source, wins);
   // Clip draws at native size clipped to the box; AutoSize draws at native size.
@@ -338,11 +540,45 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
   if (item.type === 'Textbox') drawTextbox(doc, config, item, x, y, context);
   else if (item.type === 'Chart') {
     const data = materializeChart(item, context.datasets || {}, context.parameters || {}, context.globals || {});
+    recordLayoutItem(doc, {
+      kind: 'chart',
+      itemName: item.name || null,
+      zIndex: item.zIndex || 0,
+      x,
+      y,
+      width: item.width,
+      height: item.height,
+    });
     drawChart(doc, config, item, data, x, y, item.width, item.height, context);
   } else if (item.type === 'Image') drawImage(doc, model, item, x, y, context);
-  else if (item.type === 'Line') doc.save().lineWidth(styleSize(item.style?.border?.width, context, 1) || 1).strokeColor(styleColor(item.style?.border?.color, context, '#000000')).moveTo(x, y).lineTo(x + item.width, y + item.height).stroke().restore();
+  else if (item.type === 'Line') {
+    const lineWidth = styleSize(item.style?.border?.width, context, 1) || 1;
+    const lineColor = styleColor(item.style?.border?.color, context, '#000000');
+    recordLayoutItem(doc, {
+      kind: 'line',
+      itemName: item.name || null,
+      zIndex: item.zIndex || 0,
+      x,
+      y,
+      width: item.width,
+      height: item.height,
+      line: { width: lineWidth, color: lineColor },
+    });
+    doc.save().lineWidth(lineWidth).strokeColor(lineColor).moveTo(x, y).lineTo(x + item.width, y + item.height).stroke().restore();
+  }
   else if (item.type === 'Rectangle') {
     const backgroundColor = styleColor(item.style.backgroundColor, context, null);
+    recordLayoutItem(doc, {
+      kind: 'rectangle',
+      itemName: item.name || null,
+      zIndex: item.zIndex || 0,
+      x,
+      y,
+      width: item.width,
+      height: item.height,
+      backgroundColor,
+      borders: resolvedTraceBorders(item.style, context),
+    });
     if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
     drawBorder(doc, x, y, item.width, item.height, item.style, context);
     for (const child of [...item.items].sort((left, right) => left.zIndex - right.zIndex || left.top - right.top || left.left - right.left)) {
@@ -485,22 +721,26 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // pieces of each identical line into maximal runs and stroke each run exactly once — the way SSRS draws.
   const posKey = (v) => Math.round(v * 4); // 0.25pt precision so coincident edges match
   let pendingEdges = [];
-  const collectEdge = (x, y, width, height, side, border, context) => {
+  const collectEdge = (x, y, width, height, side, border, context, traceMeta = null) => {
     if (!border) return;
     const vertical = side === 'left' || side === 'right';
     const pos = vertical ? (side === 'right' ? x + width : x) : (side === 'bottom' ? y + height : y);
     const [a, b] = vertical ? [y, y + height] : [x, x + width];
     const sig = `${styleValue(border.style, context, 'None')}|${styleColor(border.color, context, null)}|${styleSize(border.width, context, 1)}`;
-    pendingEdges.push({ orient: vertical ? 'V' : 'H', pos, a, b, border, context, sig });
+    pendingEdges.push({
+      orient: vertical ? 'V' : 'H', pos, a, b, border, context, sig, traceMeta,
+    });
   };
   const flushEdges = () => {
     const groups = new Map();
     for (const edge of pendingEdges) {
       const key = `${edge.orient}|${posKey(edge.pos)}|${edge.sig}`;
-      if (!groups.has(key)) groups.set(key, { edge, intervals: [] });
-      groups.get(key).intervals.push([edge.a, edge.b]);
+      if (!groups.has(key)) groups.set(key, { edge, intervals: [], traceMeta: null });
+      const group = groups.get(key);
+      group.intervals.push([edge.a, edge.b]);
+      if (edge.traceMeta) group.traceMeta = edge.traceMeta;
     }
-    for (const { edge, intervals } of groups.values()) {
+    for (const { edge, intervals, traceMeta } of groups.values()) {
       intervals.sort((p, q) => p[0] - q[0]);
       let [runStart, runEnd] = intervals[0];
       const runs = [];
@@ -511,7 +751,31 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }
       runs.push([runStart, runEnd]);
       for (const [s, e] of runs) {
-        if (edge.orient === 'V') drawBorderEdge(doc, edge.pos, s, 0, e - s, 'left', edge.border, edge.context);
+        const vertical = edge.orient === 'V';
+        if (traceMeta && !/^none$/i.test(String(styleValue(edge.border.style, edge.context, 'None')))) {
+          // Record the exact outer fragment stroke produced by the PDF shared-edge resolver. Cell-level
+          // metadata cannot describe a synthesized fragment closure (notably the mandatory bottom edge
+          // of a data tablix), while recording every internal stroke would incorrectly turn nested-grid
+          // borders into free-standing lines. These records are trace-only and cannot change PDF output.
+          recordLayoutItem(doc, {
+            kind: 'line',
+            itemName: item.name || null,
+            tablixName: item.name || null,
+            traceRole: 'resolvedTablixFragmentBorder',
+            fragmentSide: traceMeta.side,
+            zIndex: item.zIndex || 0,
+            x: vertical ? edge.pos : s,
+            y: vertical ? s : edge.pos,
+            width: vertical ? 0 : e - s,
+            height: vertical ? e - s : 0,
+            line: {
+              style: styleValue(edge.border.style, edge.context, 'None'),
+              color: styleColor(edge.border.color, edge.context, '#000000'),
+              width: styleSize(edge.border.width, edge.context, 1),
+            },
+          });
+        }
+        if (vertical) drawBorderEdge(doc, edge.pos, s, 0, e - s, 'left', edge.border, edge.context);
         else drawBorderEdge(doc, s, edge.pos, e - s, 0, 'top', edge.border, edge.context);
       }
     }
@@ -595,6 +859,48 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
             height,
             text: cellText(cell),
             skipBorder: true,
+            traceEdges: Object.fromEntries(
+              ['top', 'right', 'bottom', 'left'].map((side) => {
+                const border = style.borders?.[side];
+                return [side, border && !/^none$/i.test(String(styleValue(border.style, context, 'None')))
+                  ? { border, context }
+                  : null];
+              }),
+            ),
+            traceMeta: {
+              kind: 'tablixCell',
+              tablixName: nested.item.name || null,
+              rowIndex,
+              columnIndex,
+              colSpan,
+              rowSpan,
+              repeatedHeader: Boolean(row.isHeader),
+              nested: true,
+            },
+          });
+        } else {
+          recordLayoutItem(doc, {
+            kind: 'tablixCell',
+            itemName: null,
+            tablixName: nested.item.name || null,
+            rowIndex,
+            columnIndex,
+            colSpan,
+            rowSpan,
+            repeatedHeader: Boolean(row.isHeader),
+            nested: true,
+            zIndex: nested.item.zIndex || 0,
+            x,
+            y: cellY,
+            width,
+            height,
+            text: '',
+            lines: [],
+            writingMode: 'default',
+            verticalAlign: 'top',
+            padding: { top: 0, right: 0, bottom: 0, left: 0 },
+            backgroundColor: background,
+            borders: resolvedTraceBorders(style, context),
           });
         }
         const borders = style.borders || {};
@@ -639,13 +945,30 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
 
   const closeOuterBorderFragment = (endY) => {
     const fragmentHeight = Math.max(0, endY - fragmentStartY);
-    if (firstFragment) collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'top', item.style?.borders?.top, outerContext);
-    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'left', item.style?.borders?.left, outerContext);
-    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'right', item.style?.borders?.right, outerContext);
+    if (firstFragment) collectEdge(
+      startX, fragmentStartY, totalWidth, fragmentHeight, 'top',
+      item.style?.borders?.top, outerContext, { side: 'top' },
+    );
+    collectEdge(
+      startX, fragmentStartY, totalWidth, fragmentHeight, 'left',
+      item.style?.borders?.left, outerContext, { side: 'left' },
+    );
+    collectEdge(
+      startX, fragmentStartY, totalWidth, fragmentHeight, 'right',
+      item.style?.borders?.right, outerContext, { side: 'right' },
+    );
     // Data fragments always close, including overflow pages. Static layout tablixes instead honor the
     // declared bottom edge, so Border=None cannot create a decorative rule after headings or prose.
-    collectEdge(startX, fragmentStartY, totalWidth, fragmentHeight, 'bottom', enforceBottomClosure
-      ? enforcedBottomBorder(item.style) : item.style?.borders?.bottom, outerContext);
+    collectEdge(
+      startX,
+      fragmentStartY,
+      totalWidth,
+      fragmentHeight,
+      'bottom',
+      enforceBottomClosure ? enforcedBottomBorder(item.style) : item.style?.borders?.bottom,
+      outerContext,
+      { side: 'bottom' },
+    );
     firstFragment = false;
     flushEdges(); // draw this page fragment's borders as merged, single strokes
   };
@@ -683,7 +1006,47 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (span.textbox && !span.cell.hidden) {
       const { head, tail } = splitTextForHeight(doc, config, span.textbox, span.context, span.text, span.width, segmentHeight);
       if (tail && tail.length > 0) span.pendingTail = tail;
-      drawTextbox(doc, config, span.textbox, span.x, span.segStartY, span.context, { width: span.width, height: segmentHeight, text: head, skipBorder: true });
+      drawTextbox(doc, config, span.textbox, span.x, span.segStartY, span.context, {
+        width: span.width,
+        height: segmentHeight,
+        text: head,
+        skipBorder: true,
+        traceEdges: span.edges,
+        traceMeta: {
+          kind: 'tablixCell',
+          tablixName: item.name || null,
+          rowIndex: span.rowIndex,
+          columnIndex: span.columnIndex,
+          colSpan: span.colSpan,
+          rowSpan: span.rowSpan,
+          repeatedHeader: Boolean(span.sourceRow?.isHeader),
+          continuation: span.segStartY !== span.firstSegmentY,
+        },
+      });
+    } else {
+      recordLayoutItem(doc, {
+        kind: 'tablixCell',
+        itemName: null,
+        tablixName: item.name || null,
+        rowIndex: span.rowIndex,
+        columnIndex: span.columnIndex,
+        colSpan: span.colSpan,
+        rowSpan: span.rowSpan,
+        repeatedHeader: Boolean(span.sourceRow?.isHeader),
+        continuation: span.segStartY !== span.firstSegmentY,
+        zIndex: item.zIndex || 0,
+        x: span.x,
+        y: span.segStartY,
+        width: span.width,
+        height: segmentHeight,
+        text: '',
+        lines: [],
+        writingMode: 'default',
+        verticalAlign: 'top',
+        padding: { top: 0, right: 0, bottom: 0, left: 0 },
+        backgroundColor: styleColor(item.style?.backgroundColor, span.context, null),
+        borders: resolvedTraceBorders(item.style, span.context, span.edges),
+      });
     }
     // A nested data region can live in a row-header cell whose owning group spans several physical parent
     // rows. Those cells are rendered lazily by this open-span path, so drawing nested regions only from
@@ -738,6 +1101,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           segStartY: y,
           endRowIndex: rowIndex + (cell.rowSpan || 1) - 1,
           sourceRow: row,
+          rowIndex,
+          columnIndex,
+          colSpan: span,
+          rowSpan: cell.rowSpan || 1,
+          firstSegmentY: y,
           nestedTablixes: cell.nestedTablixes || [],
           nestedDrawn: false,
         });
@@ -747,7 +1115,49 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       if (renderedHeight <= 0) continue;
       // Recursive (parent/child) groups render expanded with the first cell indented by depth.
       const padLeft = index === 0 && row.indentLevel ? row.indentLevel * 12 : 0;
-      if (textbox && !cell.hidden) drawTextbox(doc, config, textbox, x, y, cellContext, { width, height: renderedHeight, text: texts[index] || '', skipBorder: true, padLeft });
+      if (textbox && !cell.hidden) {
+        drawTextbox(doc, config, textbox, x, y, cellContext, {
+          width,
+          height: renderedHeight,
+          text: texts[index] || '',
+          skipBorder: true,
+          padLeft,
+          traceEdges: edges,
+          traceMeta: {
+            kind: 'tablixCell',
+            tablixName: item.name || null,
+            rowIndex,
+            columnIndex,
+            colSpan: span,
+            rowSpan: 1,
+            repeatedHeader: Boolean(row.isHeader),
+          },
+        });
+      } else {
+        const style = (cell.containerWrapped ? item.style : textbox?.style) || item.style || {};
+        recordLayoutItem(doc, {
+          kind: 'tablixCell',
+          itemName: null,
+          tablixName: item.name || null,
+          rowIndex,
+          columnIndex,
+          colSpan: span,
+          rowSpan: 1,
+          repeatedHeader: Boolean(row.isHeader),
+          zIndex: item.zIndex || 0,
+          x,
+          y,
+          width,
+          height: renderedHeight,
+          text: '',
+          lines: [],
+          writingMode: 'default',
+          verticalAlign: 'top',
+          padding: { top: 0, right: 0, bottom: 0, left: 0 },
+          backgroundColor: styleColor(style.backgroundColor, cellContext, null),
+          borders: resolvedTraceBorders(style, cellContext, edges),
+        });
+      }
       for (const nested of cell.nestedTablixes || []) drawNestedTablix(nested, x, y, width);
       drawEdges(x, y, width, renderedHeight, edges);
     }
@@ -914,9 +1324,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   return { height: Math.max(item.height, addedHeight), endY: y };
 }
 
-export async function renderPdf(model, request, config) {
+export async function renderPdf(model, request, config, options = {}) {
   borderWidthFloor = config?.borderWidthFloorPt || 0;
   const doc = new PDFDocument({ autoFirstPage: false, bufferPages: true, compress: true, info: { Title: request.outputFileName || model.name, Producer: 'RDL Converter Service' } });
+  const layoutTrace = options.captureLayoutTrace ? createLayoutTrace(model, request) : null;
+  attachLayoutTrace(doc, layoutTrace);
   const completion = collectDocument(doc);
   const page = model.page;
   const headerHeight = page.header?.height || 0;
@@ -927,6 +1339,18 @@ export async function renderPdf(model, request, config) {
   const addPage = () => {
     doc.addPage({ size: [page.width, page.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
     globals.PageNumber += 1;
+    beginLayoutTracePage(doc, {
+      width: page.width,
+      height: page.height,
+      marginTop: page.marginTop,
+      marginRight: page.marginRight,
+      marginBottom: page.marginBottom,
+      marginLeft: page.marginLeft,
+      headerHeight,
+      footerHeight,
+      bodyTop,
+      bodyBottom: pageBottom,
+    });
   };
   addPage.bodyTop = bodyTop;
   addPage();
@@ -1012,16 +1436,74 @@ export async function renderPdf(model, request, config) {
     }
     if (item.type === 'Rectangle') {
       const backgroundColor = styleColor(item.style.backgroundColor, context, null);
+      recordLayoutItem(doc, {
+        kind: 'rectangle',
+        itemName: item.name || null,
+        zIndex: item.zIndex || 0,
+        x,
+        y,
+        width: item.width,
+        height: item.height,
+        backgroundColor,
+        borders: resolvedTraceBorders(item.style, context),
+      });
       if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
       drawBorder(doc, x, y, item.width, item.height, item.style, context);
-      let endY = y + item.height;
-      for (const child of [...item.items].sort((left, right) => (
-        left.zIndex - right.zIndex || left.top - right.top || left.left - right.left
-      ))) {
-        const rendered = renderBodyItem(child, x + child.left, y + child.top, context);
-        endY = Math.max(endY, rendered.endY || y);
+      const visibleChildren = (item.items || []).filter((child) => !isHidden(child.hidden, context));
+      const bands = containerLayoutBands(visibleChildren);
+      let endY = y;
+      let previousDesignBottom = 0;
+      let hasRenderedBand = false;
+      for (const band of bands) {
+        const gap = hasRenderedBand ? Math.max(0, band.top - previousDesignBottom) : band.top;
+        let bandY = endY + gap;
+        const bandHeight = band.designBottom - band.top;
+        const fixedBand = band.items.every(isFixedCoordinateItem);
+        if (bandY >= pageBottom || (
+          fixedBand
+          && bandY + bandHeight > pageBottom
+          && endY > bodyTop + COINCIDENT_EDGE_TOLERANCE_PT
+        )) {
+          addPage();
+          bandY = bodyTop;
+        }
+        let bandEndY = bandY;
+        const pageNumberAtBandStart = globals.PageNumber;
+        for (const child of [...band.items].sort((left, right) => (
+          (left.zIndex || 0) - (right.zIndex || 0)
+          || (left.top || 0) - (right.top || 0)
+          || (left.left || 0) - (right.left || 0)
+        ))) {
+          const childY = bandY + (child.top || 0) - band.top;
+          const pageNumberBeforeChild = globals.PageNumber;
+          const rendered = renderBodyItem(child, x + (child.left || 0), childY, context);
+          if (band.items.length > 1 && globals.PageNumber !== pageNumberBeforeChild) {
+            throw new ServiceError(
+              'UNSUPPORTED_FEATURE',
+              `Overlapping or side-by-side items in rectangle ${item.name || 'unnamed'} cannot independently span pages`,
+              422,
+            );
+          }
+          bandEndY = Math.max(bandEndY, rendered.endY || childY);
+        }
+        if (band.items.length > 1 && globals.PageNumber !== pageNumberAtBandStart) {
+          throw new ServiceError(
+            'UNSUPPORTED_FEATURE',
+            `Overlapping or side-by-side items in rectangle ${item.name || 'unnamed'} cannot independently span pages`,
+            422,
+          );
+        }
+        endY = bandEndY;
+        previousDesignBottom = band.designBottom;
+        hasRenderedBand = true;
       }
-      return { height: Math.max(item.height, endY - y), endY };
+      if (hasRenderedBand) {
+        endY += Math.max(0, item.height - previousDesignBottom);
+      }
+      return {
+        height: Math.max(item.height, endY - y),
+        endY: hasRenderedBand ? endY : y + item.height,
+      };
     }
     drawSimpleItem(doc, config, model, item, x, y, context);
     return { height: item.height, endY: y + item.height };
@@ -1114,6 +1596,7 @@ export async function renderPdf(model, request, config) {
   globals.TotalPages = range.count;
   for (let index = 0; index < range.count; index += 1) {
     doc.switchToPage(range.start + index);
+    selectLayoutTracePage(doc, index);
     globals.PageNumber = index + 1;
     const context = { parameters: request.parameters || {}, globals, datasets, dataset: [], fields: {} };
     if (page.header && (index > 0 || page.header.printOnFirstPage) && (index < range.count - 1 || page.header.printOnLastPage)) {
@@ -1127,5 +1610,11 @@ export async function renderPdf(model, request, config) {
   doc.end();
   const buffer = await completion;
   const parsed = await PdfLibDocument.load(buffer);
-  return { buffer, pageCount: parsed.getPageCount(), mimeType: 'application/pdf', extension: 'pdf' };
+  return {
+    buffer,
+    pageCount: parsed.getPageCount(),
+    mimeType: 'application/pdf',
+    extension: 'pdf',
+    ...(layoutTrace ? { layoutTrace: finalizeLayoutTrace(layoutTrace) } : {}),
+  };
 }

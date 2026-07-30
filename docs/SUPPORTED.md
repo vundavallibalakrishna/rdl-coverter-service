@@ -32,16 +32,16 @@ ignored. They are never executed. See [LIMITATIONS.md](./LIMITATIONS.md#why-data
 This document is prose. The machine-readable catalogue is generated from Microsoft's published RDL schema:
 
 ```bash
-npm run audit:schema   # writes tmp/output/rdl-2016-capability-catalogue.json
+npm run audit:schema   # writes tmp/rdl-2016-capability-catalogue.json
 ```
 
 It currently classifies **695 declared names** — 691 elements and 4 attributes:
 
 | Status | Count |
 | --- | --- |
-| `SUPPORTED` | 160 |
+| `SUPPORTED` | 169 |
 | `METADATA_ONLY` | 62 |
-| `REJECTED` | 473 |
+| `REJECTED` | 464 |
 
 `POST /v1/analyze` classifies *your* RDL against this catalogue and returns every construct it uses, so you
 never have to guess whether a report will render — ask the service.
@@ -69,7 +69,7 @@ structure, not SSRS/VB runtime semantics. That distinction is also the origin of
 | `Image` | **`Source=Embedded` only.** `Sizing`: `Fit`, `FitProportional`, `Clip`, `AutoSize` |
 | `Line` | Body level only |
 | `Chart` | See [Charts](#charts) |
-| `Subreport` | `PDF` / `DOCX_VISUAL` only, with caller-bundled child RDL and invocation-scoped datasets; tablix-only child body |
+| `Subreport` | `PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL`, with caller-bundled child RDL and invocation-scoped datasets; tablix-only child body |
 
 `Image` with `Source=External` or `Source=Database` is rejected (`ImageSource:<source>`) — the service does
 not fetch remote resources or read databases.
@@ -208,27 +208,23 @@ The interpreter reproduces SSRS/VB behaviour, including behaviour that surprises
 | Mode | How it is produced | Page count |
 | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. Selectable text. | Exact |
-| `DOCX_EDITABLE` | Native OpenXML, generated directly — **not** converted from PDF. Real tables, real text. | Unknown (`null` / `X-Page-Count: unknown`) — Word paginates |
+| `DOCX_EDITABLE` | Native OpenXML built from the canonical PDF renderer's resolved layout trace. Real tables and text; no page screenshot. | Canonical PDF count |
 | `DOCX_VISUAL` | PDF rasterized at 300 DPI, one full-page floating image per Word page. | Exact |
 | `XLSX` | Native Excel workbook. Default `REPORT` mode uses native-cell worksheets split at explicit RDL page breaks; legacy `DATA` mode keeps stacked/per-tablix data blocks. Numeric and date fields remain live typed values. | Not paginated (`null`) — Excel owns print layout |
 
-`DOCX_EDITABLE` is editable but Word owns final layout, so its pagination will not match the PDF exactly.
-`POST /v1/analyze` returns `structuredEditable` with native-DOCX drift risks and the
-`structuredEditable.nativePageFragments.recommendation` value for the RDL shape. Native page fragmentation
-is enabled by default: it keeps real Word tables, repeats declared headers, and closes each measured table
-fragment. Set `docx.nativePageFragments=false` to restore one continuous Word-owned table. Either mode must
-be certified per report/data family when pagination fidelity matters.
+`DOCX_EDITABLE` uses one next-page Word section per canonical PDF page and explicit native grids, row
+heights, line breaks, headers, footers, borders, and embedded fonts. It is designed and certified only for
+Microsoft Word on Windows. Editing may change later pagination. `/v1/analyze` reports
+`windowsWordEditable`; unsupported geometry and ineligible fonts fail closed.
 
 Set `pagination.continuationMarkers` to `true` to label renderer-confirmed logical-row continuations in
 PDF and editable DOCX. Both formats place “Continued from previous page” above the next table fragment;
 the current page remains unannotated. PDF detects cell-text and row-span splits. Editable DOCX detects
 row-span continuations across explicit native fragments. Pagination that Word creates after opening or
 editing the document is not observable during generation and therefore is not labelled.
-Certified structured-DOCX profiles may be mounted and matched by `identity.definitionSha256`; auto-apply is
-off by default. Profile files fail closed on duplicate/unsafe IDs, malformed match hashes, or unknown DOCX
-rendering keys.
-`DOCX_VISUAL` is the exact-page contract: one full-page image per page, not editable — use it when page
-fidelity matters more than editing.
+The former continuous renderer, per-report profiles, and native-fragment switches have been removed.
+Obsolete properties are rejected with `RDL_INVALID`. `DOCX_VISUAL` remains the non-editable raster-page
+alternative.
 
 `XLSX` defaults to case-insensitive `excel.layoutMode: "REPORT"`. Visible report items are partitioned into
 worksheets only at resolved explicit RDL page breaks. Each section gets an independent coordinate-derived

@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -59,84 +58,50 @@ test('health, readiness, and analysis do not expose RDL queries', async (context
   assert.equal(analysis.statusCode, 200);
   assert.equal(analysis.body.includes('select secret'), false);
   assert.match(analysis.json().identity.definitionSha256, /^[a-f0-9]{64}$/);
-  assert.equal(analysis.json().structuredEditable.layoutMode, 'structured');
-  assert.equal(analysis.json().structuredEditable.nativeBodyTables, true);
-  assert.equal(analysis.json().structuredEditable.exactPageParity, false);
-  assert.equal(Array.isArray(analysis.json().structuredEditable.risks), true);
-  assert.equal(analysis.json().structuredEditable.nativePageFragments.supported, true);
-  assert.equal(analysis.json().structuredEditable.nativePageFragments.enabledByDefault, true);
+  assert.equal(analysis.json().windowsWordEditable.layoutMode, 'windows-paged-editable');
+  assert.equal(analysis.json().windowsWordEditable.platform, 'Microsoft Word for Windows');
+  assert.equal(analysis.json().windowsWordEditable.pdfLayoutAuthority, true);
+  assert.equal(analysis.json().windowsWordEditable.page.eligible, true);
+  assert.equal(analysis.json().windowsWordEditable.tableGrid.maximumColumns, 63);
+  assert.equal(Array.isArray(analysis.json().windowsWordEditable.fontEmbedding), true);
 });
 
-test('DOCX profile analysis and render reject missing or mismatched profile ids cleanly', async (context) => {
-  const profilePath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-profile-api-')), 'profiles.json');
-  context.after(() => fs.rm(path.dirname(profilePath), { recursive: true, force: true }));
-  await fs.writeFile(profilePath, JSON.stringify({
-    profiles: [{
-      id: 'other-report',
-      match: { definitionSha256: '0'.repeat(64) },
-      docx: { nativePageFragments: true },
-    }],
-  }));
-  const { app } = await application(context, { RDL_DOCX_PROFILE_PATH: profilePath });
-
-  const missing = await app.inject({
+test('obsolete DOCX pagination flags and profiles are rejected explicitly', async (context) => {
+  const { app } = await application(context);
+  const obsoleteAnalysis = await app.inject({
     method: 'POST',
     url: '/v1/analyze',
-    payload: { rdlBase64: fixture.toString('base64'), docx: { profile: 'does-not-exist' } },
+    payload: { rdlBase64: fixture.toString('base64'), docx: { nativePageFragments: false } },
   });
-  assert.equal(missing.statusCode, 400);
-  assert.equal(missing.json().error.code, 'PARAMETER_INVALID');
+  assert.equal(obsoleteAnalysis.statusCode, 400);
+  assert.equal(obsoleteAnalysis.json().error.code, 'RDL_INVALID');
+  assert.deepEqual(obsoleteAnalysis.json().error.details.obsolete, ['docx.nativePageFragments']);
 
-  const mismatched = await app.inject({
+  const obsoleteRender = await app.inject({
     method: 'POST',
     url: '/v1/render',
-    payload: { ...renderOptions, output: 'DOCX_EDITABLE', rdlBase64: fixture.toString('base64'), docx: { profile: 'other-report' } },
+    payload: {
+      ...renderOptions,
+      output: 'DOCX_EDITABLE',
+      rdlBase64: fixture.toString('base64'),
+      docxProfile: 'removed-profile',
+    },
   });
-  assert.equal(mismatched.statusCode, 400);
-  assert.equal(mismatched.json().error.code, 'PARAMETER_INVALID');
+  assert.equal(obsoleteRender.statusCode, 400);
+  assert.equal(obsoleteRender.json().error.code, 'RDL_INVALID');
+  assert.deepEqual(obsoleteRender.json().error.details.obsolete, ['docxProfile']);
 });
 
-test('DOCX profile configuration fails closed for unsafe or ambiguous profiles', async (context) => {
-  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-profile-invalid-'));
-  context.after(() => fs.rm(profileDir, { recursive: true, force: true }));
-
-  const cases = [
-    {
-      name: 'duplicate id',
-      config: {
-        profiles: [
-          { id: 'same', match: { definitionSha256: '0'.repeat(64) }, docx: { nativePageFragments: true } },
-          { id: 'same', match: { definitionSha256: '1'.repeat(64) }, docx: { nativePageFragments: false } },
-        ],
-      },
-    },
-    {
-      name: 'unsafe id',
-      config: {
-        profiles: [{ id: 'bad\r\nid', match: { definitionSha256: '0'.repeat(64) }, docx: { nativePageFragments: true } }],
-      },
-    },
-    {
-      name: 'unknown rendering key',
-      config: {
-        profiles: [{ id: 'unknown-key', match: { definitionSha256: '0'.repeat(64) }, docx: { nativePageFragments: true, scale: 1 } }],
-      },
-    },
-  ];
-
-  for (const entry of cases) {
-    const profilePath = path.join(profileDir, `${entry.name.replaceAll(' ', '-')}.json`);
-    await fs.writeFile(profilePath, JSON.stringify(entry.config));
-    const { app } = await application(context, { RDL_DOCX_PROFILE_PATH: profilePath, RDL_DOCX_PROFILE_AUTO: 'true' });
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/analyze',
-      payload: { rdlBase64: fixture.toString('base64') },
-    });
-    assert.equal(response.statusCode, 500, entry.name);
-    assert.equal(response.json().error.code, 'CONFIG_INVALID', entry.name);
-    assert.equal(response.body.includes('bad\r\nid'), false);
-  }
+test('removed DOCX profile environment settings do not enter the runtime config', () => {
+  const config = loadConfig({
+    ...process.env,
+    RDL_DOCX_NATIVE_PAGE_FRAGMENTS: 'false',
+    RDL_DOCX_PROFILE_PATH: '/tmp/obsolete.json',
+    RDL_DOCX_PROFILE_AUTO: 'true',
+  });
+  assert.equal('docxNativePageFragments' in config, false);
+  assert.equal('docxProfilePath' in config, false);
+  assert.equal('docxProfileAuto' in config, false);
 });
 
 test('renders equivalent PDF contracts for JSON and multipart requests and cleans temp files', async (context) => {
@@ -187,7 +152,7 @@ test('reports rejected XML paths during analysis and blocks rendering fail-close
 test('renders all DOCX modes through the public API with explicit layout and editability headers', async (context) => {
   const { app, tempRoot } = await application(context);
   const expected = {
-    DOCX_EDITABLE: { layout: 'structured', ratio: '1', numericPages: false },
+    DOCX_EDITABLE: { layout: 'windows-paged-editable', ratio: '1', numericPages: true },
     DOCX_VISUAL: { layout: 'visual', ratio: '0', numericPages: true },
   };
   for (const output of Object.keys(expected)) {
@@ -197,7 +162,10 @@ test('renders all DOCX modes through the public API with explicit layout and edi
     assert.equal(response.rawPayload.subarray(0, 2).toString(), 'PK');
     assert.equal(response.headers['x-docx-layout-mode'], expected[output].layout);
     assert.equal(response.headers['x-docx-editable-text-ratio'], expected[output].ratio);
-    if (output === 'DOCX_EDITABLE') assert.equal(response.headers['x-docx-native-page-fragments'], 'true');
+    if (output === 'DOCX_EDITABLE') {
+      assert.equal(response.headers['x-docx-native-page-fragments'], undefined);
+      assert.equal(response.headers['x-docx-profile-id'], undefined);
+    }
     if (expected[output].numericPages) assert.equal(Number(response.headers['x-page-count']) >= 1, true);
     else assert.equal(response.headers['x-page-count'], 'unknown');
   }
@@ -231,29 +199,19 @@ test('renders XLSX with an Excel-only layout header and DATA compatibility modes
   assert.deepEqual(await fs.readdir(tempRoot), []);
 });
 
-test('renders structured DOCX with applied profile headers', async (context) => {
-  const profilePath = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-profile-render-')), 'profiles.json');
-  context.after(() => fs.rm(path.dirname(profilePath), { recursive: true, force: true }));
-  const hash = createHash('sha256').update(fixture.toString('utf8')).digest('hex');
-
-  await fs.writeFile(profilePath, JSON.stringify({
-    profiles: [{
-      id: 'basic-certified-fragments',
-      certified: true,
-      match: { definitionSha256: hash },
-      docx: { nativePageFragments: true },
-    }],
-  }));
-  const { app, tempRoot } = await application(context, { RDL_DOCX_PROFILE_PATH: profilePath, RDL_DOCX_PROFILE_AUTO: 'true' });
+test('renders page-locked DOCX without obsolete profile or fragmentation headers', async (context) => {
+  const { app, tempRoot } = await application(context);
   const response = await app.inject({
     method: 'POST',
     url: '/v1/render',
     payload: { ...renderOptions, output: 'DOCX_EDITABLE', rdlBase64: fixture.toString('base64') },
   });
   assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.headers['x-docx-profile-id'], 'basic-certified-fragments');
-  assert.equal(response.headers['x-docx-profile-certified'], 'true');
-  assert.equal(response.headers['x-docx-native-page-fragments'], 'true');
+  assert.equal(response.headers['x-docx-layout-mode'], 'windows-paged-editable');
+  assert.equal(Number(response.headers['x-page-count']) >= 1, true);
+  assert.equal(response.headers['x-docx-profile-id'], undefined);
+  assert.equal(response.headers['x-docx-profile-certified'], undefined);
+  assert.equal(response.headers['x-docx-native-page-fragments'], undefined);
   assert.deepEqual(await fs.readdir(tempRoot), []);
 });
 

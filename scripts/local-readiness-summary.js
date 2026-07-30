@@ -23,43 +23,33 @@ async function readJsonIfExists(filePath) {
   }
 }
 
-async function collectDocxReports(root) {
-  const absoluteRoot = path.join(serviceRoot, root);
+async function collectWindowsWordReports() {
+  const absoluteRoot = path.join(serviceRoot, 'tmp');
   const reports = [];
   try {
     for (const entry of await fs.readdir(absoluteRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const reportPath = path.join(absoluteRoot, entry.name, 'docx-certification-report.json');
-      const report = await readJsonIfExists(reportPath);
+      if (!entry.isFile() || !entry.name.endsWith('-windows-word-certification.json')) continue;
+      const report = await readJsonIfExists(path.join(absoluteRoot, entry.name));
       if (!report) continue;
-      const best = report.variants?.find((variant) => variant.name === report.bestVariant);
       reports.push({
-        report: entry.name,
+        report: entry.name.replace(/-windows-word-certification\.json$/, ''),
         renderer: report.renderer,
-        certified: report.certified,
-        certificationBlocked: report.certificationBlocked,
-        bestVariant: report.bestVariant,
-        nativePageFragments: report.profileCandidate?.docx?.nativePageFragments ?? null,
-        canonicalPages: report.canonicalPdf?.pages ?? null,
-        wordExportPages: best?.pages ?? null,
-        pageCountMatchesPdf: best?.pageCountMatchesPdf ?? null,
-        dimensionsMatchPdf: best?.dimensionsMatchPdf ?? null,
-        textCoverage: best?.textCoverage?.ratio ?? null,
-        nativeTables: best?.openXml?.nativeTables ?? null,
-        bodyPositionedShapes: best?.openXml?.bodyPositionedShapes ?? null,
-        blockingDifferences: report.blockingDifferences || [],
+        layoutMode: report.layoutMode,
+        authority: report.authority,
+        certified: report.passed === true,
+        gates: report.gates || {},
+        input: report.input || {},
       });
     }
   } catch {
-    // Missing certification directory is reported as an empty set.
+    // Missing tmp/ or certification artifacts are reported as an empty set.
   }
   return reports.sort((left, right) => left.report.localeCompare(right.report));
 }
 
-const schema = await readJsonIfExists(path.join(serviceRoot, 'tmp/output/rdl-2016-capability-catalogue.json'));
-const stress = await readJsonIfExists(path.join(serviceRoot, 'tmp/output/stress-certification.json'));
-const libreOfficeReports = await collectDocxReports('tmp/output/docx-certification-local');
-const wordReports = await collectDocxReports('tmp/output/docx-certification-word-local');
+const schema = await readJsonIfExists(path.join(serviceRoot, 'tmp/rdl-2016-capability-catalogue.json'));
+const stress = await readJsonIfExists(path.join(serviceRoot, 'tmp/rdl-table-stress-certification.json'));
+const wordReports = await collectWindowsWordReports();
 
 const summary = {
   localEngineeringReady: Boolean(stress?.passed && schema),
@@ -81,10 +71,9 @@ const summary = {
   } : null,
   docxCertification: {
     word: wordReports,
-    libreOffice: libreOfficeReports,
   },
   remainingBlockers: [
-    ...(!wordReports.length ? ['Run npm run certify:docx with --renderer=word for local Word certification evidence.'] : []),
+    ...(!wordReports.length ? ['Run npm run certify:windows-word on a Windows QA host with desktop Microsoft Word.'] : []),
     ...(!wordReports.some((report) => report.certified) ? ['Formal SSRS certification still requires exact SSRS reference PDF, parameters, dataset rows, and licensed font versions from the same run.'] : []),
   ],
 };

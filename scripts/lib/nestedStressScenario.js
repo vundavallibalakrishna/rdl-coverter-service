@@ -335,7 +335,7 @@ export function createNestedStressScenario() {
     model,
     request: {
       outputFileName: 'rdl-deep-nested-stress-certification', parameters: {}, datasets: { NestedData: rowsData },
-      pagination: { continuationMarkers: true }, docx: { nativePageFragments: true },
+      pagination: { continuationMarkers: true },
     },
     certification: {
       id: 'rdl-deep-nested-stress',

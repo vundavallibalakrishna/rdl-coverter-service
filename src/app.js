@@ -7,7 +7,7 @@ import { analyzeParsedRdl, parseRdl } from './rdl/parser.js';
 import { readInput, sanitizedFilename } from './request.js';
 import { readiness } from './readiness.js';
 import { RenderRunner } from './worker/runner.js';
-import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
+import { analyzeWindowsWordCompatibility } from './render/windowsWordCompatibility.js';
 import { fontAvailability } from './render/fonts.js';
 import { testUiPage } from './testUi.js';
 
@@ -53,7 +53,7 @@ export async function buildApp(options = {}) {
     const { rdlBuffer, options } = await readInput(request, config);
     const model = parseRdl(rdlBuffer, { maxRdlBytes: config.maxRdlBytes, maxXmlNodes: config.maxXmlNodes, maxXmlDepth: config.maxXmlDepth });
     const result = analyzeParsedRdl(model);
-    result.structuredEditable = analyzeStructuredEditableCompatibility(model, config, options);
+    result.windowsWordEditable = analyzeWindowsWordCompatibility(model, config, options);
     // Surface which of the report's declared consumed fonts are actually present on this render host, so an
     // absent licensed face (e.g. Segoe UI) is visible instead of silently substituted at render time.
     result.fontAvailability = fontAvailability(config, model.fonts);
