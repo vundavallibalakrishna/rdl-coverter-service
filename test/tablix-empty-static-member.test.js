@@ -101,7 +101,10 @@ test('the shared empty-static-member semantics reach PDF, editable DOCX, and XLS
 
   const docx = await renderEditableDocx(model, request, config);
   const documentXml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
-  assert.match(documentXml, />DEFAULT EMPTY TEXT</);
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /DEFAULT EMPTY TEXT/);
 
   const xlsx = await renderExcel(model, request, config, null);
   const workbook = new ExcelJS.Workbook();

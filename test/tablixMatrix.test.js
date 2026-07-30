@@ -74,8 +74,10 @@ test('a matrix renders native editable DOCX with the expanded column grid', asyn
   const result = await renderEditableDocx(model, { outputFileName: 'matrix', parameters: {}, datasets: { D: rows } });
   const zip = await JSZip.loadAsync(result.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  // Three grid columns declared, and both dynamic column-header labels present.
-  assert.equal((documentXml.match(/<w:gridCol\b/g) || []).length, 3);
+  // The page canvas adds blank-space boundaries around the three matrix columns, while preserving all
+  // expanded matrix labels as native editable text.
+  assert.equal((documentXml.match(/<w:gridCol\b/g) || []).length >= 3, true);
+  assert.match(documentXml, /<w:tblLayout w:type="fixed"\/>/);
   assert.match(documentXml, />A</);
   assert.match(documentXml, />B</);
   assert.match(documentXml, />Region</);

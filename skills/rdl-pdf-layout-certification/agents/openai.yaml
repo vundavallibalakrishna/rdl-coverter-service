@@ -1,0 +1,4 @@
+interface:
+  display_name: "RDL PDF Layout Certification"
+  short_description: "Capture and certify RDL PDF layout geometry"
+  default_prompt: "Use $rdl-pdf-layout-certification to capture and certify the canonical PDF layout."

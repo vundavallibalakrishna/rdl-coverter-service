@@ -14,8 +14,10 @@ import { parseRdl } from '../src/rdl/parser.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { renderEditableDocx } from '../src/render/docx.js';
 import { renderVisualDocx } from '../src/render/visualDocx.js';
-import { cellGridWidth, computeDocxTableGeometry } from '../src/render/docxTableLayout.js';
-import { analyzeStructuredEditableCompatibility, resolveStructuredDocxOptions } from '../src/render/structuredCompatibility.js';
+import {
+  analyzeWindowsWordCompatibility,
+  validateWindowsWordRequest,
+} from '../src/render/windowsWordCompatibility.js';
 
 const fixture = await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url));
 const model = parseRdl(fixture);
@@ -318,7 +320,7 @@ test('renders editable DOCX with native OpenXML tables and text', async () => {
   assert.doesNotMatch(documentXml, /<wps:wsp>/);
 });
 
-test('preserves textbox background and foreground colors in editable DOCX page headers', async () => {
+test('preserves textbox background and foreground colors in page-specific editable DOCX header bands', async () => {
   const headerModel = structuredClone(model);
   const title = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
   title.name = 'ColoredHeaderTitle';
@@ -335,16 +337,14 @@ test('preserves textbox background and foreground colors in editable DOCX page h
 
   const result = await renderEditableDocx(headerModel, request);
   const zip = await JSZip.loadAsync(result.buffer);
-  const headerXml = await zip.file('word/header1.xml').async('string');
-  assert.match(headerXml, /VISIBLE_HEADER_TITLE/);
-  assert.match(headerXml, /<a:solidFill><a:srgbClr val="000080"\/><\/a:solidFill>/);
-  assert.match(headerXml, /<w:color w:val="ffffff"/i);
-  assert.match(headerXml, /<wp:positionH relativeFrom="page">/);
-  assert.match(headerXml, /<wp:positionV relativeFrom="page">/);
-  assert.doesNotMatch(headerXml, /<a:noFill\/>\s*<a:ln\b[\s\S]*?<\/a:ln>\s*<a:solidFill>/);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  assert.match(documentXml, /VISIBLE_HEADER_TITLE/);
+  assert.match(documentXml, /<w:shd[^>]*w:fill="000080"/);
+  assert.match(documentXml, /<w:color w:val="FFFFFF"/i);
+  assert.equal(zip.file('word/header1.xml'), null);
 });
 
-test('keeps page-dependent non-final RDL header content visible in the reusable Word header', async () => {
+test('materializes page-dependent RDL header visibility independently on each canonical page', async () => {
   const headerModel = structuredClone(model);
   const repeated = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
   repeated.name = 'NonFinalPageHeader';
@@ -362,15 +362,22 @@ test('keeps page-dependent non-final RDL header content visible in the reusable 
     printOnLastPage: true,
     items: [repeated, alwaysHidden],
   };
+  const secondPage = structuredClone(headerModel.body.items.find((item) => item.type === 'Textbox'));
+  secondPage.name = 'SecondPageBody';
+  secondPage.value = 'SECOND_PAGE_BODY';
+  secondPage.paragraphs = [['SECOND_PAGE_BODY']];
+  secondPage.pageBreak = { location: 'Start', disabled: 'false' };
+  headerModel.body.items.push(secondPage);
 
   const result = await renderEditableDocx(headerModel, request);
   const zip = await JSZip.loadAsync(result.buffer);
-  const headerXml = await zip.file('word/header1.xml').async('string');
-  assert.match(headerXml, /REPEATED_NON_FINAL_HEADER/);
-  assert.doesNotMatch(headerXml, /ALWAYS_HIDDEN_HEADER/);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  assert.equal(result.pageCount, 2);
+  assert.equal((documentXml.match(/REPEATED_NON_FINAL_HEADER/g) || []).length, 1);
+  assert.doesNotMatch(documentXml, /ALWAYS_HIDDEN_HEADER/);
 });
 
-test('preserves nested page-dependent footer content without unhiding literal-hidden content', async () => {
+test('respects page-dependent and literal-hidden nested footer content', async () => {
   const footerModel = structuredClone(model);
   const pageDependent = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
   pageDependent.name = 'PageDependentFooterText';
@@ -395,8 +402,11 @@ test('preserves nested page-dependent footer content without unhiding literal-hi
 
   const result = await renderEditableDocx(footerModel, request);
   const zip = await JSZip.loadAsync(result.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
   const footerXml = await zip.file('word/footer1.xml').async('string');
-  assert.match(footerXml, /PAGE_DEPENDENT_FOOTER_DATA/);
+  assert.doesNotMatch(documentXml, /PAGE_DEPENDENT_FOOTER_DATA/);
+  assert.doesNotMatch(documentXml, /ALWAYS_HIDDEN_FOOTER_DATA/);
+  assert.doesNotMatch(footerXml, /PAGE_DEPENDENT_FOOTER_DATA/);
   assert.doesNotMatch(footerXml, /ALWAYS_HIDDEN_FOOTER_DATA/);
 });
 
@@ -407,20 +417,17 @@ test('preserves tablix-level outer borders in editable DOCX', async () => {
   const result = await renderEditableDocx(borderedModel, request);
   const zip = await JSZip.loadAsync(result.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  assert.match(documentXml, /<w:tblBorders>[\s\S]*?<w:bottom w:val="single" w:color="112233" w:sz="8"[\s\S]*?<\/w:tblBorders>/);
+  assert.match(documentXml, /<w:tcBorders>[\s\S]*?<w:bottom w:val="single" w:color="112233" w:sz="8"/);
 });
 
-test('keeps wide multi-page DOCX tables inside the page, repeats only declared headers, and never duplicates overflowing cells', async () => {
+test('page-locks a multi-page native table to the canonical PDF fragments without duplicating text', async () => {
   const stressModel = structuredClone(model);
   const tablix = stressModel.body.items.find((item) => item.type === 'Tablix');
-  tablix.width = 900;
-  tablix.columns = [260, 640];
   tablix.rowMembers[0].repeatOnNewPage = true;
   const longCell = `LONG_CELL_START\n${Array.from({ length: 260 }, (_, index) => `Overflow line ${String(index + 1).padStart(3, '0')} with wrapped content that must continue exactly once.`).join('\n')}\nLONG_CELL_END`;
   const stressRequest = {
     ...request,
     outputFileName: 'docx-overflow-stress',
-    docx: { nativePageFragments: true },
     datasets: {
       Sales: [
         { Name: longCell, Amount: 1 },
@@ -428,32 +435,19 @@ test('keeps wide multi-page DOCX tables inside the page, repeats only declared h
       ],
     },
   };
-  const geometry = computeDocxTableGeometry(stressModel, tablix);
-  assert.equal(geometry.tableTwips + geometry.indentTwips <= geometry.availableTwips, true);
-  assert.equal(geometry.gridTwips.reduce((sum, width) => sum + width, 0), geometry.tableTwips);
-  assert.equal(cellGridWidth(geometry.gridTwips, 0, 2), geometry.tableTwips);
-  assert.equal(geometry.scaledToFit, true);
 
-  const result = await renderEditableDocx(stressModel, stressRequest);
+  const [canonical, result] = await Promise.all([
+    renderPdf(stressModel, stressRequest, config),
+    renderEditableDocx(stressModel, stressRequest, config),
+  ]);
   const zip = await JSZip.loadAsync(result.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
   const nativeTables = (documentXml.match(/<w:tbl>/g) || []).length;
   const nativeTableXml = [...documentXml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((match) => match[0]);
   const nativeRows = nativeTableXml.flatMap((table) => [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]));
-  assert.equal(nativeTables > 1, true);
+  assert.equal(result.pageCount, canonical.pageCount);
+  assert.equal(nativeTables, canonical.pageCount);
   assert.equal((documentXml.match(/<wps:wsp>/g) || []).length, 0);
-  assert.equal((documentXml.match(/<w:tblHeader\/>/g) || []).length, nativeTables);
-  for (const table of nativeTableXml) {
-    const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
-    const closureRow = physicalRows.at(-1) || '';
-    assert.match(closureRow, new RegExp(`<w:gridSpan w:val="${geometry.gridTwips.length}"\\/>`), 'each fragment closes across the complete grid');
-    assert.match(closureRow, /<w:top w:val="single"/);
-    assert.match(closureRow, /<w:bottom w:val="none"/);
-  }
-  const oversizedStartRow = nativeRows.find((row) => row.includes('LONG_CELL_START')) || '';
-  const oversizedEndRow = nativeRows.find((row) => row.includes('LONG_CELL_END')) || '';
-  assert.ok(oversizedStartRow && oversizedEndRow, 'the page-taller content remains native and editable');
-  assert.notEqual(oversizedStartRow, oversizedEndRow, 'a page-taller source row becomes bounded native rows');
   assert.equal(nativeRows.every((row) => /<w:cantSplit\/>/.test(row)), true, 'every physical row remains atomic');
   assert.equal(nativeRows.every((row) => /<w:trHeight\b/.test(row)), true, 'every physical row has a bounded measured height');
   assert.equal((documentXml.match(/LONG_CELL_START/g) || []).length, 1);
@@ -464,75 +458,19 @@ test('keeps wide multi-page DOCX tables inside the page, repeats only declared h
   }
 });
 
-test('structured DOCX profiles can enable native fragments for a certified RDL hash', async (context) => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-docx-profile-test-'));
-  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
-  const profilePath = path.join(tempDir, 'profiles.json');
-  await fs.writeFile(profilePath, JSON.stringify({
-    profiles: [{
-      id: 'basic-certified-native-fragments',
-      description: 'Test profile for a certified native-table DOCX layout.',
-      certified: true,
-      match: { definitionSha256: model.identity.definitionSha256 },
-      docx: { nativePageFragments: true },
-    }],
-  }));
-  const profiledConfig = { ...config, docxProfilePath: profilePath, docxProfileAuto: true };
-  const analysis = analyzeStructuredEditableCompatibility(model, profiledConfig);
-  assert.equal(analysis.profiles.available, 1);
-  assert.equal(analysis.profiles.selected.id, 'basic-certified-native-fragments');
-
-  const stressModel = structuredClone(model);
-  const tablix = stressModel.body.items.find((item) => item.type === 'Tablix');
-  tablix.columns = [260, 640];
-  const stressRequest = {
-    ...request,
-    outputFileName: 'docx-profile-fragments',
-    datasets: {
-      Sales: Array.from({ length: 50 }, (_, index) => ({
-        Name: `PROFILE_ROW_${String(index + 1).padStart(3, '0')}\n${'Wrapped content '.repeat(10)}`,
-        Amount: index + 1,
-      })),
-    },
-  };
-
-  const result = await renderEditableDocx(stressModel, stressRequest, profiledConfig);
-  const zip = await JSZip.loadAsync(result.buffer);
-  const documentXml = await zip.file('word/document.xml').async('string');
-  const nativeTables = (documentXml.match(/<w:tbl>/g) || []).length;
-  assert.equal(nativeTables > 1, true);
-  assert.equal((documentXml.match(/<wps:wsp>/g) || []).length, 0);
-});
-
-test('structured DOCX profile auto-apply ignores uncertified candidates unless explicitly requested', async (context) => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-docx-profile-uncertified-test-'));
-  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
-  const profilePath = path.join(tempDir, 'profiles.json');
-  await fs.writeFile(profilePath, JSON.stringify({
-    profiles: [{
-      id: 'basic-uncertified-continuous-table',
-      certified: false,
-      match: { definitionSha256: model.identity.definitionSha256 },
-      docx: { nativePageFragments: false },
-    }],
-  }));
-  const profiledConfig = { ...config, docxProfilePath: profilePath, docxProfileAuto: true };
-  const analysis = analyzeStructuredEditableCompatibility(model, profiledConfig);
-  assert.equal(analysis.profiles.available, 1);
-  assert.equal(analysis.profiles.matches[0].id, 'basic-uncertified-continuous-table');
-  assert.equal(analysis.profiles.selected, null);
-
-  const autoOptions = resolveStructuredDocxOptions(model, { ...request, docx: {} }, profiledConfig);
-  const disabledOptions = resolveStructuredDocxOptions(model, {
-    ...request,
-    docx: { nativePageFragments: false },
-  }, profiledConfig);
-  const explicitOptions = resolveStructuredDocxOptions(model, { ...request, docx: { profile: 'basic-uncertified-continuous-table' } }, profiledConfig);
-  assert.equal(autoOptions.nativePageFragments, true);
-  assert.equal(autoOptions.profile.selected, null);
-  assert.equal(disabledOptions.nativePageFragments, false);
-  assert.equal(explicitOptions.nativePageFragments, false);
-  assert.equal(explicitOptions.profile.selected.id, 'basic-uncertified-continuous-table');
+test('Windows Word analysis reports the fixed platform contract and obsolete options fail closed', () => {
+  const analysis = analyzeWindowsWordCompatibility(model, config);
+  assert.equal(analysis.platform, 'Microsoft Word for Windows');
+  assert.equal(analysis.layoutMode, 'windows-paged-editable');
+  assert.equal(analysis.limits.tableColumns, 63);
+  assert.throws(
+    () => validateWindowsWordRequest({ docx: { nativePageFragments: false } }),
+    (error) => error.code === 'RDL_INVALID',
+  );
+  assert.throws(
+    () => validateWindowsWordRequest({ docxProfile: 'removed-profile' }),
+    (error) => error.code === 'RDL_INVALID',
+  );
 });
 
 test('renders visual DOCX with one page image per PDF page', async (context) => {
@@ -557,7 +495,7 @@ test('renders visual DOCX with one page image per PDF page', async (context) => 
   assert.equal((documentXml.match(/w:type="page"/g) || []).length, result.pageCount - 1);
 });
 
-test('structured footer materializes PAGE and NUMPAGES as real Word fields', async () => {
+test('page-specific footer materializes canonical page numbers as native literal text without fields', async () => {
   const footerModel = structuredClone(model);
   const footerText = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
   footerText.name = 'PageFooter';
@@ -571,28 +509,14 @@ test('structured footer materializes PAGE and NUMPAGES as real Word fields', asy
   footerModel.page.footer = { height: 24, printOnFirstPage: true, printOnLastPage: true, items: [footerText] };
   const result = await renderEditableDocx(footerModel, request);
   const zip = await JSZip.loadAsync(result.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
   const footerXml = await zip.file('word/footer1.xml').async('string');
-  assert.match(footerXml, /<w:instrText[^>]*>PAGE<\/w:instrText>/);
-  assert.match(footerXml, /<w:instrText[^>]*>NUMPAGES<\/w:instrText>/);
-  assert.equal((footerXml.match(/<w:fldChar w:fldCharType="begin"\/>/g) || []).length, 2);
-  assert.doesNotMatch(footerXml, /w:dirty=/);
-  assert.doesNotMatch(footerXml, /<w:instrText[^>]*>\s*(?:LINK|INCLUDETEXT|INCLUDEPICTURE|DDE)\b/i);
-  assert.doesNotMatch(footerXml, /<w:fldSimple/);
-  const complexFields = [...footerXml.matchAll(/<w:r><w:rPr>(?:(?!<\/w:rPr>)[\s\S])*?<\/w:rPr><w:fldChar w:fldCharType="begin"[^>]*\/><\/w:r>(?:(?!<w:fldChar w:fldCharType="end")[\s\S])*?<w:fldChar w:fldCharType="end"[^>]*\/><\/w:r>/g)].map((match) => match[0]);
-  for (const instruction of ['PAGE', 'NUMPAGES']) {
-    const field = complexFields.find((candidate) => new RegExp(`<w:instrText[^>]*>${instruction}<\\/w:instrText>`).test(candidate)) || '';
-    assert.ok(field, `${instruction} complex field is present`);
-    const fieldRuns = field.match(/<w:r>[\s\S]*?<\/w:r>/g) || [];
-    assert.equal(fieldRuns.length, 5);
-    for (const run of fieldRuns) {
-      assert.match(run, /<w:rFonts[^>]*w:ascii="Arial"/);
-      assert.match(run, /<w:sz w:val="16"/);
-    }
-  }
-  assert.match(footerXml, /<wp:positionH relativeFrom="page">/);
+  assert.doesNotMatch(documentXml, /Page 1 of 1/);
+  assert.match(footerXml.replace(/<[^>]+>/g, ''), /Page 1 of 1/);
+  assert.doesNotMatch(footerXml, /<w:instrText|<w:fldSimple|w:dirty=/);
 });
 
-test('each generated Word field inherits its own RDL text-run style', async () => {
+test('each page-number text run inherits its own resolved RDL style', async () => {
   const footerModel = structuredClone(model);
   const footerText = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
   const arial = { ...footerText.style, fontFamily: 'Arial', fontSize: 8 };
@@ -607,17 +531,13 @@ test('each generated Word field inherits its own RDL text-run style', async () =
 
   const zip = await JSZip.loadAsync((await renderEditableDocx(footerModel, request)).buffer);
   const footerXml = await zip.file('word/footer1.xml').async('string');
-  const complexFields = [...footerXml.matchAll(/<w:r><w:rPr>(?:(?!<\/w:rPr>)[\s\S])*?<\/w:rPr><w:fldChar w:fldCharType="begin"[^>]*\/><\/w:r>(?:(?!<w:fldChar w:fldCharType="end")[\s\S])*?<w:fldChar w:fldCharType="end"[^>]*\/><\/w:r>/g)].map((match) => match[0]);
-  const complexField = (instruction) => complexFields.find((candidate) => new RegExp(`<w:instrText[^>]*>${instruction}<\\/w:instrText>`).test(candidate)) || '';
-  const pageField = complexField('PAGE');
-  const totalField = complexField('NUMPAGES');
-  assert.equal((pageField.match(/w:ascii="Arial"/g) || []).length, 5);
-  assert.equal((totalField.match(/w:ascii="Times New Roman"/g) || []).length, 5);
-  assert.match(pageField, /w:ascii="Arial"/);
-  assert.match(pageField, /<w:sz w:val="16"/);
-  assert.match(totalField, /w:ascii="Times New Roman"/);
-  assert.match(totalField, /<w:sz w:val="22"/);
-  assert.match(totalField, /<w:b\/>/);
+  const runs = [...footerXml.matchAll(/<w:r>([\s\S]*?)<\/w:r>/g)].map((match) => match[0]);
+  const pageRun = runs.find((run) => /<w:t[^>]*>1<\/w:t>/.test(run) && /w:ascii="Arial"/.test(run)) || '';
+  const totalRun = runs.find((run) => /<w:t[^>]*>1<\/w:t>/.test(run) && /w:ascii="Times New Roman"/.test(run)) || '';
+  assert.match(pageRun, /<w:sz w:val="16"/);
+  assert.match(totalRun, /<w:sz w:val="22"/);
+  assert.match(totalRun, /<w:b\/>/);
+  assert.doesNotMatch(footerXml, /<w:instrText/);
 });
 
 test('editable DOCX preserves multi-line cell text as breaks and normalizes tabs', async () => {
@@ -630,9 +550,15 @@ test('editable DOCX preserves multi-line cell text as breaks and normalizes tabs
   const result = await renderEditableDocx(model, multilineRequest);
   const zip = await JSZip.loadAsync(result.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  // The "\n" between the two lines becomes a Word break rather than collapsing onto one line.
-  assert.ok((documentXml.match(/<w:br\/>/g) || []).length >= 1);
-  assert.match(documentXml, /First line indented/); // tab expanded to a space
-  assert.match(documentXml, /Second line/);
+  // The PDF-measured lines become distinct native Word lines (paragraphs or explicit breaks).
+  assert.ok(
+    (documentXml.match(/<w:br\/>/g) || []).length >= 1
+      || (documentXml.match(/<w:p>/g) || []).length >= 2,
+  );
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /First line indented/); // tab expanded to a space
+  assert.match(nativeText, /Second line/);
   assert.equal(documentXml.includes(TAB), false); // no raw control character leaks into the XML text
 });

@@ -75,10 +75,19 @@ function openedFont(file) {
   return openedFonts.get(file);
 }
 
+// Font files are responsible for visible glyphs, not Unicode layout controls. Requiring a glyph for a
+// newline, tab, BOM, joiner, variation selector, or another default-ignorable code point turns valid
+// multiline/structured text into a misleading FONT_MISSING failure in strict mode. Keep the original text
+// unchanged for measurement and drawing; this projection is used only for glyph-coverage validation.
+export function renderableGlyphText(text) {
+  return String(text || '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu, '');
+}
+
 function fontCoversText(file, text) {
   if (!text) return true;
   try {
-    return openedFont(file).layout(String(text)).glyphs.every((glyph) => glyph.id !== 0);
+    const visibleText = renderableGlyphText(text);
+    return !visibleText || openedFont(file).layout(visibleText).glyphs.every((glyph) => glyph.id !== 0);
   } catch {
     return false;
   }
@@ -140,6 +149,98 @@ export function checkFonts(config, families = ['Arial', 'Times New Roman']) {
 }
 
 const VARIANTS = [[false, false, 'regular'], [true, false, 'bold'], [false, true, 'italic'], [true, true, 'bolditalic']];
+
+// Word's editable embedding contract is stricter than "the font file exists". OS/2.fsType must permit
+// installable embedding (no restriction bits) or editable embedding. Preview/print-only, restricted, and
+// bitmap-only fonts cannot be placed in an editable DOCX. The full file is always embedded, so the
+// no-subsetting flag is honored naturally.
+export function editableFontEmbeddingPermission(file, family = null, variant = null) {
+  let font;
+  try {
+    font = openedFont(file);
+  } catch (error) {
+    throw new ServiceError(
+      'FONT_EMBEDDING_FORBIDDEN',
+      `Font embedding metadata could not be inspected${family ? `: ${family}:${variant || 'regular'}` : ''}`,
+      503,
+      { family, variant, cause: error.message },
+    );
+  }
+  const fsType = font?.['OS/2']?.fsType;
+  if (!fsType) {
+    throw new ServiceError(
+      'FONT_EMBEDDING_FORBIDDEN',
+      `Font embedding metadata is unavailable${family ? `: ${family}:${variant || 'regular'}` : ''}`,
+      503,
+      { family, variant },
+    );
+  }
+  if (fsType.noEmbedding || fsType.viewOnly || fsType.bitmapOnly) {
+    throw new ServiceError(
+      'FONT_EMBEDDING_FORBIDDEN',
+      `Font license metadata disallows editable embedding${family ? `: ${family}:${variant || 'regular'}` : ''}`,
+      503,
+      { family, variant, fsType },
+    );
+  }
+  return {
+    eligible: true,
+    mode: fsType.editable ? 'editable' : 'installable',
+    noSubsetting: Boolean(fsType.noSubsetting),
+  };
+}
+
+// Returns the same OpenType vertical metrics PDFKit uses for a resolved font file without mutating the
+// active PDF graphics/text state. Layout tracing uses these values to record physical baselines while the
+// ordinary PDF drawing path remains byte-for-byte independent of trace capture.
+export function fontVerticalMetrics(file, size) {
+  try {
+    if (!file || !fs.existsSync(file)) return null;
+    const font = openedFont(file);
+    const unitsPerEm = Number(font.unitsPerEm || 1000);
+    return {
+      ascender: Number(font.ascent || 0) * Number(size || 0) / unitsPerEm,
+      descender: Number(font.descent || 0) * Number(size || 0) / unitsPerEm,
+      lineGap: Number(font.lineGap || 0) * Number(size || 0) / unitsPerEm,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function fontEmbeddingEligibility(config, families = []) {
+  return [...new Set(families)].map((family) => {
+    const variants = {};
+    let eligible = true;
+    for (const [bold, italic, variant] of VARIANTS) {
+      const file = resolveFontFile(config.fontDir, family, bold, italic);
+      if (!file) {
+        variants[variant] = { available: false, eligible: false, reason: 'missing' };
+        eligible = false;
+        continue;
+      }
+      try {
+        const permission = editableFontEmbeddingPermission(file, family, variant);
+        variants[variant] = { available: true, ...permission };
+      } catch (error) {
+        variants[variant] = {
+          available: true,
+          eligible: false,
+          reason: error.code === 'FONT_EMBEDDING_FORBIDDEN' ? 'license-restricted' : 'metadata-error',
+        };
+        eligible = false;
+      }
+    }
+    return {
+      family,
+      eligible,
+      variants,
+      // DOCX_EDITABLE has no non-strict font mode: unlike the legacy PDF fallback path, its public
+      // contract requires every consumed face to be embedded so Word cannot substitute a host font.
+      blocksWindowsPagedEditable: !eligible,
+    };
+  });
+}
 
 // Per-family availability of the actual licensed font files on THIS server, for the families a report
 // declares. `available` means every variant resolves to a file we could embed in a PDF; when it is false

@@ -57,6 +57,9 @@ test('recursive indentation is applied in editable DOCX', async () => {
   const result = await renderEditableDocx(model, { outputFileName: 'tree', parameters: {}, datasets: { D: rows } });
   const zip = await JSZip.loadAsync(result.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  assert.match(documentXml, /<w:ind w:left="\d+"/); // at least one indented row
+  // PDF recursive indentation is captured as increased left cell padding in the page-locked grid.
+  const leftMargins = [...documentXml.matchAll(/<w:left w:type="dxa" w:w="(\d+)"\/>/g)]
+    .map((match) => Number(match[1]));
+  assert.equal(Math.max(...leftMargins) > Math.min(...leftMargins), true);
   for (const name of ['CEO', 'VP-A', 'Eng', 'VP-B']) assert.ok(documentXml.includes(name));
 });

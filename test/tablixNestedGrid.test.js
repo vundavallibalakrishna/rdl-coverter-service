@@ -116,7 +116,11 @@ test('the same stable nested grid renders through PDF and editable DOCX', async 
   const docxResult = await renderEditableDocx(model, request, config);
   const zip = await JSZip.loadAsync(docxResult.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  assert.equal((documentXml.match(/<w:gridCol\b/g) || []).length, 3);
-  assert.match(documentXml, />CATEGORY BAND</);
-  assert.match(documentXml, />SUBCATEGORY BAND</);
+  assert.equal((documentXml.match(/<w:gridCol\b/g) || []).length >= 3, true);
+  assert.match(documentXml, /<w:tblLayout w:type="fixed"\/>/);
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /CATEGORY BAND/);
+  assert.match(nativeText, /SUBCATEGORY BAND/);
 });

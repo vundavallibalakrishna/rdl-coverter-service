@@ -8,7 +8,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { buildApp } from '../src/app.js';
-import { fontAvailability, pdfFont, resolveFontFile } from '../src/render/fonts.js';
+import {
+  fontAvailability,
+  pdfFont,
+  renderableGlyphText,
+  resolveFontFile,
+} from '../src/render/fonts.js';
 import { loadConfig } from '../src/config.js';
 
 // Set an env var for the duration of fn(), restoring (or unsetting) it afterwards even on failure.
@@ -22,6 +27,14 @@ async function withEnv(name, value, fn) {
 }
 
 const ALL_VARIANTS = ['bold', 'bolditalic', 'italic', 'regular'];
+
+test('font coverage ignores layout controls while retaining every visible glyph', () => {
+  assert.equal(
+    renderableGlyphText(`Line 1\n\tLine 2\uFEFF\u200D\uFE0F`),
+    'Line 1Line 2',
+  );
+  assert.equal(renderableGlyphText('• Assurance 😊'), '• Assurance 😊');
+});
 
 test('fontAvailability marks an absent declared family unavailable with every variant missing', () => {
   const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });

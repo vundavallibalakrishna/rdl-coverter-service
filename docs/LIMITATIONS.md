@@ -83,7 +83,7 @@ server*, and this service deliberately has no report server, catalogue, filesyst
 `OmitBorderOnPageBreak`. Analysis cannot declare that dependency renderable because it has no render-time
 bundle.
 
-`PDF` and `DOCX_VISUAL` rendering can resolve the dependency only when the same request supplies:
+`PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL` rendering can resolve the dependency only when the same request supplies:
 
 - the exact child RDL as `rdlBase64`;
 - one invocation record for each evaluated child parameter signature; and
@@ -95,8 +95,8 @@ with a row-spanned parent cell cannot itself exceed every available page segment
 Definitions are capped, recursion is cycle/depth checked, all parent/child row and request limits apply, and
 unused definitions are rejected. Child queries are metadata and are never executed.
 
-`DOCX_EDITABLE` and `XLSX` still reject bundled subreports because their native nested-grid composition has
-not been implemented. This prevents a child from being silently flattened or omitted.
+`XLSX` still rejects bundled subreports because its native nested-grid composition has not been
+implemented. This prevents a child from being silently flattened or omitted.
 
 See [Supplying subreports](./SUBREPORTS.md) for the exact HTTP/library request contract, invocation matching,
 empty-result handling, and nested child/grandchild example.
@@ -170,31 +170,17 @@ VB coerces `Nothing` to `0`. An RDL guard like `IIF(IsNothing(a) And IsNothing(b
 non-short-circuiting `And` will colour empty rows as though they scored zero. **SSRS produces the same
 output** for the same RDL and rows. This is report logic, not rendering — the fix belongs in the RDL.
 
-### DOCX_EDITABLE pagination differs from the PDF
+### DOCX_EDITABLE is Windows Word only
 
-Word performs final layout, so page breaks land differently. `KeepTogether` and row spans are honoured via
-`cantSplit`/`keepNext`, which keeps content coherent, but exact page parity is not achievable in an editable
-reflowing document — that is a Word limitation, not an implementation gap. When page-for-page fidelity
-matters more than editing, use `DOCX_VISUAL` (a non-editable full-page image per page).
+`DOCX_EDITABLE` is constructed from the canonical PDF layout trace, with one native fixed-grid Word section
+per PDF page. Microsoft Word for Windows is the only supported rendering and certification authority.
+Word for Mac, LibreOffice, Google Docs, and browser previews may paginate or rasterize the package
+differently and are outside the contract.
 
-Native page fragmentation is enabled by default for `DOCX_EDITABLE`. It keeps content as native Word tables
-while splitting large tablixes at PDF-like page-break estimates, repeating declared headers, and physically
-closing each table fragment. It can improve reports where Word otherwise compresses too many rows onto a
-page, but row-span-heavy reports can still drift. Set `docx.nativePageFragments=false` (legacy alias:
-`docxNativePageFragments=false`) to restore one continuous Word-owned table. Certify the selected mode for
-each RDL/data family with a page-by-page Word export comparison.
-
-`/v1/analyze` returns `structuredEditable` with the native-DOCX risk level, specific drift risks, and the
-fragmentation recommendation for the RDL shape. That analysis is static: it does not replace rendering the
-actual data set through Microsoft Word during release certification.
-
-Certified structured-DOCX profiles can be mounted through `RDL_DOCX_PROFILE_PATH` and matched by the
-`identity.definitionSha256` returned from `/v1/analyze`. Keep `RDL_DOCX_PROFILE_AUTO=false` until the profile
-has passed page-by-page Word export certification for the exact report/data family. Auto-apply ignores
-profiles where `certified` is not `true`; an uncertified candidate can still be selected explicitly for QA.
-The service rejects malformed profile files instead of guessing: duplicate IDs, unsafe IDs, invalid
-definition hashes, and unknown DOCX rendering keys return `CONFIG_INVALID` when a profile is requested or
-auto-apply is enabled.
+Word geometry that cannot be represented safely fails with `UNSUPPORTED_FEATURE` instead of being scaled,
+clipped, rasterized, or approximated. This includes incompatible editable overlaps, unsupported rotations,
+required tables wider than 63 columns, and pages over Word's 22-by-22-inch limit. The former continuous
+renderer, native-fragment flags, and per-report profiles are obsolete and rejected with `RDL_INVALID`.
 
 ### Border thickness varies slightly between cells
 
@@ -210,8 +196,8 @@ makes borders heavier rather than more uniform, so it defaults to `0` (off).
 Machine-readable, generated from Microsoft's published schema:
 
 ```bash
-npm run audit:schema   # tmp/output/rdl-2016-capability-catalogue.json
+npm run audit:schema   # tmp/rdl-2016-capability-catalogue.json
 ```
 
-Current classification of the 695 declared names: **160** `SUPPORTED`, **62** `METADATA_ONLY`, **473**
+Current classification of the 695 declared names: **169** `SUPPORTED`, **62** `METADATA_ONLY`, **464**
 `REJECTED`. To check a specific RDL rather than the whole schema, use `POST /v1/analyze`.

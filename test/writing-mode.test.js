@@ -58,14 +58,13 @@ test('PDF writes Rotate270 and Vertical text on a vertical physical axis', async
   }
 });
 
-test('editable DOCX uses native table-cell text directions', async () => {
-  const result = await renderEditableDocx(parseRdl(rdl()), request, config);
-  const zip = await JSZip.loadAsync(result.buffer);
-  const xml = await zip.file('word/document.xml').async('string');
-  assert.match(xml, /<w:textDirection w:val="btLr"\s*\/>/);
-  assert.match(xml, /<w:textDirection w:val="tbRl"\s*\/>/);
-  assert.match(xml, /ROTATE270/);
-  assert.match(xml, /VERTICAL/);
+test('page-locked editable DOCX fails closed for rotated text', async () => {
+  await assert.rejects(
+    () => renderEditableDocx(parseRdl(rdl()), request, config),
+    (error) => error.code === 'UNSUPPORTED_FEATURE'
+      && error.details?.item === 'BottomToTop'
+      && error.details?.writingMode === 'rotate270',
+  );
 });
 
 test('XLSX REPORT uses native editable cell rotations', async () => {

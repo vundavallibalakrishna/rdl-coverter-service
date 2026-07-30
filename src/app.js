@@ -7,7 +7,7 @@ import { analyzeParsedRdl, parseRdl } from './rdl/parser.js';
 import { readInput, sanitizedFilename } from './request.js';
 import { readiness } from './readiness.js';
 import { RenderRunner } from './worker/runner.js';
-import { analyzeStructuredEditableCompatibility } from './render/structuredCompatibility.js';
+import { analyzeWindowsWordCompatibility } from './render/windowsWordCompatibility.js';
 import { fontAvailability } from './render/fonts.js';
 import { testUiPage } from './testUi.js';
 
@@ -53,7 +53,7 @@ export async function buildApp(options = {}) {
     const { rdlBuffer, options } = await readInput(request, config);
     const model = parseRdl(rdlBuffer, { maxRdlBytes: config.maxRdlBytes, maxXmlNodes: config.maxXmlNodes, maxXmlDepth: config.maxXmlDepth });
     const result = analyzeParsedRdl(model);
-    result.structuredEditable = analyzeStructuredEditableCompatibility(model, config, options);
+    result.windowsWordEditable = analyzeWindowsWordCompatibility(model, config, options);
     // Surface which of the report's declared consumed fonts are actually present on this render host, so an
     // absent licensed face (e.g. Segoe UI) is visible instead of silently substituted at render time.
     result.fontAvailability = fontAvailability(config, model.fonts);
@@ -87,9 +87,6 @@ export async function buildApp(options = {}) {
       pageCount: rendered.pageCount,
       layoutMode: rendered.layoutMode,
       editableTextRatio: rendered.editableTextRatio,
-      docxProfileId: rendered.docxProfile?.id,
-      docxProfileCertified: rendered.docxProfile?.certified,
-      docxNativePageFragments: rendered.docxNativePageFragments,
       durationMs,
     }, 'RDL rendering completed');
     reply
@@ -102,11 +99,6 @@ export async function buildApp(options = {}) {
     if (rendered.layoutMode && renderRequest.output === 'XLSX') reply.header('X-Xlsx-Layout-Mode', safeHeaderValue(rendered.layoutMode));
     else if (rendered.layoutMode && /^DOCX_/.test(renderRequest.output)) reply.header('X-Docx-Layout-Mode', safeHeaderValue(rendered.layoutMode));
     if (rendered.editableTextRatio !== undefined) reply.header('X-Docx-Editable-Text-Ratio', rendered.editableTextRatio);
-    if (rendered.docxProfile?.id) {
-      reply.header('X-Docx-Profile-Id', safeHeaderValue(rendered.docxProfile.id));
-      reply.header('X-Docx-Profile-Certified', String(rendered.docxProfile.certified === true));
-    }
-    if (rendered.docxNativePageFragments !== undefined) reply.header('X-Docx-Native-Page-Fragments', String(rendered.docxNativePageFragments));
     return reply.send(rendered.buffer);
   });
 

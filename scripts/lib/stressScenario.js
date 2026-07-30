@@ -257,7 +257,6 @@ export function createStressScenario() {
     parameters: {},
     datasets: { StressData: rowsData },
     pagination: { continuationMarkers: true },
-    docx: { nativePageFragments: true },
   };
   return { model, request };
 }

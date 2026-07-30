@@ -92,16 +92,15 @@ test('PDF rich text wraps an oversized word at grapheme boundaries instead of cl
   assert.match(stdout.replace(/\s+/g, ''), /establish.*ent/s);
 });
 
-test('editable DOCX enables character-level wrapping for ordinary RDL paragraphs', async () => {
+test('editable DOCX materializes the canonical PDF long-word wrap as native Word line breaks', async () => {
   const { model, request } = scenario();
   const rendered = await renderEditableDocx(model, request, config);
   const zip = await JSZip.loadAsync(rendered.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
-  assert.match(documentXml, /<w:wordWrap w:val="1"\/>/);
-  assert.doesNotMatch(documentXml, /<w:wordWrap w:val="0"\/>/);
-  assert.match(documentXml, /establishment/);
-  assert.ok(
-    documentXml.indexOf('<w:wordWrap w:val="1"/>') < documentXml.indexOf('<w:spacing '),
-    'wordWrap must remain in the schema-defined paragraph-property position',
-  );
+  assert.match(documentXml, /<w:br\/>/);
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /establishment/);
+  assert.doesNotMatch(documentXml, /<w:wordWrap/);
 });

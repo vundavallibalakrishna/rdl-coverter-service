@@ -39,8 +39,6 @@ process.on('message', async (message) => {
       totalRows: validation.totalRows + subreports.bundledRows,
       layoutMode: rendered.layoutMode,
       editableTextRatio: rendered.editableTextRatio,
-      docxProfile: rendered.docxProfile,
-      docxNativePageFragments: rendered.docxNativePageFragments,
       sceneStats: rendered.sceneStats,
     });
   } catch (error) {

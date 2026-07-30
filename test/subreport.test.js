@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import JSZip from 'jszip';
 import { createConverter } from '../src/index.js';
 
 const execFileAsync = promisify(execFile);
@@ -181,7 +182,7 @@ test('fails closed when the parent references an unbundled subreport', async (co
   );
 });
 
-test('fails closed instead of flattening bundled subreports into editable DOCX or XLSX', async (context) => {
+test('renders bundled subreports through the PDF trace into editable DOCX while XLSX remains unsupported', async (context) => {
   const converter = await createConverter({
     env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
   });
@@ -190,10 +191,16 @@ test('fails closed instead of flattening bundled subreports into editable DOCX o
     { parameters: { EntityID: 1 }, datasets: { ChildData: [{ EntityID: 1, Label: 'CHILD_ALPHA' }] } },
     { parameters: { EntityID: 2 }, datasets: { ChildData: [{ EntityID: 2, Label: 'CHILD_BETA' }] } },
   ]);
-  for (const output of ['DOCX_EDITABLE', 'XLSX']) {
-    await assert.rejects(
-      converter.render({ rdl: parentRdl, ...request, output }),
-      (error) => error.code === 'UNSUPPORTED_FEATURE' && /PDF and visual DOCX/.test(error.message),
-    );
-  }
+  const docx = await converter.render({ rdl: parentRdl, ...request, output: 'DOCX_EDITABLE' });
+  const zip = await JSZip.loadAsync(docx.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /CHILD_ALPHA/);
+  assert.match(nativeText, /CHILD_BETA/);
+  await assert.rejects(
+    converter.render({ rdl: parentRdl, ...request, output: 'XLSX' }),
+    (error) => error.code === 'UNSUPPORTED_FEATURE',
+  );
 });

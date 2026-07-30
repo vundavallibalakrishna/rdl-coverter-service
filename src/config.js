@@ -41,12 +41,6 @@ export function loadConfig(env = process.env) {
     workerMemoryMaxMb,
     maxXmlNodes: positiveInteger(env.RDL_MAX_XML_NODES, 250_000),
     maxXmlDepth: positiveInteger(env.RDL_MAX_XML_DEPTH, 256),
-    // Native page fragments are the editable-DOCX default so repeated headers and physical bottom
-    // borders are deterministic at the renderer's measured page boundaries. Callers can still opt out
-    // per request, and deployments can restore Word-owned continuous-table flow with the env flag.
-    docxNativePageFragments: booleanFlag(env.RDL_DOCX_NATIVE_PAGE_FRAGMENTS, true),
-    docxProfilePath: env.RDL_DOCX_PROFILE_PATH ? path.resolve(env.RDL_DOCX_PROFILE_PATH) : null,
-    docxProfileAuto: booleanFlag(env.RDL_DOCX_PROFILE_AUTO, false),
     pdftoppmPath: env.RDL_PDFTOPPM_PATH || 'pdftoppm',
     // Minimum PDF border stroke width in points. 0 = honour the RDL width exactly (default). A floor only
     // makes borders heavier, not more uniform (the unevenness is a viewer sub-pixel artifact, not width),

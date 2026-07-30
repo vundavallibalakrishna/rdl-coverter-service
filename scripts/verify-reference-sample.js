@@ -21,7 +21,7 @@ const rdlPath = path.resolve(positionalArguments[0] || path.join(serviceRoot, '.
 const referencePath = path.resolve(positionalArguments[1] || path.join(serviceRoot, 'Combined_Assurance_Reports_modifiedV4.pdf'));
 const hydrationPath = path.resolve(positionalArguments[2] || samplePath('combined-assurance-hydration.json'));
 // Generated artifacts live under tmp/ so they stay out of version control (see .gitignore).
-const outputDir = path.join(serviceRoot, 'tmp', 'output', 'pdf');
+const outputDir = path.join(serviceRoot, 'tmp');
 const generatedPath = path.join(outputDir, 'combined-assurance-hydrated.pdf');
 const comparisonPath = path.join(outputDir, 'combined-assurance-hydrated.comparison.json');
 

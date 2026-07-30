@@ -383,19 +383,19 @@ test('dropCoveredPlaceholders removes only the empty cells a preceding span cove
   assert.deepEqual(result.map((cell) => cell.items.length), [1, 1, 0]);
 });
 
-test('the Combined Assurance Table 2 keeps all thirteen column-header labels on distinct grid columns', {
+test('the Combined Assurance Table 2 keeps every visible leaf header on a distinct grid column', {
   skip: hasSamples(COMBINED_ASSURANCE) ? false : MISSING_SAMPLES,
 }, () => {
   const model = parseRdl(fs.readFileSync(samplePath(COMBINED_ASSURANCE)));
   assert.deepEqual(model.unsupported, []);
   const tablix = model.body.items.find((item) => item.name === 'Tablix2');
   assert.equal(tablix.rowHeaderColumns.length, 7);
-  assert.equal(tablix.bodyColumns.length, 10);
-  assert.equal(tablix.columns.length, 17);
+  assert.equal(tablix.bodyColumns.length, 13);
+  assert.equal(tablix.columns.length, 20);
 
-  // Every static column-header row now tiles exactly the 10 body columns (placeholders removed).
-  for (const row of tablix.rows.slice(0, 4)) {
-    assert.equal(row.cells.reduce((sum, cell) => sum + (cell.colSpan || 1), 0), 10);
+  // Every declared static column-header row tiles the complete 13-column body (placeholders removed).
+  for (const row of tablix.rows.slice(0, 2)) {
+    assert.equal(row.cells.reduce((sum, cell) => sum + (cell.colSpan || 1), 0), 13);
   }
 
   const rows = materializeTablixRows(tablix, [], {}, {}, {});
@@ -405,9 +405,9 @@ test('the Combined Assurance Table 2 keeps all thirteen column-header labels on 
     const index = labelRow.cells.findIndex((cell) => (cell.values || []).join('').includes(needle));
     return placements[rows.indexOf(labelRow)][index];
   };
-  // Previously "4th Line", "Combined Assurance Level" and "Comment/Action Plan" all collapsed onto
-  // the last grid column; they must now sit on their own columns 13, 15 and 16.
+  // The final assurance/activity/action headers must remain on their own columns rather than collapsing
+  // onto the last grid position.
   assert.equal(columnOf('4th Line'), 13);
   assert.equal(columnOf('Combined Assurance Level'), 15);
-  assert.equal(columnOf('Comment'), 16);
+  assert.equal(columnOf('Comment'), 19);
 });
