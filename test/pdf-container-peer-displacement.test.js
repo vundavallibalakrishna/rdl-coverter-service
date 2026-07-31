@@ -132,6 +132,47 @@ test('a growing tablix displaces later rectangle peers while same-band peers rem
   );
 });
 
+test('overlapping vertical lanes render in parallel while a later same-lane label follows growth', async () => {
+  const laneRdl = `<?xml version="1.0"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+ <DataSets><DataSet Name="D"><Fields><Field Name="V"><DataField>V</DataField></Field></Fields><Query><CommandText>x</CommandText></Query></DataSet></DataSets>
+ <ReportSections><ReportSection><Body><ReportItems>
+  <Textbox Name="RightPanel"><CanGrow>false</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>RIGHT_PANEL</Value></TextRun></TextRuns></Paragraph></Paragraphs>
+   <Top>0in</Top><Left>2in</Left><Height>2in</Height><Width>1.5in</Width><Style/>
+  </Textbox>
+  <Tablix Name="LeftTable"><TablixBody><TablixColumns><TablixColumn><Width>1.5in</Width></TablixColumn></TablixColumns>
+   <TablixRows><TablixRow><Height>0.3in</Height><TablixCells><TablixCell><CellContents><Textbox Name="Cell"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!V.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border></Style></Textbox></CellContents></TablixCell></TablixCells></TablixRow></TablixRows>
+   </TablixBody><TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
+   <TablixRowHierarchy><TablixMembers><TablixMember><Group Name="Rows"><GroupExpressions><GroupExpression>=Fields!V.Value</GroupExpression></GroupExpressions></Group></TablixMember></TablixMembers></TablixRowHierarchy>
+   <DataSetName>D</DataSetName><Top>0.05in</Top><Left>0in</Left><Height>0.3in</Height><Width>1.5in</Width><Style/>
+  </Tablix>
+  <Textbox Name="LeftLabel"><CanGrow>false</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>LEFT_LABEL</Value></TextRun></TextRuns></Paragraph></Paragraphs>
+   <Top>0.4in</Top><Left>0.5in</Left><Height>0.2in</Height><Width>1in</Width><Style/>
+  </Textbox>
+ </ReportItems><Height>3in</Height><Style/></Body>
+ <Page><PageHeight>4in</PageHeight><PageWidth>4in</PageWidth><LeftMargin>0.2in</LeftMargin><RightMargin>0.2in</RightMargin><TopMargin>0.2in</TopMargin><BottomMargin>0.2in</BottomMargin></Page>
+ </ReportSection></ReportSections></Report>`;
+  const rendered = await renderPdf(parseRdl(laneRdl), {
+    parameters: {},
+    datasets: { D: [{ V: 'A' }, { V: 'B' }, { V: 'C' }] },
+  }, config, { captureLayoutTrace: true });
+  const items = rendered.layoutTrace.pages[0].items;
+  const panel = items.find((entry) => entry.itemName === 'RightPanel');
+  const firstCell = items.find((entry) => entry.text === 'A');
+  const lastCell = items.find((entry) => entry.text === 'C');
+  const label = items.find((entry) => entry.itemName === 'LeftLabel');
+
+  assert.ok(panel && firstCell && lastCell && label);
+  assert.ok(
+    Math.abs(panel.y - (firstCell.y - 3.6)) <= 0.25,
+    'the right panel keeps its declared coordinate instead of being pushed below the left table',
+  );
+  assert.ok(
+    label.y >= lastCell.y + lastCell.height + 3.5,
+    'the later same-lane label follows the growing table and preserves its declared gap',
+  );
+});
+
 test('a rectangle continues from the final child position after that child advances a page', async () => {
   const rendered = await renderPdf(parseRdl(pageAdvanceRdl), {
     parameters: {},

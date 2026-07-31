@@ -69,6 +69,61 @@ test('a matrix expands columns to rowHeaderColumns + keys x bodyColumns with int
   assert.deepEqual(placements[1], [0, 1, 2]);
 });
 
+test('a mixed static and dynamic column hierarchy repeats only the dynamic leaf column', () => {
+  const rdl = `<?xml version="1.0"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+ <DataSets><DataSet Name="D"><Fields>
+  <Field Name="RowKey"><DataField>RowKey</DataField></Field>
+  <Field Name="ColumnKey"><DataField>ColumnKey</DataField></Field>
+  <Field Name="Value"><DataField>Value</DataField></Field>
+ </Fields><Query><CommandText>x</CommandText></Query></DataSet></DataSets>
+ <ReportSections><ReportSection><Body><ReportItems>
+  <Tablix Name="Mixed"><TablixBody>
+   <TablixColumns><TablixColumn><Width>1in</Width></TablixColumn><TablixColumn><Width>0.5in</Width></TablixColumn></TablixColumns>
+   <TablixRows><TablixRow><Height>0.25in</Height><TablixCells>
+    <TablixCell><CellContents><Textbox Name="row"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!RowKey.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox></CellContents></TablixCell>
+    <TablixCell><CellContents><Textbox Name="value"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Value.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox></CellContents></TablixCell>
+   </TablixCells></TablixRow></TablixRows>
+  </TablixBody>
+  <TablixColumnHierarchy><TablixMembers>
+   <TablixMember/>
+   <TablixMember><Group Name="Columns"><GroupExpressions><GroupExpression>=Fields!ColumnKey.Value</GroupExpression></GroupExpressions></Group></TablixMember>
+  </TablixMembers></TablixColumnHierarchy>
+  <TablixRowHierarchy><TablixMembers><TablixMember><Group Name="Rows"><GroupExpressions><GroupExpression>=Fields!RowKey.Value</GroupExpression></GroupExpressions></Group></TablixMember></TablixMembers></TablixRowHierarchy>
+  <DataSetName>D</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.25in</Height><Width>1.5in</Width><Style/>
+  </Tablix>
+ </ReportItems><Height>3in</Height><Style/></Body><Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth></Page></ReportSection></ReportSections></Report>`;
+  const tablix = tablixOf(rdl);
+  const source = [
+    { RowKey: 'R1', ColumnKey: 'C1', Value: 11 },
+    { RowKey: 'R1', ColumnKey: 'C2', Value: 12 },
+    { RowKey: 'R2', ColumnKey: 'C1', Value: 21 },
+    { RowKey: 'R2', ColumnKey: 'C2', Value: 22 },
+  ];
+
+  assert.deepEqual(materializeTablixColumns(tablix, source, {}, {}, {}), [72, 36, 36]);
+  assert.deepEqual(
+    materializeTablixRows(tablix, source, {}, {}, {}).map((row) => row.cells.map((cell) => (cell.values || []).join(''))),
+    [
+      ['R1', '11', '12'],
+      ['R2', '21', '22'],
+    ],
+  );
+});
+
+test('matrix cells preserve their row-column intersection for expression-backed styles', () => {
+  const rdl = matrixRdl().replace(
+    '<Style/></Textbox></CellContents></TablixCell></TablixCells></TablixRow>',
+    '<Style><BackgroundColor>=IIF(Fields!Product.Value = "A", "Red", "Blue")</BackgroundColor></Style></Textbox></CellContents></TablixCell></TablixCells></TablixRow>',
+  );
+  const tablix = tablixOf(rdl);
+  const materialized = materializeTablixRows(tablix, rows, {}, {}, {});
+  assert.equal(materialized[1].cells[1].fields.Product, 'A');
+  assert.equal(materialized[1].cells[2].fields.Product, 'B');
+  assert.equal(materialized[1].cells[1].scopeDataset.length, 1);
+  assert.equal(materialized[1].cells[2].scopeDataset.length, 1);
+});
+
 test('a matrix renders native editable DOCX with the expanded column grid', async () => {
   const model = parseRdl(matrixRdl());
   const result = await renderEditableDocx(model, { outputFileName: 'matrix', parameters: {}, datasets: { D: rows } });
