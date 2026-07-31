@@ -687,7 +687,14 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }
     });
   });
-  const contextForRow = (rowIndex) => ({ fields: rows[rowIndex]?.fields || {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets });
+  const contextForCell = (rowIndex, cell = null) => ({
+    fields: cell?.fields || rows[rowIndex]?.fields || {},
+    parameters: request.parameters || {},
+    globals,
+    dataset: cell?.scopeDataset || rows[rowIndex]?.scopeDataset || datasets[item.datasetName] || [],
+    datasets,
+    scopes: cell?.scopes || {},
+  });
   // A side's border for a cell, evaluated in that cell's row context. Returns null when the side is
   // absent or resolves to None so the caller can fall back to the neighbouring cell's opposite side.
   const resolveSide = (owner, side) => {
@@ -695,7 +702,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const cellStyle = owner.cell.containerWrapped ? item.style : (cellTextbox(owner.cell)?.style || item.style);
     const border = cellStyle?.borders?.[side];
     if (!border) return null;
-    const context = contextForRow(owner.rowIndex);
+    const context = contextForCell(owner.rowIndex, owner.cell);
     if (/^none$/i.test(String(styleValue(border.style, context, 'None')))) return null;
     return { border, context };
   };
@@ -804,11 +811,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const columnIndex = placements[rowIndex][cellIndex];
       const cellWidth = cellGeometryPt(columns, columnIndex, cell.colSpan || 1).widthPt;
       const context = {
-        fields: row.fields || {},
+        fields: cell.fields || row.fields || {},
         parameters: nestedParameters,
         globals: nestedGlobals,
-        dataset: row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
+        dataset: cell.scopeDataset || row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
         datasets: nestedDatasets,
+        scopes: cell.scopes || {},
       };
       const textHeight = textbox && !cell.hidden
         ? measureTextboxHeight(doc, config, textbox, context, cellText(cell), cellWidth)
@@ -846,11 +854,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         const height = rowOffsets[Math.min(layout.heights.length, rowIndex + rowSpan)] - rowOffsets[rowIndex];
         const textbox = cellTextbox(cell);
         const context = {
-          fields: row.fields || {},
+          fields: cell.fields || row.fields || {},
           parameters: nestedParameters,
           globals: nestedGlobals,
-          dataset: row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
+          dataset: cell.scopeDataset || row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
           datasets: nestedDatasets,
+          scopes: cell.scopes || {},
         };
         const style = (cell.containerWrapped ? nested.item.style : textbox?.style) || nested.item.style || {};
         const background = styleColor(style.backgroundColor, context, null);
@@ -982,7 +991,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const span = cell.colSpan || 1;
       const columnIndex = placements[rowIndex][index];
       const { widthPt: width } = cellGeometryPt(columnWidths, columnIndex, span);
-      const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
+      const context = contextForCell(rowIndex, cell);
       return { cell, textbox, width, columnIndex, context, text: texts[index] || '' };
     });
   };
@@ -1087,7 +1096,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const { xOffsetPt, widthPt: width } = cellGeometryPt(columnWidths, columnIndex, span);
       const x = startX + xOffsetPt;
       const textbox = cellTextbox(cell);
-      const cellContext = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
+      const cellContext = contextForCell(rowIndex, cell);
       const edges = resolveEdges({ cell, rowIndex }, columnIndex, span);
       // Merged (row-span) cells are drawn lazily via drawSpanSegment so they track the real extent of their
       // spanned rows across page splits; single-row cells draw here directly.
@@ -1581,6 +1590,10 @@ export async function renderPdf(model, request, config, options = {}) {
     return true;
   };
   const sameDesignTop = (left, right) => Math.abs((left.top || 0) - (right.top || 0)) <= 0.25;
+  const horizontallyDisjoint = (left, right) => (
+    (left.left || 0) + (left.width || 0) <= (right.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
+    || (right.left || 0) + (right.width || 0) <= (left.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
+  );
   const activeBreakLocation = (item, context) => {
     const disabled = item.pageBreak ? isHidden(item.pageBreak.disabled, context) : true;
     return disabled ? 'None' : String(item.pageBreak?.location || 'None');
@@ -1598,21 +1611,28 @@ export async function renderPdf(model, request, config, options = {}) {
     }
     const breakLocation = activeBreakLocation(item, context);
     let band = [item];
-    if (isFixedCoordinateItem(item) && /^None$/i.test(breakLocation)) {
+    if (/^None$/i.test(breakLocation)) {
       let nextIndex = itemIndex + 1;
-      while (nextIndex < items.length && sameDesignTop(item, items[nextIndex])) nextIndex += 1;
-      const peers = items
-        .slice(itemIndex + 1, nextIndex)
-        .filter((candidate) => !isHidden(candidate.hidden, context));
-      if (peers.every((candidate) => (
-        isFixedCoordinateItem(candidate)
-        && /^None$/i.test(activeBreakLocation(candidate, context))
-      ))) {
-        band = [item, ...peers];
-        itemIndex = nextIndex;
-      } else {
-        itemIndex += 1;
+      let designBottom = (item.top || 0) + (item.height || 0);
+      while (nextIndex < items.length) {
+        const candidate = items[nextIndex];
+        if (isHidden(candidate.hidden, context)) {
+          nextIndex += 1;
+          continue;
+        }
+        if (!/^None$/i.test(activeBreakLocation(candidate, context))) break;
+        const coincidentTop = sameDesignTop(item, candidate);
+        const overlapsVertically = (candidate.top || 0) < designBottom - COINCIDENT_EDGE_TOLERANCE_PT;
+        // Different horizontal lanes are coordinate peers while their declared vertical intervals
+        // overlap. Items in the same lane remain sequential so a growing tablix still displaces its
+        // following label/legend. Exact-top items retain the established z-layer behaviour.
+        const independentLane = band.every((peer) => horizontallyDisjoint(peer, candidate));
+        if (!coincidentTop && !(overlapsVertically && independentLane)) break;
+        band.push(candidate);
+        designBottom = Math.max(designBottom, (candidate.top || 0) + (candidate.height || 0));
+        nextIndex += 1;
       }
+      itemIndex = nextIndex;
     } else {
       itemIndex += 1;
     }
@@ -1637,16 +1657,57 @@ export async function renderPdf(model, request, config, options = {}) {
       pageHasContent = false;
     }
     let bandEndY = y;
-    for (const candidate of band) {
-      const candidateY = y + candidate.top - item.top;
-      const x = page.marginLeft + candidate.left;
-      const rendered = renderBodyItem(candidate, x, candidateY, context);
-      bandEndY = Math.max(bandEndY, rendered.endY);
-      previousDesignBottom = Math.max(
-        previousDesignBottom,
-        candidate.top + candidate.height,
+    const fixedBand = band.every(isFixedCoordinateItem);
+    if (band.length > 1 && !fixedBand) {
+      const startPage = globals.PageNumber;
+      const state = { lastPage: startPage };
+      const childEnds = [];
+      const orderedBandItems = [...band].sort((left, right) => (
+        (left.zIndex || 0) - (right.zIndex || 0)
+        || (left.top || 0) - (right.top || 0)
+        || (left.left || 0) - (right.left || 0)
+      ));
+      for (const candidate of orderedBandItems) {
+        switchBufferedPage(startPage);
+        const synchronizedAdvance = () => {
+          const nextPage = globals.PageNumber + 1;
+          if (nextPage <= state.lastPage) switchBufferedPage(nextPage);
+          else {
+            addPage();
+            state.lastPage = Math.max(state.lastPage, globals.PageNumber);
+          }
+        };
+        synchronizedAdvance.bodyTop = bodyTop;
+        const candidateY = y + candidate.top - item.top;
+        const x = page.marginLeft + candidate.left;
+        const rendered = renderBodyItem(candidate, x, candidateY, context, {
+          addPage: synchronizedAdvance,
+        });
+        state.lastPage = Math.max(state.lastPage, globals.PageNumber);
+        childEnds.push({
+          page: globals.PageNumber,
+          endY: rendered.endY ?? candidateY,
+        });
+      }
+      switchBufferedPage(state.lastPage);
+      bandEndY = Math.max(
+        state.lastPage === startPage ? y : bodyTop,
+        ...childEnds
+          .filter((entry) => entry.page === state.lastPage)
+          .map((entry) => entry.endY),
       );
+    } else {
+      for (const candidate of band) {
+        const candidateY = y + candidate.top - item.top;
+        const x = page.marginLeft + candidate.left;
+        const rendered = renderBodyItem(candidate, x, candidateY, context);
+        bandEndY = Math.max(bandEndY, rendered.endY);
+      }
     }
+    previousDesignBottom = Math.max(
+      previousDesignBottom,
+      ...band.map((candidate) => candidate.top + candidate.height),
+    );
     cursorY = bandEndY;
     pageHasContent = true;
     if (/^(End|StartAndEnd)$/i.test(breakLocation)) {

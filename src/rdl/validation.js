@@ -369,6 +369,12 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     ...cell,
     values,
     nestedTablixes,
+    // Preserve the exact materialization scope for expression-backed cell styles. Matrix values are
+    // evaluated at the row∩column intersection; evaluating their background, borders, or font later
+    // with only the row representative would incorrectly give every cell in that row the same style.
+    fields: context.fields || {},
+    scopeDataset: context.dataset || [],
+    scopes: context.scopes || {},
     hidden: cell.items.some((item) => {
       const result = evaluateExpression(item.hidden, context);
       return result === true || String(result).toLowerCase() === 'true';
@@ -596,9 +602,16 @@ function partitionByGroup(group, rows, parameters, globals, sourceRows, datasets
 // value) plus, per hierarchy depth, the header cells to render above the body. Static-column tablixes
 // never reach here (gated by hasColumnGroups).
 function matrixColumnData(tablix, sourceRows, parameters, globals, datasets) {
-  const bodyColumnCount = tablix.bodyColumns.length;
   const leaves = [];
   const headerRowsByLevel = [];
+  // Each leaf in the design-time column hierarchy owns exactly one TablixBody column. A dynamic
+  // leaf repeats that column for every group instance; a neighbouring static leaf remains a single
+  // column. Do not repeat the complete body-column template for every dynamic instance: mixed
+  // static/dynamic matrices (for example, a row-label column followed by a dynamic value column)
+  // would otherwise multiply both columns and destroy the declared grid geometry.
+  const templateIndexByMember = new Map(
+    (tablix.columnMemberPaths || []).map((path, index) => [path[path.length - 1], index]),
+  );
   const walk = (members, incomingRows, scopes, depth) => {
     let leafCount = 0;
     for (const member of members || []) {
@@ -608,11 +621,15 @@ function matrixColumnData(tablix, sourceRows, parameters, globals, datasets) {
           const childScopes = group.name ? { ...scopes, [group.name]: instance.rows } : scopes;
           const childLeafCount = member.children?.length
             ? walk(member.children, instance.rows, childScopes, depth + 1)
-            : (leaves.push({ rows: instance.rows, scopes: childScopes }), 1);
+            : (leaves.push({
+              rows: instance.rows,
+              scopes: childScopes,
+              templateIndex: templateIndexByMember.get(member) ?? 0,
+            }), 1);
           if (member.header) {
             (headerRowsByLevel[depth] ||= []).push({
               cell: member.header.cell,
-              colSpan: childLeafCount * bodyColumnCount,
+              colSpan: childLeafCount,
               fields: instance.rows[0] || {},
               scopes: childScopes,
               rows: instance.rows,
@@ -623,7 +640,11 @@ function matrixColumnData(tablix, sourceRows, parameters, globals, datasets) {
       } else if (member.children?.length) {
         leafCount += walk(member.children, incomingRows, scopes, depth);
       } else {
-        leaves.push({ rows: incomingRows, scopes });
+        leaves.push({
+          rows: incomingRows,
+          scopes,
+          templateIndex: templateIndexByMember.get(member) ?? 0,
+        });
         leafCount += 1;
       }
     }
@@ -637,7 +658,10 @@ export function materializeTablixColumns(tablix, rows, parameters, globals = {},
   if (!tablix.hasColumnGroups) return tablix.columns;
   const sourceRows = prepareTablixData(tablix, rows, parameters, globals, datasets);
   const { leaves } = matrixColumnData(tablix, sourceRows, parameters, globals, datasets);
-  return [...(tablix.rowHeaderColumns || []), ...leaves.flatMap(() => tablix.bodyColumns)];
+  return [
+    ...(tablix.rowHeaderColumns || []),
+    ...leaves.map((leaf) => tablix.bodyColumns[leaf.templateIndex]),
+  ];
 }
 
 function staticLeafRole(leaf, ancestorPath) {
@@ -839,9 +863,16 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           nestedTablixDepth: globals.__nestedTablixDepth || 0,
         };
         const cellResolve = (scope) => scopeKey(scope, tablix, groups, cellContext.fields, parameters, globals, sourceRows, datasets, unit.emitIndex, unit.path);
-        template.cells.forEach((cell, cellIndex) => {
-          bodyCells.push(materializedCell(cell, cellContext, duplicateState, `body:${unit.templateIndex}:${column.rows.length}:${cellIndex}`, cellResolve));
-        });
+        const cell = template.cells[column.templateIndex];
+        if (cell) {
+          bodyCells.push(materializedCell(
+            cell,
+            cellContext,
+            duplicateState,
+            `body:${unit.templateIndex}:${column.rows.length}:${column.templateIndex}`,
+            cellResolve,
+          ));
+        }
       }
     } else {
       bodyCells = template.cells.map((cell, cellIndex) => materializedCell(cell, context, duplicateState, `body:${unit.templateIndex}:${cellIndex}`, resolveScope));
@@ -926,7 +957,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       });
     });
     const result = [...headerRows, ...output];
-    assertMaterializedGrid(result, rowHeaderColumns.length + columnData.leaves.length * tablix.bodyColumns.length, tablix.name);
+    assertMaterializedGrid(result, rowHeaderColumns.length + columnData.leaves.length, tablix.name);
     return result;
   }
 
