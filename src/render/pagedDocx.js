@@ -21,6 +21,7 @@ import {
   TableLayoutType,
   TableRow,
   TextRun,
+  TextDirection,
   TextWrappingType,
   UnderlineType,
   VerticalAlignTable,
@@ -48,6 +49,7 @@ const GRID_PRECISION_POINTS = 0.25;
 // bottom margin/footer. A PDF item that actually occupies this band fails closed below.
 const SECTION_ANCHOR_POINTS = 2;
 const GEOMETRY_EPSILON = 0.13;
+const CERTIFIED_GEOMETRY_TOLERANCE_POINTS = 0.5;
 const NONE_BORDER = Object.freeze({ style: BorderStyle.NONE, size: 0, color: 'auto' });
 const VARIANTS = Object.freeze([
   { key: 'regular', bold: false, italic: false, element: 'embedRegular' },
@@ -74,6 +76,10 @@ function pointsToDrawingPixels(points) {
 
 function pointsToDrawingEmus(points) {
   return Math.round(Number(points || 0) * 12_700);
+}
+
+function pointsToInches(points) {
+  return Math.round((Number(points || 0) / 72) * 1000) / 1000;
 }
 
 function cleanColor(value, fallback = '000000') {
@@ -114,6 +120,272 @@ function isEmptyCell(item) {
   return item.kind === 'tablixCell' && !String(item.text || '') && (item.lines || []).length === 0;
 }
 
+function borderWidth(item, side) {
+  const border = item?.borders?.[side];
+  if (!border || /^none$/i.test(String(border.style || 'None'))) return 0;
+  return Math.max(0, Number(border.width || 0));
+}
+
+function textPaintBounds(item) {
+  const lines = item?.lines || [];
+  const runs = lines.flatMap((line) => line.runs || []);
+  if (runs.length === 0 && lines.length === 0) return null;
+  const left = Math.min(...lines.map((line) => Number(line.x ?? item.x)));
+  const top = Math.min(...lines.map((line) => Number(line.y ?? item.y)));
+  const right = Math.max(...lines.map((line) => (
+    Number(line.x ?? item.x) + Math.max(0, Number(line.width || 0))
+  )));
+  const bottom = Math.max(...lines.map((line) => (
+    Number(line.y ?? item.y) + Math.max(0, Number(line.height || line.contentHeight || 0))
+  )));
+  // PDF clips every textbox to its declared box. A glyph's measured advance can extend beyond that box,
+  // but the clipped pixels do not participate in a visible overlap and must not block a native Word grid.
+  return {
+    left: Math.max(Number(item.x || 0), left),
+    top: Math.max(Number(item.y || 0), top),
+    right: Math.min(Number(item.x || 0) + Number(item.width || 0), right),
+    bottom: Math.min(Number(item.y || 0) + Number(item.height || 0), bottom),
+  };
+}
+
+function isUnpaintedOwner(item) {
+  return !item.backgroundColor && !Object.values(item.borders || {}).some(Boolean);
+}
+
+function primaryTextAlignment(item) {
+  return String(item?.lines?.find((line) => line.runs?.length > 0)?.alignment || 'left').toLowerCase();
+}
+
+function horizontalTrimPreservesFlow(item, side, reduction) {
+  if (reduction <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS) return true;
+  const alignmentValue = primaryTextAlignment(item);
+  if (side === 'right') return alignmentValue === 'left';
+  if (alignmentValue === 'right') return true;
+  return alignmentValue === 'left' && Number(item.padding?.left || 0) + GEOMETRY_EPSILON >= reduction;
+}
+
+function verticalTrimPreservesFlow(item, side, reduction) {
+  if (reduction <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS) return true;
+  const vertical = String(item.verticalAlign || 'top').toLowerCase();
+  if (side === 'bottom') {
+    return /top/.test(vertical)
+      || (/bottom/.test(vertical) && Number(item.padding?.bottom || 0) + GEOMETRY_EPSILON >= reduction);
+  }
+  return /bottom/.test(vertical)
+    || (/top/.test(vertical) && Number(item.padding?.top || 0) + GEOMETRY_EPSILON >= reduction);
+}
+
+function adjustPadding(item, side, reduction) {
+  if (!item.padding || reduction <= 0) return;
+  item.padding = {
+    ...item.padding,
+    [side]: Math.max(0, Number(item.padding[side] || 0) - reduction),
+  };
+}
+
+function coalesceVerticalEdge(first, second) {
+  const upper = first.y <= second.y ? first : second;
+  const lower = upper === first ? second : first;
+  if (contains(upper, lower) || contains(lower, upper)) return null;
+  const overlap = upper.y + upper.height - lower.y;
+  if (overlap <= GEOMETRY_EPSILON) return null;
+  const upperPaint = textPaintBounds(upper);
+  const lowerPaint = textPaintBounds(lower);
+  const paintSafe = isUnpaintedOwner(upper)
+    && isUnpaintedOwner(lower)
+    && (!upperPaint || !lowerPaint
+      || upperPaint.bottom <= lowerPaint.top + GEOMETRY_EPSILON);
+  const borderAllowance = Math.max(
+    borderWidth(upper, 'bottom'),
+    borderWidth(lower, 'top'),
+    GRID_PRECISION_POINTS,
+  ) + GRID_PRECISION_POINTS;
+  const maximumOverlap = Math.min(
+    CERTIFIED_GEOMETRY_TOLERANCE_POINTS * 2,
+    borderAllowance,
+  );
+  if (!paintSafe && overlap > maximumOverlap + GEOMETRY_EPSILON) return null;
+
+  const sharedEdge = snap(paintSafe && upperPaint && lowerPaint
+    ? (upperPaint.bottom + lowerPaint.top) / 2
+    : ((upper.y + upper.height) + lower.y) / 2);
+  if ((upperPaint && upperPaint.bottom > sharedEdge + GEOMETRY_EPSILON)
+    || (lowerPaint && lowerPaint.top < sharedEdge - GEOMETRY_EPSILON)) return null;
+
+  const upperBottom = upper.y + upper.height;
+  const lowerBottom = lower.y + lower.height;
+  const upperReduction = Math.max(0, upperBottom - sharedEdge);
+  const lowerReduction = Math.max(0, sharedEdge - lower.y);
+  if (!verticalTrimPreservesFlow(upper, 'bottom', upperReduction)
+    || !verticalTrimPreservesFlow(lower, 'top', lowerReduction)) return null;
+  upper.height = Math.max(0, sharedEdge - upper.y);
+  lower.y = sharedEdge;
+  lower.height = Math.max(0, lowerBottom - sharedEdge);
+  adjustPadding(upper, 'bottom', upperReduction);
+  adjustPadding(lower, 'top', lowerReduction);
+  return {
+    axis: 'vertical',
+    first: upper.itemName,
+    second: lower.itemName,
+    originalOverlap: overlap,
+    sharedEdge,
+    sourceEdges: [
+      {
+        side: 'bottom',
+        from: upperBottom,
+        to: sharedEdge,
+        start: Math.max(upper.x, lower.x),
+        end: Math.min(upper.x + upper.width, lower.x + lower.width),
+      },
+      {
+        side: 'top',
+        from: lower.y - lowerReduction,
+        to: sharedEdge,
+        start: Math.max(upper.x, lower.x),
+        end: Math.min(upper.x + upper.width, lower.x + lower.width),
+      },
+    ],
+  };
+}
+
+function coalesceHorizontalEdge(first, second) {
+  const left = first.x <= second.x ? first : second;
+  const right = left === first ? second : first;
+  if (contains(left, right) || contains(right, left)) return null;
+  const overlap = left.x + left.width - right.x;
+  if (overlap <= GEOMETRY_EPSILON) return null;
+  const leftPaint = textPaintBounds(left);
+  const rightPaint = textPaintBounds(right);
+  const paintSafe = isUnpaintedOwner(left)
+    && isUnpaintedOwner(right)
+    && (!leftPaint || !rightPaint
+      || leftPaint.right <= rightPaint.left + GEOMETRY_EPSILON);
+  const borderAllowance = Math.max(
+    borderWidth(left, 'right'),
+    borderWidth(right, 'left'),
+    GRID_PRECISION_POINTS,
+  ) + GRID_PRECISION_POINTS;
+  const maximumOverlap = Math.min(
+    CERTIFIED_GEOMETRY_TOLERANCE_POINTS * 2,
+    borderAllowance,
+  );
+  if (!paintSafe && overlap > maximumOverlap + GEOMETRY_EPSILON) return null;
+
+  const sharedEdge = snap(paintSafe && leftPaint && rightPaint
+    ? (leftPaint.right + rightPaint.left) / 2
+    : ((left.x + left.width) + right.x) / 2);
+  if ((leftPaint && leftPaint.right > sharedEdge + GEOMETRY_EPSILON)
+    || (rightPaint && rightPaint.left < sharedEdge - GEOMETRY_EPSILON)) return null;
+
+  const leftRight = left.x + left.width;
+  const rightBoundary = right.x + right.width;
+  const leftReduction = Math.max(0, leftRight - sharedEdge);
+  const rightReduction = Math.max(0, sharedEdge - right.x);
+  if (!horizontalTrimPreservesFlow(left, 'right', leftReduction)
+    || !horizontalTrimPreservesFlow(right, 'left', rightReduction)) return null;
+  left.width = Math.max(0, sharedEdge - left.x);
+  right.x = sharedEdge;
+  right.width = Math.max(0, rightBoundary - sharedEdge);
+  adjustPadding(left, 'right', leftReduction);
+  adjustPadding(right, 'left', rightReduction);
+  return {
+    axis: 'horizontal',
+    first: left.itemName,
+    second: right.itemName,
+    originalOverlap: overlap,
+    sharedEdge,
+    sourceEdges: [
+      {
+        side: 'right',
+        from: leftRight,
+        to: sharedEdge,
+        start: Math.max(left.y, right.y),
+        end: Math.min(left.y + left.height, right.y + right.height),
+      },
+      {
+        side: 'left',
+        from: right.x - rightReduction,
+        to: sharedEdge,
+        start: Math.max(left.y, right.y),
+        end: Math.min(left.y + left.height, right.y + right.height),
+      },
+    ],
+  };
+}
+
+function coalesceShallowEdgeOverlaps(items) {
+  const adjustments = [];
+  for (let leftIndex = 0; leftIndex < items.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < items.length; rightIndex += 1) {
+      const left = items[leftIndex];
+      const right = items[rightIndex];
+      if (!positiveOverlap(left, right)) continue;
+      if (!['textbox', 'tablixCell'].includes(left.kind)
+        || !['textbox', 'tablixCell'].includes(right.kind)) continue;
+      if (!/^(default|horizontal)?$/i.test(String(left.writingMode || 'default'))
+        || !/^(default|horizontal)?$/i.test(String(right.writingMode || 'default'))) continue;
+
+      const overlapWidth = Math.min(left.x + left.width, right.x + right.width)
+        - Math.max(left.x, right.x);
+      const overlapHeight = Math.min(left.y + left.height, right.y + right.height)
+        - Math.max(left.y, right.y);
+      const adjustment = overlapHeight <= overlapWidth
+        ? coalesceVerticalEdge(left, right)
+        : coalesceHorizontalEdge(left, right);
+      if (adjustment) adjustments.push(adjustment);
+    }
+  }
+  return adjustments;
+}
+
+function moveCoalescedBorderLines(lines, adjustments) {
+  for (const line of lines) {
+    for (const adjustment of adjustments) {
+      for (const edge of adjustment.sourceEdges || []) {
+        if (adjustment.axis === 'vertical') {
+          const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
+          const coversEdge = line.x <= edge.start + GEOMETRY_EPSILON
+            && line.x + line.width >= edge.end - GEOMETRY_EPSILON;
+          if (horizontal && coversEdge && Math.abs(line.y - edge.from) <= GEOMETRY_EPSILON) {
+            line.y = edge.to;
+          }
+          const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
+          const onPerpendicularBoundary = Math.abs(line.x - edge.start) <= GEOMETRY_EPSILON
+            || Math.abs(line.x - edge.end) <= GEOMETRY_EPSILON;
+          if (vertical && onPerpendicularBoundary && edge.side === 'top'
+            && Math.abs(line.y - edge.from) <= GEOMETRY_EPSILON) {
+            const bottom = line.y + line.height;
+            line.y = edge.to;
+            line.height = Math.max(0, bottom - edge.to);
+          } else if (vertical && onPerpendicularBoundary && edge.side === 'bottom'
+            && Math.abs(line.y + line.height - edge.from) <= GEOMETRY_EPSILON) {
+            line.height = Math.max(0, edge.to - line.y);
+          }
+        } else {
+          const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
+          const coversEdge = line.y <= edge.start + GEOMETRY_EPSILON
+            && line.y + line.height >= edge.end - GEOMETRY_EPSILON;
+          if (vertical && coversEdge && Math.abs(line.x - edge.from) <= GEOMETRY_EPSILON) {
+            line.x = edge.to;
+          }
+          const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
+          const onPerpendicularBoundary = Math.abs(line.y - edge.start) <= GEOMETRY_EPSILON
+            || Math.abs(line.y - edge.end) <= GEOMETRY_EPSILON;
+          if (horizontal && onPerpendicularBoundary && edge.side === 'left'
+            && Math.abs(line.x - edge.from) <= GEOMETRY_EPSILON) {
+            const right = line.x + line.width;
+            line.x = edge.to;
+            line.width = Math.max(0, right - edge.to);
+          } else if (horizontal && onPerpendicularBoundary && edge.side === 'right'
+            && Math.abs(line.x + line.width - edge.from) <= GEOMETRY_EPSILON) {
+            line.width = Math.max(0, edge.to - line.x);
+          }
+        }
+      }
+    }
+  }
+}
+
 function alignment(value) {
   const normalized = String(value || '').toLowerCase();
   if (normalized === 'center') return AlignmentType.CENTER;
@@ -127,6 +399,14 @@ function verticalAlignment(value) {
   if (/middle|center/.test(normalized)) return VerticalAlignTable.CENTER;
   if (/bottom/.test(normalized)) return VerticalAlignTable.BOTTOM;
   return VerticalAlignTable.TOP;
+}
+
+function wordTextDirection(value) {
+  const normalized = String(value || 'default').replace(/[\s_-]/g, '').toLowerCase();
+  if (normalized === 'default' || normalized === 'horizontal') return undefined;
+  if (normalized === 'rotate270') return TextDirection.BOTTOM_TO_TOP_LEFT_TO_RIGHT;
+  if (normalized === 'vertical') return TextDirection.TOP_TO_BOTTOM_RIGHT_TO_LEFT;
+  return null;
 }
 
 function borderStyle(style) {
@@ -156,10 +436,15 @@ function strongerBorder(left, right) {
   return rightWidth >= leftWidth ? right : left;
 }
 
-function linesForParagraphs(item) {
+function linesForParagraphs(item, bottomPaddingTwips = 0) {
   const source = item.lines || [];
   if (source.length === 0) return [new Paragraph({
-    spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
+    spacing: {
+      before: 0,
+      after: Math.max(0, bottomPaddingTwips),
+      line: 1,
+      lineRule: LineRuleType.EXACT,
+    },
     children: [new TextRun({ text: '' })],
   })];
 
@@ -174,7 +459,7 @@ function linesForParagraphs(item) {
   }
   if (current.length > 0) groups.push(current);
 
-  return groups.map((group) => {
+  return groups.map((group, groupIndex) => {
     const first = group[0];
     const last = group[group.length - 1];
     const runs = [];
@@ -206,7 +491,11 @@ function linesForParagraphs(item) {
       alignment: alignment(first.alignment),
       spacing: {
         before: Math.max(0, pointsToTwips(first.before || 0)),
-        after: Math.max(0, pointsToTwips(last.after || 0)),
+        after: Math.max(
+          0,
+          pointsToTwips(last.after || 0)
+            + (groupIndex === groups.length - 1 ? bottomPaddingTwips : 0),
+        ),
         line: Math.max(1, pointsToTwips(lineHeight)),
         lineRule: LineRuleType.EXACT,
       },
@@ -278,7 +567,16 @@ function modelResources(model) {
   return { embeddedImages, items };
 }
 
-async function pictureForItem(item, resources, model, request, config, tempDir, chartIndex) {
+async function pictureForItem(
+  item,
+  resources,
+  model,
+  request,
+  config,
+  tempDir,
+  chartIndex,
+  bottomPaddingTwips = 0,
+) {
   let data;
   let type;
   if (item.kind === 'image') {
@@ -345,7 +643,7 @@ async function pictureForItem(item, resources, model, request, config, tempDir, 
     // stable in Word footer stories and avoids page offsets being applied twice by alternate OOXML viewers.
     spacing: {
       before: 0,
-      after: 0,
+      after: Math.max(0, bottomPaddingTwips),
       line: 1,
       lineRule: LineRuleType.EXACT,
     },
@@ -378,9 +676,13 @@ async function pictureForItem(item, resources, model, request, config, tempDir, 
 }
 
 function lineBorder(line) {
-  if (!line?.line || /^none$/i.test(String(line.line.style || 'None'))) return null;
+  if (!line?.line) return null;
+  // A trace line is a visible primitive that the canonical PDF actually stroked. Older traces did not
+  // record the stroke style, so absence means the PDF's solid stroke rather than BorderStyle=None.
+  const style = line.line.style || 'Solid';
+  if (/^none$/i.test(String(style))) return null;
   return {
-    style: line.line.style || 'Solid',
+    style,
     width: Number(line.line?.width || 1),
     color: line.line?.color || '#000000',
   };
@@ -420,6 +722,24 @@ function lineMatches(line, side, box) {
   return false;
 }
 
+function lineCoincidesWithEdge(line, box) {
+  const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
+  const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
+  if (horizontal) {
+    const onHorizontalEdge = Math.abs(line.y - box.y) <= GEOMETRY_EPSILON
+      || Math.abs(line.y - (box.y + box.height)) <= GEOMETRY_EPSILON;
+    const overlap = Math.min(line.x + line.width, box.x + box.width) - Math.max(line.x, box.x);
+    return onHorizontalEdge && overlap > GEOMETRY_EPSILON;
+  }
+  if (vertical) {
+    const onVerticalEdge = Math.abs(line.x - box.x) <= GEOMETRY_EPSILON
+      || Math.abs(line.x - (box.x + box.width)) <= GEOMETRY_EPSILON;
+    const overlap = Math.min(line.y + line.height, box.y + box.height) - Math.max(line.y, box.y);
+    return onVerticalEdge && overlap > GEOMETRY_EPSILON;
+  }
+  return false;
+}
+
 function resolvedCellBorders(box, owner, decorators, lines) {
   return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => {
     let resolved = owner?.borders?.[side] || null;
@@ -441,6 +761,12 @@ function resolvedBackground(box, owner, decorators) {
   return containing.at(-1)?.backgroundColor || null;
 }
 
+function isInvisibleRectangle(item) {
+  return item.kind === 'rectangle'
+    && !item.backgroundColor
+    && !Object.values(item.borders || {}).some(Boolean);
+}
+
 function preparePageGrid(page, {
   items = page.items,
   originY = 0,
@@ -452,6 +778,10 @@ function preparePageGrid(page, {
       page: page.number,
       widthPt: page.width,
       heightPt: page.height,
+      widthIn: pointsToInches(page.width),
+      heightIn: pointsToInches(page.height),
+      maximumIn: 22,
+      exactPageLockedOutputAvailable: false,
     });
   }
   // Snap physical edges, not origins and dimensions independently. Independent rounding can move the
@@ -469,7 +799,14 @@ function preparePageGrid(page, {
       width: Math.max(0, right - x),
       height: Math.max(0, bottom - y),
     };
-  }).filter((item) => item.width >= 0 && item.height >= 0);
+  }).filter((item) => (
+    item.width >= 0
+    && item.height >= 0
+    // Layout-only RDL rectangles have already served their purpose in the canonical PDF pagination.
+    // Their children are independently traced, so retaining an unpainted container would add artificial
+    // Word grid boundaries and can reject an otherwise valid page when the design box spans page cuts.
+    && !isInvisibleRectangle(item)
+  ));
   const maximumCanvasBottom = canvasHeight - (reserveSectionAnchor ? SECTION_ANCHOR_POINTS : 0);
   // The table needs to extend only through the last painted PDF primitive. Empty space below it remains
   // ordinary page space; filling that space with exact-height blank table rows makes Word
@@ -491,7 +828,7 @@ function preparePageGrid(page, {
         kind: item.kind,
       });
     }
-    if (item.writingMode && !/^default$/i.test(item.writingMode)) {
+    if (wordTextDirection(item.writingMode) === null) {
       unsupported('Rotated or vertical editable text is not safely representable by the page-locked Word renderer', {
         page: page.number,
         item: item.itemName,
@@ -520,6 +857,12 @@ function preparePageGrid(page, {
     }
   }
   const owners = candidates.filter((candidate) => !demoted.has(candidate));
+  // Some valid RDL layouts intentionally let adjacent painted boxes overlap by the shared border stroke
+  // or by the renderer's quarter-point edge precision. Word table cells cannot overlap, so resolve only
+  // those shallow, content-free edge strips to their midpoint. Each source edge moves by no more than the
+  // certified 0.5pt geometry tolerance. Full containment and genuine content crossings remain fail-closed.
+  const coalescedEdges = coalesceShallowEdgeOverlaps(owners);
+  moveCoalescedBorderLines(lines, coalescedEdges);
   for (let leftIndex = 0; leftIndex < owners.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < owners.length; rightIndex += 1) {
       const left = owners[leftIndex];
@@ -542,11 +885,23 @@ function preparePageGrid(page, {
         width: Math.max(line.width, GEOMETRY_EPSILON * 2),
         height: Math.max(line.height, GEOMETRY_EPSILON * 2),
       }, owner)
-        && !['top', 'right', 'bottom', 'left'].some((side) => lineMatches(line, side, owner))) {
+        && !lineCoincidesWithEdge(line, owner)) {
         unsupported('An RDL line crosses editable content instead of coinciding with a cell edge', {
           page: page.number,
           line: line.itemName,
           item: owner.itemName,
+          lineBounds: {
+            x: line.x,
+            y: line.y,
+            width: line.width,
+            height: line.height,
+          },
+          itemBounds: {
+            x: owner.x,
+            y: owner.y,
+            width: owner.width,
+            height: owner.height,
+          },
         });
       }
     }
@@ -600,7 +955,16 @@ function preparePageGrid(page, {
       }
     }
   }
-  return { page, xBoundaries, yBoundaries, placements, coverage, decorators, lines };
+  return {
+    page,
+    xBoundaries,
+    yBoundaries,
+    placements,
+    coverage,
+    decorators,
+    lines,
+    coalescedEdges,
+  };
 }
 
 function emptyFooterParagraph() {
@@ -683,7 +1047,11 @@ function cellMargins(item) {
   return {
     top: Math.max(0, pointsToTwips(padding.top || 0)),
     right: Math.max(0, pointsToTwips(padding.right || 0)),
-    bottom: Math.max(0, pointsToTwips(padding.bottom || 0)),
+    // Microsoft Word adds the largest bottom cell margin to an exact row height. The canonical PDF trace
+    // already includes bottom padding inside the physical cell box, so tcMar/bottom would make the Word
+    // row taller. Preserve the same inner content box with trailing paragraph space instead; that space
+    // participates in top/center/bottom vertical alignment without changing the exact row height.
+    bottom: 0,
     left: Math.max(0, pointsToTwips(padding.left || 0)),
     marginUnitType: WidthType.DXA,
   };
@@ -694,6 +1062,10 @@ async function tableCellFor(grid, row, column, placement, resources, model, requ
   const columnSpan = placement ? placement.endColumn - placement.startColumn : 1;
   const owner = placement?.item || null;
   const box = cellBox(grid, row, column, rowSpan, columnSpan);
+  const bottomPaddingTwips = Math.max(
+    0,
+    pointsToTwips(owner?.padding?.bottom || 0),
+  );
   const margins = owner ? cellMargins(owner) : {
     top: 0, right: 0, bottom: 0, left: 0, marginUnitType: WidthType.DXA,
   };
@@ -712,38 +1084,39 @@ async function tableCellFor(grid, row, column, placement, resources, model, requ
       config,
       tempDir,
       chartCounter.value++,
+      bottomPaddingTwips,
     )];
   } else {
-    children = owner ? linesForParagraphs(owner) : [new Paragraph({
+    children = owner ? linesForParagraphs(owner, bottomPaddingTwips) : [new Paragraph({
       spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
       children: [new TextRun({ text: '' })],
     })];
   }
   const background = resolvedBackground(box, owner, grid.decorators);
-  return {
-    cell: new TableCell({
-      width: { size: pointsToTwips(box.width), type: WidthType.DXA },
-      columnSpan,
-      rowSpan,
-      margins,
-      verticalAlign: owner?.kind === 'image' || owner?.kind === 'chart'
-        // The floating picture is positioned from this paragraph's top edge. Centering a negligible
-        // anchor paragraph inside a tall owner cell moves the entire drawing down by half the cell height.
-        ? VerticalAlignTable.TOP
-        : verticalAlignment(owner?.verticalAlign),
-      shading: background ? { type: ShadingType.CLEAR, fill: cleanColor(background), color: 'auto' } : undefined,
-      borders: resolvedCellBorders(box, owner, grid.decorators, grid.lines),
-      children,
-    }),
-    bottomPaddingTwips: margins.bottom,
-  };
+  return new TableCell({
+    width: { size: pointsToTwips(box.width), type: WidthType.DXA },
+    columnSpan,
+    rowSpan,
+    margins,
+    verticalAlign: owner?.kind === 'image' || owner?.kind === 'chart'
+      // The floating picture is positioned from this paragraph's top edge. Centering a negligible
+      // anchor paragraph inside a tall owner cell moves the entire drawing down by half the cell height.
+      ? VerticalAlignTable.TOP
+      : verticalAlignment(owner?.verticalAlign),
+    // RDL's two orthogonal writing modes have direct native WordprocessingML table-cell equivalents.
+    // The canonical PDF trace has already resolved any expression-backed WritingMode, so Word consumes
+    // only the physical direction painted by PDF and never re-evaluates report data independently.
+    textDirection: owner ? wordTextDirection(owner.writingMode) || undefined : undefined,
+    shading: background ? { type: ShadingType.CLEAR, fill: cleanColor(background), color: 'auto' } : undefined,
+    borders: resolvedCellBorders(box, owner, grid.decorators, grid.lines),
+    children,
+  });
 }
 
 async function pageTable(grid, resources, model, request, config, tempDir, chartCounter) {
   const rows = [];
   for (let row = 0; row < grid.yBoundaries.length - 1; row += 1) {
     const children = [];
-    let maximumBottomPaddingTwips = 0;
     let column = 0;
     while (column < grid.xBoundaries.length - 1) {
       const placement = grid.coverage[row][column];
@@ -757,7 +1130,7 @@ async function pageTable(grid, resources, model, request, config, tempDir, chart
           column += 1;
           continue;
         }
-        const built = await tableCellFor(
+        const cell = await tableCellFor(
           grid,
           row,
           column,
@@ -769,11 +1142,10 @@ async function pageTable(grid, resources, model, request, config, tempDir, chart
           tempDir,
           chartCounter,
         );
-        children.push(built.cell);
-        maximumBottomPaddingTwips = Math.max(maximumBottomPaddingTwips, built.bottomPaddingTwips);
+        children.push(cell);
         column = placement.endColumn;
       } else {
-        const built = await tableCellFor(
+        const cell = await tableCellFor(
           grid,
           row,
           column,
@@ -785,8 +1157,7 @@ async function pageTable(grid, resources, model, request, config, tempDir, chart
           tempDir,
           chartCounter,
         );
-        children.push(built.cell);
-        maximumBottomPaddingTwips = Math.max(maximumBottomPaddingTwips, built.bottomPaddingTwips);
+        children.push(cell);
         column += 1;
       }
     }
@@ -794,24 +1165,10 @@ async function pageTable(grid, resources, model, request, config, tempDir, chart
       1,
       pointsToTwips(grid.yBoundaries[row + 1] - grid.yBoundaries[row]),
     );
-    // Microsoft Word adds the largest bottom cell margin to an exact w:trHeight. The PDF trace already
-    // includes that padding inside the physical row box, so emitting the unadjusted trace height makes
-    // every padded Word row too tall. Near a page boundary, the accumulated surplus causes an otherwise
-    // fitting cantSplit row to jump wholesale to the next page. Compensate from the actual cells in this
-    // physical row so Word's final height remains the canonical PDF height.
-    const wordHeightTwips = tracedHeightTwips - maximumBottomPaddingTwips;
-    if (wordHeightTwips < 1) {
-      unsupported('A PDF row is too short to preserve its bottom cell padding in an exact Word row', {
-        page: grid.page.number,
-        row: row + 1,
-        heightTwips: tracedHeightTwips,
-        bottomPaddingTwips: maximumBottomPaddingTwips,
-      });
-    }
     rows.push(new TableRow({
       cantSplit: true,
       height: {
-        value: wordHeightTwips,
+        value: tracedHeightTwips,
         rule: HeightRule.EXACT,
       },
       children,
@@ -1034,8 +1391,21 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
       cause: error.message,
     });
   }
-  const internalFiles = await writeInternalArtifacts(tempDir, canonical.buffer, trace);
+  let ownedTempDir = null;
+  let workingTempDir = tempDir;
+  const requiresChartWorkspace = trace.pages.some((page) => (
+    page.items.some((item) => item.kind === 'chart')
+  ));
+  if (!workingTempDir && requiresChartWorkspace) {
+    await fs.mkdir(config.tempRoot, { recursive: true, mode: 0o700 });
+    await fs.chmod(config.tempRoot, 0o700);
+    ownedTempDir = await fs.mkdtemp(path.join(config.tempRoot, 'docx-chart-'));
+    await fs.chmod(ownedTempDir, 0o700);
+    workingTempDir = ownedTempDir;
+  }
+  let internalFiles = null;
   try {
+    internalFiles = await writeInternalArtifacts(workingTempDir, canonical.buffer, trace);
     const embeddedFonts = await embeddedFontFamilies(trace, config);
     const resources = modelResources(model);
     const canonicalRequest = { ...request, __canonicalPageCount: canonical.pageCount };
@@ -1054,7 +1424,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
         model,
         canonicalRequest,
         config,
-        tempDir,
+        workingTempDir,
         chartCounter,
       );
       sections.push({
@@ -1066,7 +1436,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
           model,
           canonicalRequest,
           config,
-          tempDir,
+          workingTempDir,
           chartCounter,
         )],
       });
@@ -1106,5 +1476,6 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
     };
   } finally {
     await cleanupInternalArtifacts(internalFiles);
+    if (ownedTempDir) await fs.rm(ownedTempDir, { recursive: true, force: true });
   }
 }

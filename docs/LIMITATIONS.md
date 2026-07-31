@@ -178,9 +178,11 @@ Word for Mac, LibreOffice, Google Docs, and browser previews may paginate or ras
 differently and are outside the contract.
 
 Word geometry that cannot be represented safely fails with `UNSUPPORTED_FEATURE` instead of being scaled,
-clipped, rasterized, or approximated. This includes incompatible editable overlaps, unsupported rotations,
-required tables wider than 63 columns, and pages over Word's 22-by-22-inch limit. The former continuous
-renderer, native-fragment flags, and per-report profiles are obsolete and rejected with `RDL_INVALID`.
+clipped, rasterized, or approximated. Native orthogonal `Vertical` and `Rotate270` writing modes are
+supported through Word table-cell text directions; arbitrary or unknown writing directions remain
+unsupported. Other fail-closed cases include incompatible editable overlaps, required tables wider than
+63 columns, and pages over Word's 22-by-22-inch limit. The former continuous renderer, native-fragment
+flags, and per-report profiles are obsolete and rejected with `RDL_INVALID`.
 
 ### Border thickness varies slightly between cells
 

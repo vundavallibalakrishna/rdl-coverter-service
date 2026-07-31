@@ -11,6 +11,7 @@ import { analyzeRdl, parseRdl } from '../src/rdl/parser.js';
 import { renderEditableDocx } from '../src/render/docx.js';
 import { renderExcel } from '../src/render/excel.js';
 import { renderPdf } from '../src/render/pdf.js';
+import { analyzeWindowsWordCompatibility } from '../src/render/windowsWordCompatibility.js';
 
 const execFileAsync = promisify(execFile);
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
@@ -58,13 +59,21 @@ test('PDF writes Rotate270 and Vertical text on a vertical physical axis', async
   }
 });
 
-test('page-locked editable DOCX fails closed for rotated text', async () => {
-  await assert.rejects(
-    () => renderEditableDocx(parseRdl(rdl()), request, config),
-    (error) => error.code === 'UNSUPPORTED_FEATURE'
-      && error.details?.item === 'BottomToTop'
-      && error.details?.writingMode === 'rotate270',
-  );
+test('page-locked editable DOCX uses native cell directions for orthogonal RDL writing modes', async () => {
+  const model = parseRdl(rdl());
+  const analysis = analyzeWindowsWordCompatibility(model, config);
+  const result = await renderEditableDocx(model, request, config);
+  const zip = await JSZip.loadAsync(result.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+
+  assert.equal(analysis.unsupported.some((entry) => entry.code === 'WORD_EDITABLE_ROTATION'), false);
+  assert.equal(analysis.stats.orthogonalWritingModes, 2);
+  assert.equal(result.pageCount, 1);
+  assert.match(documentXml, /<w:textDirection w:val="btLr"\/>/);
+  assert.match(documentXml, /<w:textDirection w:val="tbRl"\/>/);
+  assert.match(documentXml, /<w:t(?:\s[^>]*)?>ROTATE270<\/w:t>/);
+  assert.match(documentXml, /<w:t(?:\s[^>]*)?>VERTICAL<\/w:t>/);
+  assert.doesNotMatch(documentXml, /<wps:wsp>|<v:shape(?:\s|>)/);
 });
 
 test('XLSX REPORT uses native editable cell rotations', async () => {

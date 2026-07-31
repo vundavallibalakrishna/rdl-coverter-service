@@ -44,6 +44,18 @@ function snap(value) {
   return Math.round(Number(value || 0) / PRECISION_POINTS) * PRECISION_POINTS;
 }
 
+function roundMeasurement(value) {
+  return Math.round(Number(value || 0) * 1000) / 1000;
+}
+
+function pointsToInches(value) {
+  return roundMeasurement(Number(value || 0) / 72);
+}
+
+function pointsToCentimetres(value) {
+  return roundMeasurement((Number(value || 0) / 72) * 2.54);
+}
+
 function coordinateBoundaryEstimate(model) {
   const boundaries = new Set([0, snap(model.page.width)]);
   const origins = [
@@ -74,7 +86,8 @@ function modelStats(model) {
     charts: 0,
     images: 0,
     subreports: model.features?.subreports || 0,
-    literalRotations: 0,
+    orthogonalWritingModes: 0,
+    unsupportedLiteralWritingModes: 0,
     expressionWritingModes: 0,
     largestDeclaredTableGrid: 0,
     dynamicColumnTablixes: 0,
@@ -93,8 +106,12 @@ function modelStats(model) {
       if (item.hasColumnGroups) stats.dynamicColumnTablixes += 1;
     }
     const writingMode = item.style?.writingMode;
-    if (typeof writingMode === 'string' && writingMode.startsWith('=')) stats.expressionWritingModes += 1;
-    else if (writingMode && !/^default$/i.test(String(writingMode))) stats.literalRotations += 1;
+    if (typeof writingMode === 'string' && writingMode.startsWith('=')) {
+      stats.expressionWritingModes += 1;
+    } else if (writingMode && !/^(default|horizontal)$/i.test(String(writingMode))) {
+      if (/^(vertical|rotate270)$/i.test(String(writingMode))) stats.orthogonalWritingModes += 1;
+      else stats.unsupportedLiteralWritingModes += 1;
+    }
   });
   return stats;
 }
@@ -106,6 +123,12 @@ export function analyzeWindowsWordCompatibility(model, config = {}, request = {}
     widthPt: model.page.width,
     heightPt: model.page.height,
     maximumPt: WORD_MAX_PAGE_POINTS,
+    widthIn: pointsToInches(model.page.width),
+    heightIn: pointsToInches(model.page.height),
+    widthCm: pointsToCentimetres(model.page.width),
+    heightCm: pointsToCentimetres(model.page.height),
+    maximumIn: 22,
+    maximumCm: 55.88,
     eligible: model.page.width <= WORD_MAX_PAGE_POINTS && model.page.height <= WORD_MAX_PAGE_POINTS,
   };
   const tableGrid = {
@@ -122,14 +145,23 @@ export function analyzeWindowsWordCompatibility(model, config = {}, request = {}
   if (!page.eligible) unsupported.push({
     code: 'WORD_PAGE_SIZE_LIMIT',
     message: 'The declared page exceeds Microsoft Word’s 22-by-22-inch limit.',
+    details: {
+      widthPt: page.widthPt,
+      heightPt: page.heightPt,
+      widthIn: page.widthIn,
+      heightIn: page.heightIn,
+      maximumIn: page.maximumIn,
+      exactPageLockedOutputAvailable: false,
+      remediation: 'Redesign or tile the RDL into pages no larger than 22 by 22 inches.',
+    },
   });
   if (!tableGrid.eligibleAtAnalysis) unsupported.push({
     code: 'WORD_TABLE_COLUMN_LIMIT',
     message: 'The declared or estimated fixed page grid exceeds Microsoft Word’s 63-column table limit.',
   });
-  if (stats.literalRotations > 0) unsupported.push({
+  if (stats.unsupportedLiteralWritingModes > 0) unsupported.push({
     code: 'WORD_EDITABLE_ROTATION',
-    message: 'The report declares rotated/vertical text that is not supported by the page-locked editable contract.',
+    message: 'The report declares a writing direction that cannot be represented by native Word table cells.',
   });
   for (const font of fontEmbedding.filter((entry) => entry.blocksWindowsPagedEditable)) {
     unsupported.push({

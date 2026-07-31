@@ -80,7 +80,9 @@ test('paragraph SpaceBefore, SpaceAfter, and LineHeight are normalized and rende
   const docx = await renderEditableDocx(model, request, config);
   const xml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
   assert.match(xml, /<w:spacing[^>]*w:before="60"/);
-  assert.match(xml, /<w:spacing[^>]*w:after="200"/);
+  // The 10pt paragraph SpaceAfter remains native and the textbox's 2pt bottom padding is represented as
+  // trailing paragraph space so Word does not add tcMar/bottom to the exact row height.
+  assert.match(xml, /<w:spacing[^>]*w:after="240"/);
   assert.match(xml, /<w:spacing[^>]*w:line="400"/);
   assert.match(xml, /<w:spacing[^>]*w:lineRule="exact"/);
 });

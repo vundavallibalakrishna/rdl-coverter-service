@@ -49,7 +49,9 @@ const SUPPORTED_ELEMENTS = new Set([
   'ChartDataPointValues', 'Y', 'ChartDataLabel', 'UseValueAsLabel', 'Visible',
   'ChartAreas', 'ChartArea', 'ChartCategoryAxes', 'ChartValueAxes', 'ChartAxis',
   'LabelsAutoFitDisabled',
-  'ChartLegends', 'ChartLegend', 'Position', 'ChartTitles', 'ChartTitle', 'Caption',
+  'ChartLegends', 'ChartLegend', 'Position', 'Layout',
+  'ChartTitles', 'ChartTitle', 'Caption',
+  'Palette', 'ChartCustomPaletteColors', 'ChartCustomPaletteColor',
   'Type', 'Subtype', 'Minimum', 'Maximum', 'Interval', 'ChartNoDataMessage',
 ]);
 
@@ -71,8 +73,9 @@ const METADATA_ELEMENTS = new Set([
   'AutoFitTextDisabled', 'BackgroundGradientType', 'CalloutLineColor', 'CategoryAxisName',
   'ChartAxisScaleBreak', 'ChartAxisTitle', 'ChartBorderSkin', 'ChartEmptyPoints', 'ChartLegendTitle',
   'ChartMajorGridLines', 'ChartMajorTickMarks', 'ChartMarker', 'ChartMinorGridLines',
-  'ChartMinorTickMarks', 'ChartSmartLabel', 'ColumnSeparatorColor', 'CrossAt', 'DockOutsideChartArea',
-  'Enabled', 'HeaderSeparatorColor', 'Length', 'Location', 'MinMovingDistance', 'Palette', 'ValueAxisName',
+  'ChartMinorTickMarks', 'ChartSmartLabel', 'ColumnSeparatorColor', 'CrossAt',
+  'DockOutsideChartArea', 'DockToChartArea',
+  'Enabled', 'HeaderSeparatorColor', 'Length', 'Location', 'MinMovingDistance', 'ValueAxisName',
 ]);
 
 const METADATA_SUBTREES = new Set([
