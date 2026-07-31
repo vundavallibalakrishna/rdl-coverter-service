@@ -724,6 +724,13 @@ export function parseRdl(input, limits = {}) {
     embeddedImages,
     defaultFontFamily,
     fonts: [...new Set([defaultFontFamily, ...[...xml.matchAll(/<FontFamily>([^<]+)<\/FontFamily>/g)].map((match) => match[1].trim())])],
+    // Field names the report actually reads, from every `Fields!Name.Value` in every expression. SSRS does
+    // not require a declared field to exist in the result set — it only matters where the report reads one
+    // — so a dataset routinely declares columns its query never returns (a query edited after the fields
+    // were generated, a shared dataset trimmed for one report). Demanding all of them rejects reports SSRS
+    // renders. Dynamic access, `Fields(name).Value`, cannot be resolved statically and is not captured; a
+    // field reached only that way behaves as SSRS does and yields nothing rather than failing the request.
+    referencedFields: [...new Set([...xml.matchAll(/Fields!([A-Za-z_][A-Za-z0-9_]*)/g)].map((match) => match[1]))],
     features: {
       textboxes: (xml.match(/<Textbox\b/g) || []).length,
       tablixes: (xml.match(/<Tablix\b/g) || []).length,

@@ -60,6 +60,11 @@ export function validateRenderInput(model, request, limits) {
   const resolvedParameters = resolveParameterValues(model.parameters, request.parameters || {});
 
   const datasets = request.datasets || {};
+  // An older parse (or a caller-built model) may predate referencedFields; treating that as "everything is
+  // referenced" keeps the previous, stricter behaviour rather than silently validating nothing.
+  const referenced = model.referencedFields
+    ? new Set(model.referencedFields)
+    : { has: () => true };
   let totalRows = 0;
   for (const dataset of model.datasets) {
     if (!model.renderingDatasets.includes(dataset.name)) continue;
@@ -72,6 +77,9 @@ export function validateRenderInput(model, request, limits) {
       for (const field of dataset.fields) {
         // A calculated field is computed from its siblings, never supplied by the caller (see rdl/fields.js).
         if (!isBoundField(field)) continue;
+        // Require only what the report reads. A declared-but-unread field is not a data-contract breach:
+        // SSRS never demands it either, so failing the request over one rejects a report that renders.
+        if (!referenced.has(field.name)) continue;
         if (rowKeyFor(row, field.dataField) === undefined) {
           throw new ServiceError(
             'FIELD_MISSING',
