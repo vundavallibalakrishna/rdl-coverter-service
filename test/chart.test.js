@@ -117,9 +117,20 @@ test('renders the incident dashboard to a selectable PDF with chart labels', { s
 });
 
 test('embeds one image per chart in the editable DOCX, scaled to fit the page and landscape', { skip }, async (context) => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-chart-docx-'));
-  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
-  const result = await renderEditableDocx(model, request, config, tempDir);
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-chart-docx-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const ownedWorkspaceConfig = loadConfig({
+    ...process.env,
+    RDL_STRICT_FONTS: 'false',
+    RDL_RENDER_TIMEOUT_MS: '30000',
+    RDL_TEMP_ROOT: tempRoot,
+  });
+  const result = await renderEditableDocx(model, request, ownedWorkspaceConfig);
+  assert.deepEqual(
+    await fs.readdir(tempRoot),
+    [],
+    'a standalone chart render must clean its security-controlled workspace',
+  );
   const zip = await JSZip.loadAsync(result.buffer);
   const media = Object.keys(zip.files).filter((name) => /^word\/media\/.*\.png$/.test(name));
   assert.equal(media.length, 3);

@@ -562,7 +562,9 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
       y,
       width: item.width,
       height: item.height,
-      line: { width: lineWidth, color: lineColor },
+      // drawSimpleItem strokes standalone RDL Line primitives as solid PDF paths. Record the resolved
+      // stroke that was actually painted so page-locked Word can materialize the same visible border.
+      line: { style: 'Solid', width: lineWidth, color: lineColor },
     });
     doc.save().lineWidth(lineWidth).strokeColor(lineColor).moveTo(x, y).lineTo(x + item.width, y + item.height).stroke().restore();
   }
@@ -1354,9 +1356,20 @@ export async function renderPdf(model, request, config, options = {}) {
   };
   addPage.bodyTop = bodyTop;
   addPage();
+  const switchBufferedPage = (pageNumber) => {
+    const range = doc.bufferedPageRange();
+    const pageIndex = Number(pageNumber) - 1;
+    if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= range.count) {
+      throw new ServiceError('INTERNAL_ERROR', 'Buffered PDF page navigation became inconsistent', 500);
+    }
+    doc.switchToPage(range.start + pageIndex);
+    selectLayoutTracePage(doc, pageIndex);
+    globals.PageNumber = pageIndex + 1;
+  };
 
   const datasets = normalizeDatasets(model, request);
-  const renderBodyItem = (item, x, y, context) => {
+  const renderBodyItem = (item, x, y, context, pagination = {}) => {
+    const pageAdvance = pagination.addPage || addPage;
     if (isHidden(item.hidden, context)) return { endY: y };
     if (item.type === 'Tablix') {
       return renderTablix({
@@ -1368,7 +1381,7 @@ export async function renderPdf(model, request, config, options = {}) {
         startX: x,
         startY: y,
         pageBottom,
-        addPage,
+        addPage: pageAdvance,
         globals,
       });
     }
@@ -1396,13 +1409,13 @@ export async function renderPdf(model, request, config, options = {}) {
         // tablix-row policy and avoids creating a short first-page fragment solely because earlier
         // coordinate-flow content consumed the remainder.
         if (desiredHeight <= freshCapacity && currentY > bodyTop + 0.5) {
-          addPage();
+          pageAdvance();
           currentY = bodyTop;
           firstSegment = false;
           continue;
         }
         if (available <= Math.max(10, styleSize(item.style?.fontSize, context, 10) || 10)) {
-          addPage();
+          pageAdvance();
           currentY = bodyTop;
           firstSegment = false;
           continue;
@@ -1417,7 +1430,7 @@ export async function renderPdf(model, request, config, options = {}) {
           available,
         );
         if (!split.head && split.tail) {
-          addPage();
+          pageAdvance();
           currentY = bodyTop;
           firstSegment = false;
           continue;
@@ -1429,7 +1442,7 @@ export async function renderPdf(model, request, config, options = {}) {
         });
         if (!split.tail) return { height: currentY + available - y, endY: currentY + available };
         remaining = split.tail;
-        addPage();
+        pageAdvance();
         currentY = bodyTop;
         firstSegment = false;
       }
@@ -1464,40 +1477,83 @@ export async function renderPdf(model, request, config, options = {}) {
           && bandY + bandHeight > pageBottom
           && endY > bodyTop + COINCIDENT_EDGE_TOLERANCE_PT
         )) {
-          addPage();
+          pageAdvance();
           bandY = bodyTop;
         }
         let bandEndY = bandY;
-        const pageNumberAtBandStart = globals.PageNumber;
-        for (const child of [...band.items].sort((left, right) => (
+        const orderedBandItems = [...band.items].sort((left, right) => (
           (left.zIndex || 0) - (right.zIndex || 0)
           || (left.top || 0) - (right.top || 0)
           || (left.left || 0) - (right.left || 0)
-        ))) {
-          const childY = bandY + (child.top || 0) - band.top;
-          const pageNumberBeforeChild = globals.PageNumber;
-          const rendered = renderBodyItem(child, x + (child.left || 0), childY, context);
-          if (band.items.length > 1 && globals.PageNumber !== pageNumberBeforeChild) {
-            throw new ServiceError(
-              'UNSUPPORTED_FEATURE',
-              `Overlapping or side-by-side items in rectangle ${item.name || 'unnamed'} cannot independently span pages`,
-              422,
+        ));
+        if (orderedBandItems.length > 1 && !fixedBand) {
+          const startPage = globals.PageNumber;
+          const state = { lastPage: startPage };
+          const childEnds = [];
+          for (const child of orderedBandItems) {
+            switchBufferedPage(startPage);
+            const synchronizedAdvance = () => {
+              const nextPage = globals.PageNumber + 1;
+              if (nextPage <= state.lastPage) {
+                switchBufferedPage(nextPage);
+              } else {
+                pageAdvance();
+                state.lastPage = Math.max(state.lastPage, globals.PageNumber);
+              }
+            };
+            synchronizedAdvance.bodyTop = pageAdvance.bodyTop ?? bodyTop;
+            const childY = bandY + (child.top || 0) - band.top;
+            const rendered = renderBodyItem(
+              child,
+              x + (child.left || 0),
+              childY,
+              context,
+              { addPage: synchronizedAdvance },
             );
+            state.lastPage = Math.max(state.lastPage, globals.PageNumber);
+            childEnds.push({
+              page: globals.PageNumber,
+              endY: rendered.endY ?? childY,
+            });
           }
-          const renderedEndY = rendered.endY ?? childY;
-          // Y coordinates are page-local. Once a single-child band advances to another page, its
-          // final-page endpoint replaces the prior-page band coordinate; comparing the two with
-          // Math.max would retain a stale Y and can push otherwise fitting later bands forward.
-          bandEndY = globals.PageNumber === pageNumberBeforeChild
-            ? Math.max(bandEndY, renderedEndY)
-            : renderedEndY;
-        }
-        if (band.items.length > 1 && globals.PageNumber !== pageNumberAtBandStart) {
-          throw new ServiceError(
-            'UNSUPPORTED_FEATURE',
-            `Overlapping or side-by-side items in rectangle ${item.name || 'unnamed'} cannot independently span pages`,
-            422,
+          if (state.lastPage > startPage) {
+            const hasVisibleBorder = Object.values(resolvedTraceBorders(item.style, context))
+              .some(Boolean);
+            if (backgroundColor || hasVisibleBorder) {
+              throw new ServiceError(
+                'UNSUPPORTED_FEATURE',
+                'A page-spanning rectangle with a visible fill or border cannot be safely fragmented',
+                422,
+                { item: item.name || null },
+              );
+            }
+          }
+          switchBufferedPage(state.lastPage);
+          bandEndY = Math.max(
+            bandY,
+            ...childEnds
+              .filter((entry) => entry.page === state.lastPage)
+              .map((entry) => entry.endY),
           );
+        } else {
+          for (const child of orderedBandItems) {
+            const childY = bandY + (child.top || 0) - band.top;
+            const pageNumberBeforeChild = globals.PageNumber;
+            const rendered = renderBodyItem(
+              child,
+              x + (child.left || 0),
+              childY,
+              context,
+              { addPage: pageAdvance },
+            );
+            const renderedEndY = rendered.endY ?? childY;
+            // Y coordinates are page-local. Once a single-child band advances to another page, its
+            // final-page endpoint replaces the prior-page band coordinate; comparing the two with
+            // Math.max would retain a stale Y and can push otherwise fitting later bands forward.
+            bandEndY = globals.PageNumber === pageNumberBeforeChild
+              ? Math.max(bandEndY, renderedEndY)
+              : renderedEndY;
+          }
         }
         endY = bandEndY;
         previousDesignBottom = band.designBottom;

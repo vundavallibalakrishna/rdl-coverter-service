@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { analyzeRdl, parseRdl } from '../src/rdl/parser.js';
 import { normalizeDatasets } from '../src/render/common.js';
 import { materializeChart } from '../src/render/chartData.js';
+import { renderEditableDocx } from '../src/render/docx.js';
 import { renderPdf } from '../src/render/pdf.js';
 
 const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1 }) => `
@@ -88,4 +92,17 @@ test('fixed charts with the same RDL Top render side by side on one PDF page', a
   const result = await renderPdf(parseRdl(sideBySideRdl), request, config);
   assert.equal(result.pageCount, 1);
   assert.ok(result.buffer.length > 2_000);
+});
+
+test('standalone editable DOCX chart rendering owns and cleans its temporary workspace', async (context) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-chart-owned-workspace-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const ownedWorkspaceConfig = loadConfig({
+    ...process.env,
+    RDL_STRICT_FONTS: 'false',
+    RDL_TEMP_ROOT: tempRoot,
+  });
+  const result = await renderEditableDocx(parseRdl(rdl()), request, ownedWorkspaceConfig);
+  assert.equal(result.buffer.subarray(0, 2).toString(), 'PK');
+  assert.deepEqual(await fs.readdir(tempRoot), []);
 });

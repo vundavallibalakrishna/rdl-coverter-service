@@ -15,6 +15,7 @@ import {
 } from '../src/render/fonts.js';
 import { renderEditableDocx } from '../src/render/docx.js';
 import { renderPdf } from '../src/render/pdf.js';
+import { analyzeWindowsWordCompatibility } from '../src/render/windowsWordCompatibility.js';
 
 const execFileAsync = promisify(execFile);
 const fixture = await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url));
@@ -259,7 +260,18 @@ test('Windows page, grid-column, and editable-overlap limits fail closed generic
   oversizedPage.page.width = 23 * 72;
   await assert.rejects(
     renderEditableDocx(oversizedPage, request, config),
-    (error) => error.code === 'UNSUPPORTED_FEATURE' && /22-by-22-inch/.test(error.message),
+    (error) => error.code === 'UNSUPPORTED_FEATURE'
+      && /22-by-22-inch/.test(error.message)
+      && error.details?.widthIn === 23
+      && error.details?.maximumIn === 22,
+  );
+  const pageAnalysis = analyzeWindowsWordCompatibility(oversizedPage, config);
+  assert.equal(pageAnalysis.page.widthIn, 23);
+  assert.equal(pageAnalysis.page.maximumCm, 55.88);
+  assert.equal(
+    pageAnalysis.unsupported.find((entry) => entry.code === 'WORD_PAGE_SIZE_LIMIT')
+      ?.details?.exactPageLockedOutputAvailable,
+    false,
   );
 
   const textbox = structuredClone(baseModel.body.items.find((item) => item.type === 'Textbox'));
@@ -300,6 +312,82 @@ test('Windows page, grid-column, and editable-overlap limits fail closed generic
   );
 });
 
+test('safe shared-edge overlaps coalesce without permitting genuine content crossings', async () => {
+  const adjacent = structuredClone(baseModel);
+  adjacent.page.header = null;
+  adjacent.page.footer = null;
+  adjacent.page.marginLeft = 0;
+  adjacent.page.marginRight = 0;
+  const source = structuredClone(baseModel.body.items.find((item) => item.type === 'Textbox'));
+  const textBox = (name, value, left, top, width, height) => ({
+    ...structuredClone(source),
+    name,
+    value,
+    paragraphs: [[value]],
+    left,
+    top,
+    width,
+    height,
+    canGrow: false,
+    style: {
+      ...structuredClone(source.style),
+      border: { style: 'Solid', width: 1, color: '#000000' },
+      borders: {
+        top: { style: 'Solid', width: 1, color: '#000000' },
+        right: { style: 'Solid', width: 1, color: '#000000' },
+        bottom: { style: 'Solid', width: 1, color: '#000000' },
+        left: { style: 'Solid', width: 1, color: '#000000' },
+      },
+    },
+  });
+  const icon = textBox('ClippedIcon', 'X', 0, 80, 22, 34);
+  const iconLabel = textBox('IconLabel', 'ICON_LABEL', 20, 80, 80, 34);
+  for (const [item, textAlign] of [[icon, 'Center'], [iconLabel, 'Left']]) {
+    item.style.backgroundColor = null;
+    item.style.textAlign = textAlign;
+    item.style.border = { style: 'None', width: 0, color: '#000000' };
+    item.style.borders = Object.fromEntries(
+      ['top', 'right', 'bottom', 'left']
+        .map((side) => [side, { style: 'None', width: 0, color: '#000000' }]),
+    );
+  }
+  adjacent.body.items = [{
+    type: 'Rectangle',
+    name: 'AdjacentEdgeContainer',
+    left: 0,
+    top: 0,
+    width: 200,
+    height: 114,
+    zIndex: 0,
+    hidden: false,
+    style: {},
+    items: [
+      textBox('Upper', 'UPPER', 0, 0, 100, 20),
+      textBox('Lower', 'LOWER', 0, 19.25, 100, 20),
+      textBox('Left', 'LEFT', 0, 50, 100, 20),
+      textBox('Right', 'RIGHT', 99.25, 50, 100, 20),
+      icon,
+      iconLabel,
+    ],
+  }];
+
+  const rendered = await renderEditableDocx(adjacent, request, config);
+  const documentXml = await (
+    await JSZip.loadAsync(rendered.buffer)
+  ).file('word/document.xml').async('string');
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+
+  for (const marker of ['UPPER', 'LOWER', 'LEFT', 'RIGHT', 'ICON_LABEL']) {
+    assert.match(nativeText, new RegExp(marker));
+  }
+  assert.match(nativeText, /X/);
+  assert.match(documentXml, /<w:trHeight w:val="395" w:hRule="exact"\/>/);
+  assert.match(documentXml, /<w:gridCol w:w="1985"\/>/);
+  assert.doesNotMatch(documentXml, /<wps:wsp>|<v:shape(?:\s|>)/);
+});
+
 test('coincident PDF edges remain coincident after the quarter-point Word grid conversion', async () => {
   const adjacent = structuredClone(baseModel);
   adjacent.page.header = null;
@@ -336,7 +424,7 @@ test('coincident PDF edges remain coincident after the quarter-point Word grid c
   assert.equal(rendered.pageCount, 1);
 });
 
-test('exact Word rows compensate for the largest bottom cell padding without counting top padding twice', async () => {
+test('exact Word rows preserve bottom padding as trailing content space without Word height inflation', async () => {
   const padded = structuredClone(baseModel);
   padded.page.header = null;
   padded.page.footer = null;
@@ -364,14 +452,15 @@ test('exact Word rows compensate for the largest bottom cell padding without cou
   const zip = await JSZip.loadAsync(rendered.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
 
-  // The PDF row is 20pt/400 twips. Word adds the largest 2pt/40-twip bottom cell margin even when
-  // hRule="exact", so the serialized row height must be 360 twips. Top padding does not receive this
-  // Word-specific addition and therefore must not be subtracted.
-  assert.match(documentXml, /<w:trHeight w:val="360" w:hRule="exact"\/>/);
+  // Word adds the largest tcMar/bottom value to hRule="exact". Keep the canonical 20pt/400-twip row
+  // untouched, emit zero bottom cell margin, and preserve the declared 2pt/40-twip padding as trailing
+  // paragraph space inside that exact box.
+  assert.match(documentXml, /<w:trHeight w:val="400" w:hRule="exact"\/>/);
   assert.match(
     documentXml,
-    /<w:tcMar>[\s\S]*?<w:top w:type="dxa" w:w="100"\/>[\s\S]*?<w:bottom w:type="dxa" w:w="40"\/>[\s\S]*?<\/w:tcMar>/,
+    /<w:tcMar>[\s\S]*?<w:top w:type="dxa" w:w="100"\/>[\s\S]*?<w:bottom w:type="dxa" w:w="0"\/>[\s\S]*?<\/w:tcMar>/,
   );
+  assert.match(documentXml, /<w:spacing\b(?=[^>]*w:after="40")[^>]*\/>/);
 
   const noBottomPadding = structuredClone(padded);
   noBottomPadding.body.items[0].style.paddingBottom = 0;
@@ -380,12 +469,73 @@ test('exact Word rows compensate for the largest bottom cell padding without cou
   const unadjustedXml = await unadjustedZip.file('word/document.xml').async('string');
   assert.match(unadjustedXml, /<w:trHeight w:val="400" w:hRule="exact"\/>/);
 
-  const impossible = structuredClone(padded);
-  impossible.body.items[0].height = 1;
-  await assert.rejects(
-    renderEditableDocx(impossible, request, config),
-    (error) => error.code === 'UNSUPPORTED_FEATURE'
-      && /too short to preserve its bottom cell padding/.test(error.message),
+  const splitGrid = structuredClone(padded);
+  const spanning = structuredClone(splitGrid.body.items[0]);
+  spanning.top = 0;
+  const peer = {
+    ...structuredClone(spanning),
+    name: 'OffsetPeerCreatesTinyFirstGridRow',
+    value: 'Peer',
+    paragraphs: [['Peer']],
+    left: 100,
+    top: 1.5,
+    width: 100,
+    height: 10,
+    style: {
+      ...splitGrid.body.items[0].style,
+      paddingBottom: 0,
+    },
+  };
+  splitGrid.body.items = [{
+    type: 'Rectangle',
+    name: 'SplitGridContainer',
+    left: 0,
+    top: 0,
+    width: 200,
+    height: 20,
+    style: {},
+    items: [spanning, peer],
+  }];
+  const splitZip = await JSZip.loadAsync((await renderEditableDocx(splitGrid, request, config)).buffer);
+  const splitXml = await splitZip.file('word/document.xml').async('string');
+  assert.match(
+    splitXml,
+    /<w:trHeight w:val="30" w:hRule="exact"\/>/,
+    'a spanning padded cell must not make its 1.5pt first trace-grid row unrepresentable',
+  );
+});
+
+test('standalone page-band lines are traced and materialized as native Word borders', async () => {
+  const lined = structuredClone(baseModel);
+  lined.page.footer = {
+    height: 24,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [{
+      type: 'Line',
+      name: 'FooterDivider',
+      left: 0,
+      top: 2,
+      width: lined.page.width - lined.page.marginLeft - lined.page.marginRight,
+      height: 0,
+      style: {
+        border: {
+          color: '#123456',
+          width: 1.5,
+        },
+      },
+    }],
+  };
+
+  const canonical = await renderPdf(lined, request, config, { captureLayoutTrace: true });
+  const traced = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'FooterDivider');
+  assert.deepEqual(traced.line, { style: 'Solid', width: 1.5, color: '#123456' });
+
+  const zip = await JSZip.loadAsync((await renderEditableDocx(lined, request, config)).buffer);
+  const footerXml = await zip.file('word/footer1.xml').async('string');
+  assert.match(
+    footerXml,
+    /<w:(?:top|bottom) w:val="single" w:color="123456" w:sz="12"\/>/,
   );
 });
 
