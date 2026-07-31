@@ -1,5 +1,6 @@
 import { ServiceError } from '../errors.js';
 import { FUNCTION_REGISTRY } from './functions/index.js';
+import { CUSTOM_CODE_FUNCTION_REGISTRY } from './functions/customCode.js';
 import { formatNet } from './format.js';
 
 function splitArguments(value) {
@@ -244,6 +245,8 @@ function lookupMatches(sourceValue, destinationArg, rows, context) {
 
 function evaluateFunction(name, args, context) {
   const normalized = name.toLowerCase();
+  const customCodeFunction = CUSTOM_CODE_FUNCTION_REGISTRY[normalized];
+  if (customCodeFunction) return customCodeFunction(args.map((arg) => evaluateArgument(arg, context)), context);
   if (normalized === 'iif') {
     if (args.length !== 3) throw new ServiceError('UNSUPPORTED_FEATURE', 'IIF requires three arguments');
     return evaluateArgument(args[0], context) ? evaluateArgument(args[1], context) : evaluateArgument(args[2], context);
@@ -430,7 +433,7 @@ export function evaluateExpression(input, context = {}) {
   // the expression. The regex below spans the first "(" to the last ")", so without this check
   // `IsNothing(a) And IsNothing(b)` is greedily mis-read as one IsNothing(...) call over mangled text and
   // never reaches the operator handling below.
-  const functionMatch = value.match(/^([A-Za-z_][A-Za-z0-9_]*)\((.*)\)$/s);
+  const functionMatch = value.match(/^((?:Code\.)?[A-Za-z_][A-Za-z0-9_]*)\((.*)\)$/is);
   if (functionMatch && closesAtEnd(value, functionMatch[1].length)) {
     return evaluateFunction(functionMatch[1], splitArguments(functionMatch[2]), context);
   }

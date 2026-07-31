@@ -1,5 +1,6 @@
 import { RDL_2016_SCHEMA_ATTRIBUTE_NAMES, RDL_2016_SCHEMA_ELEMENT_NAMES } from './rdl2016SchemaNames.js';
 import { FUNCTION_NAMES } from './functions/index.js';
+import { CUSTOM_CODE_FUNCTION_NAMES } from './functions/customCode.js';
 
 export const CapabilityStatus = Object.freeze({
   SUPPORTED: 'SUPPORTED',
@@ -122,6 +123,8 @@ export const EXPRESSION_FUNCTION_CAPABILITIES = Object.freeze({
   // Registry-backed functions (string / math / conversion / date / formatting / inspection) are added by
   // their category modules and classified SUPPORTED here automatically.
   ...Object.fromEntries(FUNCTION_NAMES.map((name) => [name, CapabilityStatus.SUPPORTED])),
+  // These are fixed service-owned implementations. Embedded RDL VB remains metadata and is never run.
+  ...Object.fromEntries(CUSTOM_CODE_FUNCTION_NAMES.map((name) => [name, CapabilityStatus.SUPPORTED])),
 });
 
 // The second capability axis the element-name catalogue lacks: which PROPERTIES are ExpressionType (a
@@ -244,7 +247,7 @@ function classifyAttribute(path, name, parentStatus) {
 function expressionFunctions(value) {
   if (typeof value !== 'string' || !value.trim().startsWith('=')) return [];
   const code = value.replace(/"(?:[^"]|"")*"|'[^']*'/g, '');
-  return [...code.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map((match) => match[1]);
+  return [...code.matchAll(/\b((?:Code\.)?[A-Za-z_][A-Za-z0-9_]*)\s*\(/gi)].map((match) => match[1]);
 }
 
 export function inspectRdlCapabilities(parsed, namespace) {
@@ -267,12 +270,15 @@ export function inspectRdlCapabilities(parsed, namespace) {
       for (const name of expressionFunctions(value)) {
         const configured = Object.entries(EXPRESSION_FUNCTION_CAPABILITIES)
           .find(([known]) => known.toLowerCase() === name.toLowerCase());
+        if (/^Code\./i.test(name) && !configured) {
+          customCodeDetected = true;
+          continue;
+        }
         detectedFunctions.set(name.toLowerCase(), {
           name: configured?.[0] || name,
           status: configured?.[1] || CapabilityStatus.REJECTED,
         });
       }
-      if (typeof value === 'string' && value.trim().startsWith('=') && /\bCode\./i.test(value)) customCodeDetected = true;
       return;
     }
 
