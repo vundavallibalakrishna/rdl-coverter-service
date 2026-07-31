@@ -53,15 +53,18 @@ Consequences, all intended:
 | --- | --- |
 | `Code` (embedded VB) | `METADATA_ONLY` — reported, never run |
 | `CodeModule`, `CodeModules` | `REJECTED` |
-| `Code.*` calls in expressions | `REJECTED` |
+| `Code.CalculateColor(yValue, xValue)` | `SUPPORTED` by a fixed native compatibility implementation; embedded VB is not run |
+| Every other `Code.*` call in expressions | `REJECTED` |
 | `CustomReportItem` | `REJECTED` |
 
 `Code` in an RDL is arbitrary VB.NET authored by whoever produced the file. Running it would mean **remote
 code execution as the service account**, from an uploaded document. There is no sandbox worth trusting here.
 
 This is why expressions are parsed and interpreted rather than evaluated: no `eval`, no `Function`
-constructor, no `vm` module, no dynamic code generation anywhere in the codebase. A report needing `Code.*`
-must have that logic moved into the RDL expression surface or precomputed by the caller into a dataset field.
+constructor, no `vm` module, no dynamic code generation anywhere in the codebase. The sole
+`Code.CalculateColor` compatibility call dispatches to a fixed service-owned native function; it never
+reads or runs the report's VB body. A report needing any other `Code.*` logic must move it into the supported
+RDL expression surface or precompute it in a caller-supplied dataset field.
 
 ### `Aggregate()`
 

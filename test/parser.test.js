@@ -338,7 +338,7 @@ test('analysis exposes subreport dependencies without resolving or rendering the
   assert.equal(analysis.blockingErrors.some(({ feature }) => feature === 'Subreport'), true);
 });
 
-test('unused embedded code is metadata-only while every Code.* invocation remains fail-closed', () => {
+test('unused embedded code is metadata-only, allowlisted native mappings work, and unknown Code.* stays fail-closed', () => {
   const definition = `
     <Code>
       Public Function Paint(ByVal value As Integer) As String
@@ -358,6 +358,31 @@ test('unused embedded code is metadata-only while every Code.* invocation remain
   assert.equal(invokedAnalysis.compatible, false);
   assert.equal(invokedAnalysis.blockingErrors.some(({ feature }) => feature === 'CustomCode'), true);
   assert.equal(invokedAnalysis.capabilities.expressions.detected.some((entry) => entry.name === 'Code.*' && entry.status === 'REJECTED'), true);
+
+  const calculateColor = unused.replace(
+    '<BackgroundColor>#dddddd</BackgroundColor>',
+    '<BackgroundColor>=Code.CalculateColor(CStr(Fields!Amount.Value), CStr(Parameters!Choice.Value))</BackgroundColor>',
+  );
+  const calculateColorAnalysis = analyzeRdl(calculateColor);
+  assert.equal(calculateColorAnalysis.compatible, true);
+  assert.ok(calculateColorAnalysis.capabilities.expressions.detected
+    .some((entry) => entry.name === 'Code.CalculateColor' && entry.status === 'SUPPORTED'));
+});
+
+test('Code.CalculateColor uses the fixed service-owned 5x5 risk heat-map mapping', () => {
+  const color = (y, x) => evaluateExpression(`=Code.CalculateColor(CStr(${y}), CStr(${x}))`);
+  assert.equal(color(1, 1), 'Green');
+  assert.equal(color(5, 1), '#ffff00');
+  assert.equal(color(3, 2), '#ffff00');
+  assert.equal(color(5, 2), '#FFA500');
+  assert.equal(color(4, 3), '#FFA500');
+  assert.equal(color(3, 4), '#FFA500');
+  assert.equal(color(5, 4), '#ff0000');
+  assert.equal(color(1, 5), '#ffff00');
+  assert.equal(color(2, 5), '#FFA500');
+  assert.equal(color(4, 5), '#ff0000');
+  assert.equal(color(1, 0), '#ff0000');
+  assert.throws(() => evaluateExpression('=Code.NotAllowlisted(1, 2)'), /Unsupported RDL expression/);
 });
 
 test('an RDL using RunningValue passes the expression capability gate', () => {

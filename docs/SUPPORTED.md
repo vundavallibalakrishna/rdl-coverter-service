@@ -153,10 +153,15 @@ including a leading `=`, while the default `Auto` mode retains normal SSRS expre
 | Comparison | `=` `<>` `<` `>` `<=` `>=` `Like` |
 | Logical | `And` `AndAlso` `Or` `OrElse` `Xor` `Not` |
 
-### Functions (101)
+### Functions (102)
 
-All of the following are supported. Anything **not** on this list is rejected — including `Aggregate()` and
-any `Code.*` call.
+All of the following are supported. Anything **not** on this list is rejected, including `Aggregate()` and
+unknown `Code.*` calls. Embedded VB is never executed; the one listed `Code.*` entry is a fixed,
+service-owned compatibility implementation.
+
+**Allowlisted compatibility (1)** — `Code.CalculateColor(yValue, xValue)` implements the fixed 5×5 risk
+heat-map colour contract used by supported dashboard RDLs. The report's `<Code>` body remains metadata and
+cannot alter this implementation.
 
 **Aggregates (13)** — `Avg`, `Count`, `CountDistinct`, `CountRows`, `First`, `Last`, `Max`, `Min`, `StDev`,
 `StDevP`, `Sum`, `Var`, `VarP`

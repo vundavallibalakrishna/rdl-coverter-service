@@ -4,6 +4,7 @@ import { ServiceError } from '../errors.js';
 import { toPoints } from '../units.js';
 import { inspectRdlCapabilities } from './capabilities.js';
 import { FUNCTION_NAMES } from './functions/index.js';
+import { CUSTOM_CODE_FUNCTION_NAMES } from './functions/customCode.js';
 import { asArray, childEntries, firstDefined, flattenCellItems, parseBoolean, RENDERABLE_CELL_ITEMS, textValue } from './helpers.js';
 
 const SUPPORTED_NAMESPACES = new Set([
@@ -606,11 +607,15 @@ function collectUnsupportedExpressions(value, target = new Set()) {
     const supportedFunctions = new Set(['iif', 'first', 'format', 'sum', 'count', 'countdistinct', 'avg', 'min', 'max', 'runningvalue',
       'switch', 'choose', 'isnothing', 'rownumber', 'previous', 'last', 'countrows', 'stdev', 'stdevp', 'var', 'varp', 'join',
       'lookup', 'lookupset', 'multilookup', 'dateadd', 'datediff', 'datepart', 'cdate',
-      ...FUNCTION_NAMES.map((name) => name.toLowerCase())]);
-    for (const match of code.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
-      if (!supportedFunctions.has(match[1].toLowerCase())) target.add(`ExpressionFunction:${match[1]}`);
+      ...FUNCTION_NAMES.map((name) => name.toLowerCase()),
+      ...CUSTOM_CODE_FUNCTION_NAMES.map((name) => name.toLowerCase())]);
+    for (const match of code.matchAll(/\b((?:Code\.)?[A-Za-z_][A-Za-z0-9_]*)\s*\(/gi)) {
+      const name = match[1];
+      if (!supportedFunctions.has(name.toLowerCase())) {
+        if (/^Code\./i.test(name)) target.add('CustomCode');
+        else target.add(`ExpressionFunction:${name}`);
+      }
     }
-    if (/\bCode\./i.test(code)) target.add('CustomCode');
   } else if (Array.isArray(value)) {
     for (const entry of value) collectUnsupportedExpressions(entry, target);
   } else if (value && typeof value === 'object') {

@@ -452,7 +452,9 @@ The service treats every RDL as untrusted input, because an RDL is an executable
 - **No data source execution.** `DataSource`, `ConnectString`, `Query`, `CommandText` are parsed so
   `/v1/analyze` can report them, then ignored. No SQL, no stored procedures, no connections. Rows come from
   the caller, who has already applied its own authorization.
-- **No code execution.** Embedded `Code` is reported, never run. `CodeModules` and `Code.*` are rejected.
+- **No code execution.** Embedded `Code` is reported, never run. `CodeModules` and unknown `Code.*` calls
+  are rejected. `Code.CalculateColor(yValue, xValue)` is the sole allowlisted compatibility call and
+  dispatches to a fixed service-owned 5×5 heat-map function, never to report VB.
 - **No dynamic evaluation.** Expressions are parsed and interpreted. No `eval`, no `Function`, no `vm`, no
   code generation anywhere in the codebase.
 - **No outbound fetches.** No external entities (XXE), no `Source=External` images.

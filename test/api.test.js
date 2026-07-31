@@ -66,6 +66,29 @@ test('health, readiness, and analysis do not expose RDL queries', async (context
   assert.equal(Array.isArray(analysis.json().windowsWordEditable.fontEmbedding), true);
 });
 
+test('public analyze and render endpoints accept the native Code.CalculateColor compatibility mapping', async (context) => {
+  const { app } = await application(context);
+  const mapped = Buffer.from(fixture.toString()
+    .replace('<ReportSections>', '<Code>Public Function CalculateColor(y, x) As String : Return \"ignored\" : End Function</Code><ReportSections>')
+    .replace('<BackgroundColor>#dddddd</BackgroundColor>', '<BackgroundColor>=Code.CalculateColor(CStr(1), CStr(1))</BackgroundColor>'));
+  const analysis = await app.inject({
+    method: 'POST',
+    url: '/v1/analyze',
+    payload: { rdlBase64: mapped.toString('base64') },
+  });
+  assert.equal(analysis.statusCode, 200, analysis.body);
+  assert.ok(analysis.json().capabilities.expressions.detected
+    .some((entry) => entry.name === 'Code.CalculateColor' && entry.status === 'SUPPORTED'));
+
+  const rendered = await app.inject({
+    method: 'POST',
+    url: '/v1/render',
+    payload: { ...renderOptions, rdlBase64: mapped.toString('base64') },
+  });
+  assert.equal(rendered.statusCode, 200, rendered.body);
+  assert.equal(rendered.rawPayload.subarray(0, 4).toString(), '%PDF');
+});
+
 test('obsolete DOCX pagination flags and profiles are rejected explicitly', async (context) => {
   const { app } = await application(context);
   const obsoleteAnalysis = await app.inject({
