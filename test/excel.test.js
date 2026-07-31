@@ -32,6 +32,45 @@ function groupedRdl() {
   <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth></Page></ReportSection></ReportSections></Report>`;
 }
 
+function chartReportRdl() {
+  const chart = (name, left, title) => `<Chart Name="${name}">
+    <ChartCategoryHierarchy><ChartMembers><ChartMember><Group Name="${name}Categories"><GroupExpressions>
+      <GroupExpression>=Fields!Category.Value</GroupExpression>
+    </GroupExpressions></Group><Label>=Fields!Category.Value</Label></ChartMember></ChartMembers></ChartCategoryHierarchy>
+    <ChartSeriesHierarchy><ChartMembers><ChartMember><Label>Amount</Label></ChartMember></ChartMembers></ChartSeriesHierarchy>
+    <ChartData><ChartSeriesCollection><ChartSeries Name="AmountSeries"><ChartDataPoints><ChartDataPoint>
+      <ChartDataPointValues><Y>=Sum(Fields!Amount.Value)</Y></ChartDataPointValues>
+      <ChartDataLabel><UseValueAsLabel>true</UseValueAsLabel><Visible>true</Visible><Style/></ChartDataLabel>
+      <Style/>
+    </ChartDataPoint></ChartDataPoints><Type>Column</Type></ChartSeries></ChartSeriesCollection></ChartData>
+    <ChartAreas><ChartArea Name="Default"><ChartCategoryAxes><ChartAxis Name="Category"><Style/></ChartAxis></ChartCategoryAxes>
+      <ChartValueAxes><ChartAxis Name="Value"><Style/></ChartAxis></ChartValueAxes></ChartArea></ChartAreas>
+    <ChartTitles><ChartTitle Name="Title"><Caption>${title}</Caption><Style/></ChartTitle></ChartTitles>
+    <DataSetName>D</DataSetName><Top>0.75in</Top><Left>${left}in</Left><Width>3in</Width><Height>2in</Height>
+    <Style><Border><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></Border></Style>
+  </Chart>`;
+  return `<?xml version="1.0"?><Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <DataSets><DataSet Name="D"><Fields><Field Name="Category"><DataField>Category</DataField></Field>
+    <Field Name="Amount"><DataField>Amount</DataField></Field></Fields></DataSet></DataSets>
+  <ReportSections><ReportSection><Body><ReportItems>
+    <Textbox Name="Heading"><CanGrow>true</CanGrow><KeepTogether>true</KeepTogether>
+      <Paragraphs><Paragraph><TextRuns><TextRun><Value>Dashboard Overview</Value><Style><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns></Paragraph></Paragraphs>
+      <Top>0in</Top><Left>0in</Left><Height>0.3in</Height><Width>6.2in</Width><Style/>
+    </Textbox>
+    <Textbox Name="LeftBand"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun>
+      <Value>Risk Matrix with Count of Risks</Value>
+    </TextRun></TextRuns></Paragraph></Paragraphs><Top>0.4in</Top><Left>0in</Left><Height>0.3in</Height><Width>3in</Width><Style/></Textbox>
+    <Textbox Name="RightBand"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun>
+      <Value>Action Status</Value>
+    </TextRun></TextRuns></Paragraph></Paragraphs><Top>0.4in</Top><Left>3.2in</Left><Height>0.3in</Height><Width>3in</Width><Style/></Textbox>
+    ${chart('LeftChart', 0, 'By Division')}
+    ${chart('RightChart', 3.2, 'By Department')}
+  </ReportItems><Height>2.75in</Height><Style/></Body><Width>6.2in</Width>
+  <Page><PageHeight>4in</PageHeight><PageWidth>6.5in</PageWidth><LeftMargin>0.1in</LeftMargin>
+    <RightMargin>0.1in</RightMargin><TopMargin>0.1in</TopMargin><BottomMargin>0.1in</BottomMargin></Page>
+  </ReportSection></ReportSections></Report>`;
+}
+
 async function load(buffer) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
@@ -365,7 +404,7 @@ test('REPORT mode preserves vertical group spans as native merges and closes the
   assert.ok((ws.views.find((view) => view.state === 'frozen')?.xSplit || 0) > 0);
 });
 
-test('REPORT drawings contain pictures only for declared embedded RDL images', async () => {
+test('REPORT embedded images use pictures without emitting layout shapes or native chart parts', async () => {
   const withLogo = structuredClone(model);
   withLogo.embeddedImages = {
     Logo: {
@@ -387,10 +426,34 @@ test('REPORT drawings contain pictures only for declared embedded RDL images', a
   assert.equal(Object.keys(zip.files).some((name) => name.startsWith('xl/charts/')), false);
 });
 
-test('visible charts fail closed in REPORT mode instead of disappearing', async () => {
-  const charted = structuredClone(model);
-  charted.body.items.push({ type: 'Chart', name: 'C', top: 90, left: 0, width: 100, height: 100, zIndex: 0, hidden: 'false', pageBreak: null });
-  await assert.rejects(renderExcel(charted, request, config, null), (error) => error.code === 'UNSUPPORTED_FEATURE');
+test('REPORT mode anchors visible charts as pictures while preserving RDL section naming and peer geometry', async () => {
+  const charted = parseRdl(chartReportRdl());
+  const rendered = await renderExcel(charted, {
+    outputFileName: 'Dashboard',
+    parameters: {},
+    datasets: { D: [{ Category: 'A', Amount: 2 }, { Category: 'B', Amount: 3 }] },
+    excel: { layoutMode: 'REPORT' },
+  }, config, null);
+  assert.equal(rendered.layoutMode, 'report-sections');
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(rendered.buffer);
+  assert.deepEqual(workbook.worksheets.map((worksheet) => worksheet.name), ['Dashboard Overview']);
+  assert.equal(workbook.worksheets[0].getImages().length, 2);
+  const leftBand = findCell(workbook.worksheets[0], 'Risk Matrix with Count of Risks');
+  const rightBand = findCell(workbook.worksheets[0], 'Action Status');
+  assert.ok(leftBand && rightBand);
+  assert.equal(leftBand.row, rightBand.row, 'coincident side-by-side freeform headings must share their worksheet row');
+
+  const zip = await JSZip.loadAsync(rendered.buffer);
+  const drawing = await zip.file('xl/drawings/drawing1.xml').async('string');
+  assert.equal((drawing.match(/<xdr:pic>/g) || []).length, 2);
+  assert.equal(Object.keys(zip.files).some((name) => name.startsWith('xl/charts/')), false);
+
+  const anchors = [...drawing.matchAll(/<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/g)]
+    .map((match) => ({ column: Number(match[1]), row: Number(match[2]) }));
+  assert.equal(anchors.length, 2);
+  assert.equal(anchors[0].row, anchors[1].row, 'side-by-side chart peers must share their top row');
+  assert.notEqual(anchors[0].column, anchors[1].column);
 });
 
 test('an untrusted value beginning with = is stored as a typed string, never a live formula', async () => {

@@ -1,5 +1,7 @@
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { evaluateExpression } from '../rdl/expression.js';
 import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
@@ -12,6 +14,7 @@ import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './exce
 
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
 const DEFAULT_ROW_POINTS = 15;
+const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
 
 function sheetName(name, fallback) {
   const cleaned = String(name || fallback).replace(SHEET_NAME_FORBIDDEN, ' ').trim().slice(0, 31);
@@ -428,6 +431,12 @@ function firstVisibleText(items, model, request, globals) {
         }
       } catch { /* validation/rendering reports the real error later */ }
     }
+    if (item.type === 'Chart' && item.title && !isHidden(item.title.hidden, context)) {
+      try {
+        const value = String(evaluateExpression(item.title.caption, context) || '').replace(/\s+/g, ' ').trim();
+        if (value) return value;
+      } catch { /* a field-scoped chart title is not a stable section title */ }
+    }
     for (const child of [...(item.items || [])].sort((a, b) => a.top - b.top || a.left - b.left)) {
       const value = visit(child);
       if (value) return value;
@@ -695,14 +704,40 @@ function addEmbeddedImage(workbook, worksheet, model, item, range, context) {
   });
 }
 
-function renderFreeformItem({ workbook, worksheet, model, item, context, xGrid, yGrid, startRow, merges, parentLeft = 0, parentTop = 0 }) {
+async function renderFreeformItem({
+  workbook,
+  worksheet,
+  model,
+  item,
+  context,
+  config,
+  tempDir,
+  chartCounter,
+  xGrid,
+  yGrid,
+  startRow,
+  merges,
+  parentLeft = 0,
+  parentTop = 0,
+}) {
   if (isHidden(item.hidden, context)) return;
   const left = point(parentLeft + (item.left || 0));
   const top = point(parentTop + (item.top || 0));
   const columns = gridRange(xGrid, left, item.width || 0);
   const rows = rowRange(yGrid, startRow, top, item.height || 0);
   const range = { ...columns, ...rows };
-  if (item.type === 'Chart') throw new ServiceError('UNSUPPORTED_FEATURE', 'Charts are not supported in Excel REPORT mode without drawings; use excel.layoutMode DATA');
+  if (item.type === 'Chart') {
+    const data = materializeChart(item, context.datasets, context.parameters, context.globals);
+    const png = await renderChartPng(item, data, config, tempDir, context, chartCounter.value++);
+    if (!png?.data) throw new ServiceError('RENDER_FAILED', 'Excel chart picture could not be rendered', 500);
+    const id = workbook.addImage({ buffer: png.data, extension: 'png' });
+    worksheet.addImage(id, {
+      tl: { col: range.startCol - 1, row: range.startRow - 1 },
+      br: { col: range.endCol, row: range.endRow },
+      editAs: 'oneCell',
+    });
+    return;
+  }
   if (item.type === 'Image') {
     addEmbeddedImage(workbook, worksheet, model, item, range, context);
     return;
@@ -727,15 +762,56 @@ function renderFreeformItem({ workbook, worksheet, model, item, context, xGrid, 
   }
   if (item.type === 'Rectangle') {
     for (const child of [...(item.items || [])].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
-      renderFreeformItem({ workbook, worksheet, model, item: child, context, xGrid, yGrid, startRow, merges, parentLeft: left, parentTop: top });
+      await renderFreeformItem({
+        workbook,
+        worksheet,
+        model,
+        item: child,
+        context,
+        config,
+        tempDir,
+        chartCounter,
+        xGrid,
+        yGrid,
+        startRow,
+        merges,
+        parentLeft: left,
+        parentTop: top,
+      });
     }
   }
 }
 
-function renderFreeformBand({ workbook, worksheet, model, items, height, context, xGrid, startRow, merges }) {
+async function renderFreeformBand({
+  workbook,
+  worksheet,
+  model,
+  items,
+  height,
+  context,
+  config,
+  tempDir,
+  chartCounter,
+  xGrid,
+  startRow,
+  merges,
+}) {
   const yGrid = freeformRows(worksheet, items, height, startRow);
   for (const item of [...items].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
-    renderFreeformItem({ workbook, worksheet, model, item, context, xGrid, yGrid, startRow, merges });
+    await renderFreeformItem({
+      workbook,
+      worksheet,
+      model,
+      item,
+      context,
+      config,
+      tempDir,
+      chartCounter,
+      xGrid,
+      yGrid,
+      startRow,
+      merges,
+    });
   }
   return yGrid.length - 1;
 }
@@ -1153,7 +1229,17 @@ function declaredSectionName(items, context) {
   return '';
 }
 
-async function renderReportExcel(model, request, config) {
+function containsTablix(item) {
+  if (item.type === 'Tablix') return true;
+  return (item.items || []).some((child) => containsTablix(child));
+}
+
+function containsChart(item) {
+  if (item.type === 'Chart') return true;
+  return (item.items || []).some((child) => containsChart(child));
+}
+
+async function renderReportExcel(model, request, config, tempDir) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'RDL Converter Service';
   workbook.title = request.outputFileName || model.name || 'Report';
@@ -1167,6 +1253,7 @@ async function renderReportExcel(model, request, config) {
   // PDFKit's colour/font state is page-backed even when no bytes are being collected. A private measuring
   // page gives XLSX the exact PDF text metrics without producing or embedding a PDF artifact.
   measureDoc.addPage({ size: [1000, 1000], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+  const chartCounter = { value: 0 };
   let rowCount = 0;
 
   for (let index = 0; index < sections.length; index += 1) {
@@ -1182,16 +1269,37 @@ async function renderReportExcel(model, request, config) {
     let cursor = 1;
     let headerBandRows = 0;
     if (model.page.header?.items?.length) {
-      headerBandRows = renderFreeformBand({
+      headerBandRows = await renderFreeformBand({
         workbook, worksheet, model, items: model.page.header.items, height: model.page.header.height,
-        context, xGrid, startRow: cursor, merges,
+        context, config, tempDir, chartCounter, xGrid, startRow: cursor, merges,
       });
       cursor += headerBandRows;
     }
     const detailRegions = [];
-    const renderSectionItem = (sourceItem, parentLeft = 0) => {
+    const renderSectionItem = async (sourceItem, parentLeft = 0) => {
       const item = { ...sourceItem, left: point(parentLeft + (sourceItem.left || 0)) };
       if (item.type === 'Rectangle') {
+        // A fixed rectangle is a true coordinate container. Rendering all of its children in one band
+        // preserves side-by-side charts/text/images. Rectangles containing tablixes retain the flow-aware
+        // path below because their materialized height can grow beyond the design-time rectangle.
+        if (!containsTablix(item)) {
+          const consumed = await renderFreeformBand({
+            workbook,
+            worksheet,
+            model,
+            items: [{ ...item, top: 0 }],
+            height: Math.max(2, item.height || DEFAULT_ROW_POINTS),
+            context,
+            config,
+            tempDir,
+            chartCounter,
+            xGrid,
+            startRow: cursor,
+            merges,
+          });
+          cursor += consumed;
+          return;
+        }
         const containerStart = cursor;
         let previousChildBottom = 0;
         for (const child of [...(item.items || [])].sort((a, b) => (
@@ -1199,7 +1307,7 @@ async function renderReportExcel(model, request, config) {
         ))) {
           const gap = Math.max(0, (child.top || 0) - previousChildBottom);
           cursor += addGapRows(worksheet, cursor, gap);
-          renderSectionItem({ ...child, top: 0 }, item.left);
+          await renderSectionItem({ ...child, top: 0 }, item.left);
           previousChildBottom = Math.max(previousChildBottom, (child.top || 0) + (child.height || 0));
         }
         const trailing = Math.max(0, (item.height || 0) - previousChildBottom);
@@ -1247,28 +1355,84 @@ async function renderReportExcel(model, request, config) {
         if (region.dynamic) detailRegions.push(region);
         return;
       }
-      if (item.type === 'Chart') {
-        throw new ServiceError('UNSUPPORTED_FEATURE', 'Charts are not supported in Excel REPORT mode without drawings; use excel.layoutMode DATA');
-      }
       const height = Math.max(2, item.height || DEFAULT_ROW_POINTS);
-      const consumed = renderFreeformBand({
+      const consumed = await renderFreeformBand({
         workbook,
         worksheet,
         model,
         items: [{ ...item, top: 0 }],
         height,
         context,
+        config,
+        tempDir,
+        chartCounter,
         xGrid,
         startRow: cursor,
         merges,
       });
       cursor += consumed;
     };
+    const isFreeformCoordinateItem = (candidate) => {
+      if (candidate.type === 'Tablix') return false;
+      if (candidate.type === 'Rectangle') {
+        return (candidate.items || []).every(isFreeformCoordinateItem);
+      }
+      return true;
+    };
+    const sameDesignTop = (left, right) => (
+      Math.abs((left.top || 0) - (right.top || 0)) <= COINCIDENT_EDGE_TOLERANCE_PT
+    );
+    const horizontallyDisjoint = (left, right) => (
+      (left.left || 0) + (left.width || 0) <= (right.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
+      || (right.left || 0) + (right.width || 0) <= (left.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
+    );
     let previousDesignBottom = null;
-    for (const item of section) {
+    for (let itemIndex = 0; itemIndex < section.length; itemIndex += 1) {
+      const item = section[itemIndex];
+      // Freeform report items are coordinate-positioned. Coincident-top items and horizontally disjoint
+      // items whose design-time vertical intervals overlap are peers in one band, matching the canonical
+      // PDF layout rule. Without this, Excel's sequential rows insert artificial gaps between side-by-side
+      // headings, charts, images, or fixed rectangles merely because they are separate RDL items.
+      const peerBand = [item];
+      let peerBottom = (item.top || 0) + (item.height || 0);
+      if (isFreeformCoordinateItem(item)) {
+        for (let peerIndex = itemIndex + 1; peerIndex < section.length; peerIndex += 1) {
+          const peer = section[peerIndex];
+          if (!isFreeformCoordinateItem(peer)) break;
+          const coincidentTop = sameDesignTop(item, peer);
+          const overlapsVertically = (peer.top || 0) < peerBottom - COINCIDENT_EDGE_TOLERANCE_PT;
+          const independentLane = peerBand.every((candidate) => horizontallyDisjoint(candidate, peer));
+          if (!coincidentTop && !(overlapsVertically && independentLane)) break;
+          peerBand.push(peer);
+          peerBottom = Math.max(peerBottom, (peer.top || 0) + (peer.height || 0));
+        }
+      }
+      if (peerBand.length > 1) {
+        const bandTop = item.top || 0;
+        const gap = previousDesignBottom === null ? 0 : Math.max(0, bandTop - previousDesignBottom);
+        cursor += addGapRows(worksheet, cursor, gap);
+        const consumed = await renderFreeformBand({
+          workbook,
+          worksheet,
+          model,
+          items: peerBand.map((peer) => ({ ...peer, top: (peer.top || 0) - bandTop })),
+          height: Math.max(2, peerBottom - bandTop),
+          context,
+          config,
+          tempDir,
+          chartCounter,
+          xGrid,
+          startRow: cursor,
+          merges,
+        });
+        cursor += consumed;
+        previousDesignBottom = Math.max(previousDesignBottom ?? 0, peerBottom);
+        itemIndex += peerBand.length - 1;
+        continue;
+      }
       const gap = previousDesignBottom === null ? 0 : Math.max(0, (item.top || 0) - previousDesignBottom);
       cursor += addGapRows(worksheet, cursor, gap);
-      renderSectionItem({ ...item, top: 0 });
+      await renderSectionItem({ ...item, top: 0 });
       previousDesignBottom = Math.max(previousDesignBottom ?? 0, (item.top || 0) + (item.height || 0));
     }
     const usedRows = Math.max(1, cursor - 1);
@@ -1291,7 +1455,26 @@ async function renderReportExcel(model, request, config) {
 
 export async function renderExcel(model, request, config, tempDir) {
   const mode = resolveExcelLayoutMode(request);
-  if (mode === 'REPORT') return renderReportExcel(model, request, config);
+  if (mode === 'REPORT') {
+    let ownedTempDir = null;
+    let workingTempDir = tempDir;
+    const requiresChartWorkspace = [
+      ...(model.page.header?.items || []),
+      ...(model.body.items || []),
+    ].some((item) => containsChart(item));
+    if (!workingTempDir && requiresChartWorkspace) {
+      await fs.mkdir(config.tempRoot, { recursive: true, mode: 0o700 });
+      await fs.chmod(config.tempRoot, 0o700);
+      ownedTempDir = await fs.mkdtemp(path.join(config.tempRoot, 'excel-chart-'));
+      await fs.chmod(ownedTempDir, 0o700);
+      workingTempDir = ownedTempDir;
+    }
+    try {
+      return await renderReportExcel(model, request, config, workingTempDir);
+    } finally {
+      if (ownedTempDir) await fs.rm(ownedTempDir, { recursive: true, force: true });
+    }
+  }
   const rendered = await renderDataExcel(model, request, config, tempDir);
   return {
     ...rendered,

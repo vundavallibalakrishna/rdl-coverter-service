@@ -247,6 +247,24 @@ root cause for the RDL *construct*, driven by the normalized model (coordinates,
 expressions, group structure) — not tuned to Combined Assurance, KRI, Incident, or the sample in front of
 you. Concretely:
 
+- **Every root-cause fix requires a cross-renderer impact audit.** Before changing code, classify whether
+  the corrected behavior is an RDL/model semantic shared by PDF, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX,
+  or a genuinely format-specific behavior. For a shared semantic, fix it at the lowest common layer when
+  possible and implement any necessary renderer adaptations in **every applicable output in the same
+  change**. Never land a PDF-only, Word-only, or Excel-only workaround when the same RDL construct is also
+  consumed by another renderer.
+- A shared fix is not complete until focused tests cover the construct in PDF, `DOCX_EDITABLE`, and XLSX;
+  also verify `DOCX_VISUAL` when the change can affect canonical PDF bytes, page geometry, pagination, or
+  rasterization. Tests must assert the format-appropriate equivalent—not assume that PDF drawing commands,
+  Word OOXML, and Excel cells have identical mechanics.
+- If an output is intentionally unaffected or cannot represent the construct, record the concrete
+  format-semantic reason in the code/test or change report and add or preserve fail-closed capability
+  detection where appropriate. “The issue was reported only in one format” is not a valid reason to skip
+  the other renderers.
+- During RCA and handoff, report a renderer-impact matrix covering PDF, `DOCX_EDITABLE`, `DOCX_VISUAL`, and
+  XLSX with one of: fixed and tested, inherited from canonical PDF, not applicable with reason, or
+  unsupported and fail-closed. Do not describe a generic issue as fixed while an applicable renderer still
+  contains the same defect.
 - **PDF and DOCX fixes are global root-cause fixes.** Never identify or branch on an output filename,
   report name, definition hash, item name, visible text, dataset value, page number, known row count, or
   client-specific layout signature. An `if`/`else`, lookup, profile, tolerance, or geometry adjustment is

@@ -236,8 +236,10 @@ worksheets only at resolved explicit RDL page breaks. Each section gets an indep
 grid: title bands, textboxes, rectangles, lines, tablixes, fills, per-side borders, alignment, fonts, and
 horizontal headings remain native editable cells. Group values that span PDF rows retain their RDL row
 spans as native editable merged regions, matching the PDF/DOCX table hierarchy. Declared
-embedded RDL images may be pictures; report layout, tables, and text are never rasterized or emitted as
-shapes. Visible charts fail with `UNSUPPORTED_FEATURE` in REPORT mode rather than disappearing.
+embedded RDL images and visible charts may be anchored pictures; report layout, tables, and text are never
+rasterized or emitted as shapes. Side-by-side fixed chart peers retain their coordinate relationship.
+Unsupported chart types or properties continue to fail closed rather than disappearing or being
+approximated.
 
 Set `excel.layoutMode: "DATA"` for the legacy data-first renderer. It stacks tablixes on one worksheet by
 default; `excel.sheetPerTablix: true` puts each tablix on its own worksheet and collects other content on an

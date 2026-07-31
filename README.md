@@ -37,7 +37,7 @@ Use it two ways, both supported and both backed by the identical pipeline:
 | Requirement | Why |
 | --- | --- |
 | **Node.js ≥ 22** | ESM, native test runner |
-| **Poppler** (`pdftoppm`) | `DOCX_VISUAL`, and chart images in `DOCX_EDITABLE`/XLSX `DATA` mode — rasterizes PDF/chart pages. `brew install poppler` / `apt install poppler-utils` |
+| **Poppler** (`pdftoppm`) | `DOCX_VISUAL`, and chart images in `DOCX_EDITABLE`/XLSX `REPORT`/`DATA` modes — rasterizes PDF/chart pages. `brew install poppler` / `apt install poppler-utils` |
 | **Licensed fonts** | Production only. See [Fonts](#fonts) |
 
 `GET /readyz` (or `readiness(config)`) reports whether all three are actually satisfied.
@@ -303,6 +303,11 @@ are rejected with `RDL_INVALID`.
 Choose `DOCX_VISUAL` when editability is unnecessary and a raster page image is acceptable. Choose the
 default XLSX `REPORT` layout for an editable, PDF-styled workbook without PDF pagination. Set
 `"excel": { "layoutMode": "DATA" }` for the legacy data-first workbook.
+
+In XLSX `REPORT` mode, report text, tablixes, rectangles, lines, fills, and borders remain native editable
+cells. Declared RDL images and visible charts are anchored pictures in their resolved report regions;
+side-by-side chart peers retain their coordinate relationship. Chart pictures are intentionally not native
+Excel chart objects, while the surrounding workbook remains editable.
 
 ## The request
 
