@@ -3,6 +3,7 @@ import PDFDocument from 'pdfkit';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ServiceError } from '../errors.js';
+import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression } from '../rdl/expression.js';
 import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
@@ -80,6 +81,10 @@ function unwrapFormatCall(expression) {
 // their native typed value so they stay computable; everything else is injection-safe display text.
 function excelCellValue(cell, context) {
   const display = cellText(cell);
+  // `values` is the authoritative materialized display. In particular, HideDuplicates deliberately turns
+  // a repeated expression result into an empty string. Re-evaluating a numeric/date expression after that
+  // suppression resurrects the duplicate in Excel even though PDF and Word correctly keep it blank.
+  if (display === '') return { value: '' };
   const textbox = cellTextbox(cell);
   const expression = singleExpression(textbox);
   if (expression === null) return { value: cellString(display) };
@@ -124,7 +129,12 @@ function writeTablix(worksheet, model, item, request, globals, startRow, columnM
       const columnIndex = placements[r][ci];
       if (columnIndex === undefined || columnIndex < 0) continue;
       const textbox = cellTextbox(cell);
-      const style = (cell.containerWrapped ? item.style : textbox?.style) || item.style;
+      // Rectangle-only cell wrappers affect the cell/grid perimeter, not the text they contain. Keep the
+      // visible textbox as the content-style authority while retaining the tablix as the border authority.
+      // Conflating the two drops paragraph/run formatting (font, size, colour and alignment) from wrapped
+      // symbols and labels even though PDF correctly renders the inner textbox.
+      const style = textbox?.style || item.style;
+      const borderStyle = (cell.containerWrapped ? item.style : textbox?.style) || item.style;
       const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
       const target = worksheet.getCell(excelRowNumber, columnIndex + 1);
       const { value, numFmt } = excelCellValue(cell, context);
@@ -149,7 +159,7 @@ function writeTablix(worksheet, model, item, request, globals, startRow, columnM
         horizontal: /center/i.test(hAlign) ? 'center' : /right/i.test(hAlign) ? 'right' : /justify/i.test(hAlign) ? 'justify' : 'left',
         wrapText: true,
       };
-      const borders = style.borders || {};
+      const borders = borderStyle.borders || {};
       target.border = {
         top: excelBorderSide(borders.top, context),
         bottom: excelBorderSide(borders.bottom, context),
@@ -363,20 +373,7 @@ function visiblePageBreak(item, context) {
   return String(item.pageBreak.location || 'None');
 }
 
-export function resolveExcelLayoutMode(request = {}) {
-  const requested = request.excel?.layoutMode;
-  if (requested !== undefined && requested !== null && String(requested).trim() !== '') {
-    const mode = String(requested).trim().toUpperCase();
-    if (!['REPORT', 'DATA'].includes(mode)) throw new ServiceError('RDL_INVALID', `Unsupported Excel layoutMode: ${requested}`);
-    if (mode === 'REPORT' && request.excel?.sheetPerTablix === true) {
-      throw new ServiceError('RDL_INVALID', 'excel.sheetPerTablix is only valid with excel.layoutMode DATA');
-    }
-    return mode;
-  }
-  // Backward compatibility for callers that already explicitly selected the old per-tablix workbook.
-  if (request.excel?.sheetPerTablix === true) return 'DATA';
-  return 'REPORT';
-}
+export { resolveExcelLayoutMode };
 
 function uniqueSheetName(workbook, requested, fallback) {
   const base = sheetName(requested, fallback);
@@ -818,11 +815,16 @@ async function renderFreeformBand({
 
 function cellStyle(item, cell, context) {
   const textbox = cellTextbox(cell);
-  return { textbox, style: (cell.containerWrapped ? item.style : textbox?.style) || item.style, context };
+  return {
+    textbox,
+    style: textbox?.style || item.style,
+    borderStyle: (cell.containerWrapped ? item.style : textbox?.style) || item.style,
+    context,
+  };
 }
 
 function resolvedOwnerBorder(owner, side) {
-  const border = owner.style?.borders?.[side];
+  const border = (owner.borderStyle || owner.style)?.borders?.[side];
   if (!border || /^none$/i.test(String(styleValue(border.style, owner.context, 'None')))) return null;
   return excelBorderSide(border, owner.context);
 }
@@ -847,6 +849,92 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
     left: resolvedOwnerBorder(owner, 'left') || (left && resolvedOwnerBorder(left, 'right')) || undefined,
     right: resolvedOwnerBorder(owner, 'right') || (right && resolvedOwnerBorder(right, 'left')) || undefined,
   };
+}
+
+function visibleBorderBetween(upper, lower) {
+  return Boolean(resolvedOwnerBorder(upper, 'bottom') || resolvedOwnerBorder(lower, 'top'));
+}
+
+function duplicateCellDescriptor(cell) {
+  const items = cell.items || [];
+  const duplicateItems = cell.duplicateItems || [];
+  const duplicateIndexes = duplicateItems
+    .map((entry, index) => (entry ? index : -1))
+    .filter((index) => index >= 0);
+  if (duplicateIndexes.length !== 1 || items.length !== 1 || (cell.nestedTablixes || []).length > 0) return null;
+  const index = duplicateIndexes[0];
+  const entry = duplicateItems[index];
+  return {
+    ...entry,
+    itemName: items[index]?.name || null,
+  };
+}
+
+// HideDuplicates suppresses text; it does not blindly merge equal values. In a borderless run where the
+// materializer has explicitly identified one visible owner followed by suppressed duplicates in the same
+// group instance, a native vertical Excel merge is the closest editable representation of the canonical
+// PDF region. Declared internal borders remain authoritative, and ordinary repeated values (without
+// HideDuplicates metadata) are never coalesced.
+function coalesceBorderlessDuplicateOwners(gridOwners, owners) {
+  for (const owner of owners) {
+    if (owner.excelMergedInto) continue;
+    const descriptor = duplicateCellDescriptor(owner.cell);
+    if (!descriptor || descriptor.suppressed) continue;
+    const span = Math.max(1, owner.cell.colSpan || 1);
+    let totalRowSpan = Math.max(1, owner.cell.rowSpan || 1);
+    let previous = owner;
+    while (owner.rowIndex + totalRowSpan < gridOwners.length) {
+      const nextRow = owner.rowIndex + totalRowSpan;
+      const candidate = gridOwners[nextRow][owner.start];
+      if (!candidate || candidate === owner || candidate.rowIndex !== nextRow) break;
+      if (candidate.start !== owner.start || Math.max(1, candidate.cell.colSpan || 1) !== span) break;
+      const next = duplicateCellDescriptor(candidate.cell);
+      if (!next || !next.suppressed
+        || next.key !== descriptor.key
+        || next.scope !== descriptor.scope
+        || next.value !== descriptor.value
+        || next.itemName !== descriptor.itemName
+        || visibleBorderBetween(previous, candidate)) break;
+      const candidateRowSpan = Math.max(1, candidate.cell.rowSpan || 1);
+      candidate.excelMergedInto = owner;
+      for (let rowOffset = 0; rowOffset < candidateRowSpan; rowOffset += 1) {
+        for (let columnOffset = 0; columnOffset < span; columnOffset += 1) {
+          gridOwners[nextRow + rowOffset][owner.start + columnOffset] = owner;
+        }
+      }
+      totalRowSpan += candidateRowSpan;
+      previous = candidate;
+    }
+    if (totalRowSpan > Math.max(1, owner.cell.rowSpan || 1)) {
+      owner.cell = { ...owner.cell, rowSpan: totalRowSpan };
+    }
+  }
+}
+
+function excelCanGrowTextboxHeight(measureDoc, config, textbox, context, display, width, style) {
+  if (!textbox?.canGrow || !display) return 0;
+  const contentHeight = measureTextboxHeight(measureDoc, config, textbox, context, display, width);
+  const firstVisibleCharacter = Array.from(String(display)).find((character) => !/\s/u.test(character)) || 'M';
+  const singleLineHeight = measureTextboxHeight(
+    measureDoc,
+    config,
+    textbox,
+    context,
+    firstVisibleCharacter,
+    width,
+  );
+  // PDF owns exact line breaking, while Excel independently reflows wrapped text using its workbook font
+  // and column-width engine. A multi-line CanGrow cell whose native row is set to the exact PDF height has
+  // no room when Excel produces one additional final line. Reserve one line derived from the cell's actual
+  // resolved font metrics only for genuinely multi-line content; single-line and CanGrow=false cells keep
+  // their declared compact geometry.
+  const excelWrapReserve = contentHeight > singleLineHeight + (1 / POINT_PRECISION)
+    ? singleLineHeight
+    : 0;
+  return contentHeight
+    + styleSize(style?.paddingTop, context, 2)
+    + styleSize(style?.paddingBottom, context, 2)
+    + excelWrapReserve;
 }
 
 function renderReportTablix({ worksheet, model, item, request, globals, config, xGrid, startRow, merges, tablixCache, measureDoc }) {
@@ -896,6 +984,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       }
     });
   });
+  coalesceBorderlessDuplicateOwners(gridOwners, owners);
 
   // Measure a nested tablix using the same content-aware rule as its parent. Excel never auto-fits merged
   // cells, so relying on wrapText alone clips growing text inside nested data regions. Cache by materialized
@@ -934,10 +1023,15 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         const width = columnsPt.slice(start, start + span).reduce((sum, value) => sum + value, 0);
         let required = 0;
         const display = cellText(cell);
-        if (textbox?.canGrow && display) {
-          required = measureTextboxHeight(measureDoc, config, textbox, context, display, width)
-            + styleSize(style?.paddingTop, context, 2) + styleSize(style?.paddingBottom, context, 2);
-        }
+        required = excelCanGrowTextboxHeight(
+          measureDoc,
+          config,
+          textbox,
+          context,
+          display,
+          width,
+          style,
+        );
         for (const child of cell.nestedTablixes || []) {
           const childMeasurement = measureNestedTablix(child);
           required = Math.max(required,
@@ -967,10 +1061,15 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     const rowSpan = Math.max(1, owner.cell.rowSpan || 1);
     const width = point(columnOffsets[owner.start + span] - columnOffsets[owner.start]);
     let required = 0;
-    if (owner.textbox?.canGrow && display) {
-      required = measureTextboxHeight(measureDoc, config, owner.textbox, owner.context, display, width)
-        + styleSize(owner.style?.paddingTop, owner.context, 2) + styleSize(owner.style?.paddingBottom, owner.context, 2);
-    }
+    required = excelCanGrowTextboxHeight(
+      measureDoc,
+      config,
+      owner.textbox,
+      owner.context,
+      display,
+      width,
+      owner.style,
+    );
     for (const nested of owner.cell.nestedTablixes || []) {
       const nestedMeasurement = measureNestedTablix(nested);
       required = Math.max(required,
@@ -1011,7 +1110,18 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   // native Excel rows, keeping the workbook editable without flattening the child tablix to text.
   rowProfiles.forEach((profile, rowIndex) => {
     const declared = profile.at(-1) || 0;
-    if (measuredHeights[rowIndex] > declared) profile[profile.length - 1] = point(measuredHeights[rowIndex]);
+    if (measuredHeights[rowIndex] > declared) {
+      const containsNestedGrid = rows[rowIndex].cells.some((cell) => (cell.nestedTablixes || []).length > 0);
+      if (containsNestedGrid) {
+        // The child's final edge can coincide with the parent's declared row edge. When another cell grows
+        // the parent, replacing that edge erases a boundary required to place the child; preserve it and
+        // append the grown parent edge. This is the native-grid equivalent of a short child table followed
+        // by unused vertical space in its taller invoking cell.
+        profile.push(point(measuredHeights[rowIndex]));
+      } else {
+        profile[profile.length - 1] = point(measuredHeights[rowIndex]);
+      }
+    }
     rowProfiles[rowIndex] = splitTallRowIntervals(profile);
   });
   const physicalStarts = [];
@@ -1152,6 +1262,231 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   };
 }
 
+function horizontalDesignOverlap(left, right) {
+  const leftStart = point(left.left || 0);
+  const leftEnd = point(leftStart + (left.width || 0));
+  const rightStart = point(right.left || 0);
+  const rightEnd = point(rightStart + (right.width || 0));
+  return leftStart < rightEnd - COINCIDENT_EDGE_TOLERANCE_PT
+    && rightStart < leftEnd - COINCIDENT_EDGE_TOLERANCE_PT;
+}
+
+function worksheetRowBoundaries(worksheet, count) {
+  const boundaries = [0];
+  for (let row = 1; row <= count; row += 1) {
+    boundaries.push(point(boundaries.at(-1) + (worksheet.getRow(row).height || DEFAULT_ROW_POINTS)));
+  }
+  return boundaries;
+}
+
+function decodeColumn(letters) {
+  let value = 0;
+  for (const character of letters) value = value * 26 + character.charCodeAt(0) - 64;
+  return value;
+}
+
+function decodeAddress(address) {
+  const match = /^([A-Z]+)(\d+)$/.exec(address);
+  if (!match) throw new ServiceError('RDL_INVALID', `Invalid Excel cell address: ${address}`);
+  return { column: decodeColumn(match[1]), row: Number(match[2]) };
+}
+
+function decodeMerge(range) {
+  const [start, end] = range.split(':').map(decodeAddress);
+  return { startRow: start.row, startCol: start.column, endRow: end.row, endCol: end.column };
+}
+
+function cloneExcelValue(value) {
+  if (value === null || value === undefined) return value;
+  return structuredClone(value);
+}
+
+function copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges }) {
+  const offset = plan.resolvedTop;
+  const local = plan.localBoundaries;
+  const mergeByMaster = new Map((plan.worksheet.model.merges || []).map((range) => {
+    const decoded = decodeMerge(range);
+    return [`${decoded.startRow}:${decoded.startCol}`, decoded];
+  }));
+  const mapStart = (localRow) => startRow + boundaryIndex(yGrid, point(offset + local[localRow - 1]));
+  const mapEnd = (localRow) => startRow + boundaryIndex(yGrid, point(offset + local[localRow])) - 1;
+
+  for (let row = 1; row <= plan.region.rowsConsumed; row += 1) {
+    for (let column = plan.region.startCol; column <= plan.region.endCol; column += 1) {
+      const source = plan.worksheet.getCell(row, column);
+      if (source.isMerged && source.master.address !== source.address) continue;
+      const sourceMerge = mergeByMaster.get(`${row}:${column}`);
+      const sourceRange = sourceMerge || { startRow: row, endRow: row, startCol: column, endCol: column };
+      const hasContent = source.value !== null && source.value !== undefined && source.value !== '';
+      const hasStyle = Object.keys(source.style || {}).length > 0;
+      if (!hasContent && !hasStyle && !sourceMerge) continue;
+      const range = {
+        startRow: mapStart(sourceRange.startRow),
+        endRow: mapEnd(sourceRange.endRow),
+        startCol: sourceRange.startCol,
+        endCol: sourceRange.endCol,
+      };
+      const target = worksheet.getCell(range.startRow, range.startCol);
+      target.value = cloneExcelValue(source.value);
+      target.style = structuredClone(source.style || {});
+      if (source.dataValidation && Object.keys(source.dataValidation).length) {
+        target.dataValidation = structuredClone(source.dataValidation);
+      }
+      if (source.note) target.note = structuredClone(source.note);
+      // ExcelJS snapshots the master's style into merged followers when the merge is created. Styling the
+      // master after merging leaves those follower cells without perimeter border records, which produces
+      // gaps across wide header merges and missing bottoms on tall group merges. Copy the resolved style
+      // first, then create the target merge so every edge is materialized in the worksheet XML.
+      if (range.startRow !== range.endRow || range.startCol !== range.endCol) {
+        mergeSafe(worksheet, range, merges, plan.item.name);
+      }
+    }
+  }
+
+  const mappedStart = mapStart(1);
+  const mappedEnd = mapEnd(plan.region.rowsConsumed);
+  const mappedHeaderEnd = plan.region.headerRows > 0 ? mapEnd(plan.region.headerRows) : mappedStart - 1;
+  return {
+    ...plan.region,
+    startRow: mappedStart,
+    endRow: mappedEnd,
+    rowsConsumed: mappedEnd - mappedStart + 1,
+    headerRows: Math.max(0, mappedHeaderEnd - mappedStart + 1),
+  };
+}
+
+async function renderCoordinateScheduledSection({
+  workbook,
+  worksheet,
+  model,
+  section,
+  request,
+  globals,
+  context,
+  config,
+  tempDir,
+  chartCounter,
+  xGrid,
+  startRow,
+  merges,
+  tablixCache,
+  measureDoc,
+}) {
+  // Report body coordinates remain absolute even after an explicit page break starts a new logical Excel
+  // section. Each worksheet has its own local origin, matching the legacy section renderer and SSRS's
+  // page-local placement semantics; carrying the global body Top into the new sheet creates a giant blank
+  // row containing the height of every earlier section.
+  const sectionOriginTop = section.length
+    ? Math.min(...section.map((item) => point(item.top || 0)))
+    : 0;
+  const plans = [];
+  for (const item of section) {
+    const designTop = point((item.top || 0) - sectionOriginTop);
+    if (item.type !== 'Tablix') {
+      const display = item.type === 'Textbox' ? cellString(textForItem(item, context)) : '';
+      const grownTextboxHeight = item.type === 'Textbox'
+        ? excelCanGrowTextboxHeight(measureDoc, config, item, context, display, item.width || 0, item.style || {})
+        : 0;
+      plans.push({
+        item,
+        designTop,
+        occupiedHeight: Math.max(2, item.height || DEFAULT_ROW_POINTS, grownTextboxHeight),
+        resolvedTop: designTop,
+      });
+      continue;
+    }
+    const planningWorkbook = new ExcelJS.Workbook();
+    const planningSheet = planningWorkbook.addWorksheet('Tablix');
+    const region = renderReportTablix({
+      worksheet: planningSheet,
+      model,
+      item,
+      request,
+      globals,
+      config,
+      xGrid,
+      startRow: 1,
+      merges: [],
+      tablixCache,
+      measureDoc,
+    });
+    const localBoundaries = worksheetRowBoundaries(planningSheet, region.rowsConsumed);
+    plans.push({
+      item,
+      designTop,
+      worksheet: planningSheet,
+      region,
+      localBoundaries,
+      occupiedHeight: Math.max(item.height || 0, localBoundaries.at(-1)),
+      resolvedTop: designTop,
+    });
+  }
+
+  // RDL peers keep their declared coordinates. Growth only pushes an item down when a design-time peer
+  // ended above it in the same horizontal lane, preserving the original minimum vertical gap. Items in
+  // disjoint left/right lanes therefore remain side by side instead of being serialized by item type.
+  const layoutOrder = plans
+    .map((plan, sourceIndex) => ({ plan, sourceIndex }))
+    .sort((left, right) => left.plan.designTop - right.plan.designTop
+      || (left.plan.item.left || 0) - (right.plan.item.left || 0)
+      || left.sourceIndex - right.sourceIndex)
+    .map(({ plan }) => plan);
+  for (const [index, plan] of layoutOrder.entries()) {
+    const designTop = plan.designTop;
+    for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
+      const previous = layoutOrder[previousIndex];
+      const previousDesignBottom = point(previous.designTop + (previous.item.height || 0));
+      if (previousDesignBottom > designTop + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      if (!horizontalDesignOverlap(previous.item, plan.item)) continue;
+      const originalGap = Math.max(0, designTop - previousDesignBottom);
+      plan.resolvedTop = Math.max(plan.resolvedTop, point(previous.resolvedTop + previous.occupiedHeight + originalGap));
+    }
+  }
+
+  const boundaries = new Set([0]);
+  for (const plan of plans) {
+    boundaries.add(plan.resolvedTop);
+    boundaries.add(point(plan.resolvedTop + plan.occupiedHeight));
+    if (plan.item.type === 'Tablix') {
+      for (const boundary of plan.localBoundaries) boundaries.add(point(plan.resolvedTop + boundary));
+    } else {
+      collectYBoundaries([{ ...plan.item, top: plan.resolvedTop }], boundaries);
+    }
+  }
+  const maximum = Math.max(...boundaries);
+  boundaries.add(maximum);
+  const yGrid = splitTallRowIntervals([...boundaries].filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b));
+  allocateHeightRows(worksheet, yGrid, startRow);
+
+  const detailRegions = [];
+  for (const plan of plans) {
+    if (plan.item.type === 'Tablix') {
+      const region = copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges });
+      if (region.dynamic) detailRegions.push(region);
+      continue;
+    }
+    await renderFreeformItem({
+      workbook,
+      worksheet,
+      model,
+      item: {
+        ...plan.item,
+        top: plan.resolvedTop,
+        height: plan.item.type === 'Textbox' ? plan.occupiedHeight : plan.item.height,
+      },
+      context,
+      config,
+      tempDir,
+      chartCounter,
+      xGrid,
+      yGrid,
+      startRow,
+      merges,
+    });
+  }
+  return { rowsConsumed: Math.max(1, yGrid.length - 1), detailRegions };
+}
+
 function addGapRows(worksheet, startRow, points) {
   let remaining = Math.max(0, points);
   let rows = 0;
@@ -1258,10 +1593,17 @@ async function renderReportExcel(model, request, config, tempDir) {
 
   for (let index = 0; index < sections.length; index += 1) {
     const section = sections[index];
-    const title = declaredSectionName(section, context) || firstVisibleText(section, model, request, globals);
+    // REPORT worksheets are partitioned only at explicit RDL page breaks. They are continuous Excel
+    // sheets rather than PDF pages, but each section still has a stable logical first/middle/last position.
+    // Use that position when resolving page-dependent header/body expressions; evaluating every sheet as
+    // Page 1 of 1 hides constructs intended for interior sections while still reserving their band height.
+    const sectionGlobals = { ...globals, PageNumber: index + 1, TotalPages: sections.length };
+    const sectionContext = { ...context, globals: sectionGlobals };
+    const title = declaredSectionName(section, sectionContext)
+      || firstVisibleText(section, model, request, sectionGlobals);
     const name = uniqueSheetName(workbook, title, `Section ${index + 1}`);
     const worksheet = workbook.addWorksheet(name);
-    const xGrid = reportGrid(model, section, request, globals, tablixCache);
+    const xGrid = reportGrid(model, section, request, sectionGlobals, tablixCache);
     for (let column = 0; column < xGrid.length - 1; column += 1) {
       worksheet.getColumn(column + 1).width = excelWidthFromPoints(xGrid[column + 1] - xGrid[column]);
     }
@@ -1271,11 +1613,35 @@ async function renderReportExcel(model, request, config, tempDir) {
     if (model.page.header?.items?.length) {
       headerBandRows = await renderFreeformBand({
         workbook, worksheet, model, items: model.page.header.items, height: model.page.header.height,
-        context, config, tempDir, chartCounter, xGrid, startRow: cursor, merges,
+        context: sectionContext, config, tempDir, chartCounter, xGrid, startRow: cursor, merges,
       });
       cursor += headerBandRows;
     }
     const detailRegions = [];
+    const coordinateSchedulable = section.every((item) => (
+      item.type !== 'Rectangle' || !containsTablix(item)
+    ));
+    if (coordinateSchedulable) {
+      const scheduled = await renderCoordinateScheduledSection({
+        workbook,
+        worksheet,
+        model,
+        section,
+        request,
+        globals: sectionGlobals,
+        context: sectionContext,
+        config,
+        tempDir,
+        chartCounter,
+        xGrid,
+        startRow: cursor,
+        merges,
+        tablixCache,
+        measureDoc,
+      });
+      cursor += scheduled.rowsConsumed;
+      detailRegions.push(...scheduled.detailRegions);
+    }
     const renderSectionItem = async (sourceItem, parentLeft = 0) => {
       const item = { ...sourceItem, left: point(parentLeft + (sourceItem.left || 0)) };
       if (item.type === 'Rectangle') {
@@ -1289,7 +1655,7 @@ async function renderReportExcel(model, request, config, tempDir) {
             model,
             items: [{ ...item, top: 0 }],
             height: Math.max(2, item.height || DEFAULT_ROW_POINTS),
-            context,
+            context: sectionContext,
             config,
             tempDir,
             chartCounter,
@@ -1318,7 +1684,7 @@ async function renderReportExcel(model, request, config, tempDir) {
           startRow: containerStart,
           endRow: Math.max(containerStart, cursor - 1),
         };
-        const fill = hex(styleColor(item.style?.backgroundColor, context, null));
+        const fill = hex(styleColor(item.style?.backgroundColor, sectionContext, null));
         const borders = item.style?.borders || {};
         for (let row = range.startRow; row <= range.endRow; row += 1) {
           for (let column = range.startCol; column <= range.endCol; column += 1) {
@@ -1328,10 +1694,10 @@ async function renderReportExcel(model, request, config, tempDir) {
             }
             target.border = {
               ...(target.border || {}),
-              top: row === range.startRow ? excelBorderSide(borders.top, context) : target.border?.top,
-              bottom: row === range.endRow ? excelBorderSide(borders.bottom, context) : target.border?.bottom,
-              left: column === range.startCol ? excelBorderSide(borders.left, context) : target.border?.left,
-              right: column === range.endCol ? excelBorderSide(borders.right, context) : target.border?.right,
+              top: row === range.startRow ? excelBorderSide(borders.top, sectionContext) : target.border?.top,
+              bottom: row === range.endRow ? excelBorderSide(borders.bottom, sectionContext) : target.border?.bottom,
+              left: column === range.startCol ? excelBorderSide(borders.left, sectionContext) : target.border?.left,
+              right: column === range.endCol ? excelBorderSide(borders.right, sectionContext) : target.border?.right,
             };
           }
         }
@@ -1343,7 +1709,7 @@ async function renderReportExcel(model, request, config, tempDir) {
           model,
           item,
           request,
-          globals,
+          globals: sectionGlobals,
           config,
           xGrid,
           startRow: cursor,
@@ -1362,7 +1728,7 @@ async function renderReportExcel(model, request, config, tempDir) {
         model,
         items: [{ ...item, top: 0 }],
         height,
-        context,
+        context: sectionContext,
         config,
         tempDir,
         chartCounter,
@@ -1387,7 +1753,7 @@ async function renderReportExcel(model, request, config, tempDir) {
       || (right.left || 0) + (right.width || 0) <= (left.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
     );
     let previousDesignBottom = null;
-    for (let itemIndex = 0; itemIndex < section.length; itemIndex += 1) {
+    for (let itemIndex = 0; !coordinateSchedulable && itemIndex < section.length; itemIndex += 1) {
       const item = section[itemIndex];
       // Freeform report items are coordinate-positioned. Coincident-top items and horizontally disjoint
       // items whose design-time vertical intervals overlap are peers in one band, matching the canonical
@@ -1417,7 +1783,7 @@ async function renderReportExcel(model, request, config, tempDir) {
           model,
           items: peerBand.map((peer) => ({ ...peer, top: (peer.top || 0) - bandTop })),
           height: Math.max(2, peerBottom - bandTop),
-          context,
+          context: sectionContext,
           config,
           tempDir,
           chartCounter,
@@ -1437,7 +1803,17 @@ async function renderReportExcel(model, request, config, tempDir) {
     }
     const usedRows = Math.max(1, cursor - 1);
     rowCount += usedRows;
-    configureReportSheet(worksheet, model, request, globals, usedRows, xGrid.length - 1, detailRegions, headerBandRows, xGrid[xGrid.length - 1]);
+    configureReportSheet(
+      worksheet,
+      model,
+      request,
+      sectionGlobals,
+      usedRows,
+      xGrid.length - 1,
+      detailRegions,
+      headerBandRows,
+      xGrid[xGrid.length - 1],
+    );
   }
   if (!workbook.worksheets.length) workbook.addWorksheet('Section 1', { views: [{ state: 'normal', showGridLines: false }] });
   const buffer = Buffer.from(await workbook.xlsx.writeBuffer());

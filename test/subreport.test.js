@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { createConverter } from '../src/index.js';
 
@@ -17,6 +18,10 @@ const subreportCell = `<Subreport Name="ChildCall">
   <Height>0.25in</Height><Width>2in</Width>
 </Subreport>`;
 const parentRdl = parentFixture.replace(amountCell, subreportCell);
+const growingParentRdl = parentRdl.replace(
+  '<Textbox Name="NameCell">',
+  '<Textbox Name="NameCell"><CanGrow>true</CanGrow>',
+);
 const rowSpanParentRdl = parentFixture.replace(
   '<TablixRowHierarchy><TablixMembers><TablixMember/><TablixMember><Group Name="Details"/></TablixMember></TablixMembers></TablixRowHierarchy>',
   `<TablixRowHierarchy><TablixMembers>
@@ -182,7 +187,7 @@ test('fails closed when the parent references an unbundled subreport', async (co
   );
 });
 
-test('renders bundled subreports through the PDF trace into editable DOCX while XLSX remains unsupported', async (context) => {
+test('renders bundled subreports through the PDF trace and as native cells in Excel REPORT mode', async (context) => {
   const converter = await createConverter({
     env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
   });
@@ -199,8 +204,61 @@ test('renders bundled subreports through the PDF trace into editable DOCX while 
     .join('');
   assert.match(nativeText, /CHILD_ALPHA/);
   assert.match(nativeText, /CHILD_BETA/);
+
+  // REPORT is the default Excel mode. The child tablix must remain native/editable and retain each
+  // invocation's data instead of being flattened, omitted, or converted to a drawing.
+  const xlsx = await converter.render({ rdl: parentRdl, ...request, output: 'XLSX' });
+  assert.equal(xlsx.layoutMode, 'report-sections');
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(xlsx.buffer);
+  const values = [];
+  for (const worksheet of workbook.worksheets) {
+    worksheet.eachRow((row) => row.eachCell((cell) => values.push(String(cell.text))));
+  }
+  assert.ok(values.includes('CHILD_ALPHA'));
+  assert.ok(values.includes('CHILD_BETA'));
+  assert.equal(workbook.model.media.length, 0);
+
+  // DATA mode cannot preserve a child grid within its invoking parent cell, so it must remain fail-closed.
   await assert.rejects(
-    converter.render({ rdl: parentRdl, ...request, output: 'XLSX' }),
+    converter.render({
+      rdl: parentRdl,
+      ...request,
+      output: 'XLSX',
+      excel: { layoutMode: 'DATA' },
+    }),
     (error) => error.code === 'UNSUPPORTED_FEATURE',
   );
+  await assert.rejects(
+    converter.render({
+      rdl: parentRdl,
+      ...request,
+      output: 'XLSX',
+      excel: { sheetPerTablix: true },
+    }),
+    (error) => error.code === 'UNSUPPORTED_FEATURE',
+  );
+});
+
+test('preserves a child-grid bottom edge when another parent cell grows past it in Excel REPORT mode', async (context) => {
+  const converter = await createConverter({
+    env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
+  });
+  context.after(() => converter.close());
+  const request = bundledRequest([
+    { parameters: { EntityID: 1 }, datasets: { ChildData: [{ EntityID: 1, Label: 'SHORT_CHILD_ALPHA' }] } },
+    { parameters: { EntityID: 2 }, datasets: { ChildData: [{ EntityID: 2, Label: 'SHORT_CHILD_BETA' }] } },
+  ]);
+  request.datasets.Sales = [
+    { Name: 'A growing parent cell '.repeat(20), Amount: 1 },
+    { Name: 'Another growing parent cell '.repeat(20), Amount: 2 },
+  ];
+  const rendered = await converter.render({ rdl: growingParentRdl, ...request, output: 'XLSX' });
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(rendered.buffer);
+  const values = [];
+  workbook.worksheets[0].eachRow((row) => row.eachCell((cell) => values.push(cell.text)));
+  assert.ok(values.includes('SHORT_CHILD_ALPHA'));
+  assert.ok(values.includes('SHORT_CHILD_BETA'));
+  assert.ok(workbook.worksheets[0].rowCount > 4, 'grown parent rows should retain child-grid split boundaries');
 });

@@ -250,11 +250,32 @@ test('oversized tablix output uses one bordered native page table per canonical 
     pagination: { continuationMarkers: true },
     datasets: { D: Array.from({ length: 8 }, () => ({ V: 'OVERSIZED_GROUP' })) },
   };
-  const canonical = await renderPdf(m, renderRequest, config, { captureLayoutTrace: true });
+  const [ordinary, canonical] = await Promise.all([
+    renderPdf(m, renderRequest, config),
+    renderPdf(m, renderRequest, config, { captureLayoutTrace: true }),
+  ]);
+  assert.equal(canonical.pageCount, ordinary.pageCount, 'trace capture must not change continuation pagination');
+  // PDF metadata timestamps prevent byte-for-byte equality across independent renders. The identical byte
+  // length plus the repository-wide trace raster gate proves that recording itself emits no PDF operators.
+  assert.equal(canonical.buffer.length, ordinary.buffer.length,
+    'recording a continuation marker must not add PDF drawing content');
+  const tracedMarkers = canonical.layoutTrace.pages
+    .flatMap((page) => page.items)
+    .filter((item) => item.traceRole === 'continuationMarker');
+  assert.equal(tracedMarkers.length, canonical.pageCount - 1);
+  assert.equal(tracedMarkers.every((item) => item.text === 'Continued from previous page'), true);
+  for (const page of canonical.layoutTrace.pages.slice(1)) {
+    const marker = page.items.find((item) => item.traceRole === 'continuationMarker');
+    const firstTableTop = Math.min(...page.items.filter((item) => item.kind === 'tablixCell').map((item) => item.y));
+    assert.ok(Math.abs(marker.y + marker.height - firstTableTop) <= 0.25,
+      'the marker must end at the existing repeated-header boundary without moving table cells');
+  }
   const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
   const tables = [...xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((match) => match[0]);
   assert.equal(tables.length, canonical.pageCount, 'each canonical page must become one explicit native page table');
   assert.equal((xml.match(/<w:sectPr(?:\s|>)/g) || []).length, tables.length);
+  assert.equal((xml.match(/Continued from previous page/g) || []).length, tracedMarkers.length,
+    'Word must fill the already-reserved canonical marker region with native text');
   for (const table of tables) {
     const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
     assert.equal(physicalRows.every((row) => /<w:cantSplit\/>/.test(row)), true);
@@ -268,11 +289,15 @@ test('ordinary DOCX table fragmentation does not claim that adjacent rows are co
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
   tablix.rows[1].height = 100;
 
-  const xml = await documentXml((await renderEditableDocx(m, {
+  const renderRequest = {
     parameters: {},
     pagination: { continuationMarkers: true },
     datasets: { D: Array.from({ length: 8 }, (_, index) => ({ V: `ROW_${index + 1}` })) },
-  }, config)).buffer);
+  };
+  const canonical = await renderPdf(m, renderRequest, config, { captureLayoutTrace: true });
+  assert.equal(canonical.layoutTrace.pages.flatMap((page) => page.items)
+    .some((item) => item.traceRole === 'continuationMarker'), false);
+  const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
   assert.equal((xml.match(/<w:tbl>/g) || []).length > 1, true, 'the native table should have multiple page fragments');
   assert.doesNotMatch(xml, /Continued (?:on next|from previous) page/);
 });

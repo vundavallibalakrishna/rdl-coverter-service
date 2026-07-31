@@ -385,6 +385,47 @@ test('Code.CalculateColor uses the fixed service-owned 5x5 risk heat-map mapping
   assert.throws(() => evaluateExpression('=Code.NotAllowlisted(1, 2)'), /Unsupported RDL expression/);
 });
 
+test('allowlisted maturity-level and distinct-array custom functions use fixed native contracts', () => {
+  const level = (score) => evaluateExpression(`=Code.GetPercentLevel(${score})`);
+  assert.equal(level(0), 'Level 1');
+  assert.equal(level(0.2), 'Level 1');
+  assert.equal(level(0.2001), 'Level 2');
+  assert.equal(level(0.4), 'Level 2');
+  assert.equal(level(0.6), 'Level 3');
+  assert.equal(level(0.8), 'Level 4');
+  assert.equal(level(0.8001), 'Level 5');
+  assert.equal(evaluateExpression('=Code.GetPercentLevel(Nothing)'), 'Level 1');
+
+  const context = {
+    parameters: {},
+    fields: {},
+    datasets: { D: [
+      { Key: 'All', Value: 'Alpha' },
+      { Key: 'All', Value: 'Alpha' },
+      { Key: 'All', Value: 'Beta' },
+    ] },
+  };
+  assert.deepEqual(
+    evaluateExpression('=Code.GetDistinct(LookupSet("All", Fields!Key.Value, Fields!Value.Value, "D"))', context),
+    ['Alpha', 'Beta'],
+  );
+  assert.equal(evaluateExpression('=Code.GetDistinct(Nothing)', context), null);
+});
+
+test('analysis advertises only the allowlisted native GetPercentLevel and GetDistinct mappings', () => {
+  const mapped = fixture.toString()
+    .replace(
+      '<Value>=Parameters!Title.Value</Value>',
+      '<Value>=Join(Code.GetDistinct(LookupSet("All", "All", Fields!Value.Value, "Choices")), ", ") &amp; " - " &amp; Code.GetPercentLevel(0.6)</Value>',
+    );
+  const analysis = analyzeRdl(mapped);
+  assert.equal(analysis.compatible, true);
+  assert.ok(analysis.capabilities.expressions.detected
+    .some((entry) => entry.name === 'Code.GetPercentLevel' && entry.status === 'SUPPORTED'));
+  assert.ok(analysis.capabilities.expressions.detected
+    .some((entry) => entry.name === 'Code.GetDistinct' && entry.status === 'SUPPORTED'));
+});
+
 test('an RDL using RunningValue passes the expression capability gate', () => {
   const withRunningValue = fixture.toString().replace(
     '<Value>=Parameters!Title.Value</Value>',

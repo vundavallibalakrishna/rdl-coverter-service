@@ -223,8 +223,8 @@ visible strings, dimensions, column counts, row counts, or data values in produc
 
 Dynamic column groups (matrix / cross-tab) with column-hierarchy `TablixHeader` and `TablixCorner`, group
 header/footer subtotal rows, and recursive/parent (`Group/Parent`) row groups are implemented. Bundled,
-invocation-scoped subreports are supported in PDF, `DOCX_EDITABLE`, and `DOCX_VISUAL`; XLSX subreports
-remain fail-closed. `Group/Variables` are resolved as `Variables!Name.Value` in the current row scope via
+invocation-scoped subreports are supported in PDF, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; XLSX
+`DATA` subreports remain fail-closed. `Group/Variables` are resolved as `Variables!Name.Value` in the current row scope via
 `globals.variables`; `DomainScope` and `NaturalGroup` are acknowledged metadata. The `Aggregate()` function,
 charts beyond the supported set, maps, gauges, custom code, external resources, and other uncatalogued
 variants remain fail-closed.

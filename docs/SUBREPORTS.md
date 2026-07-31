@@ -8,7 +8,8 @@ A parent report that contains `Subreport` items can render only when the same re
 3. every dataset row that child instance needs.
 
 This contract is identical for `POST /v1/render` and `createConverter().render()`. Bundled subreports are
-supported for `PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL`. `XLSX` fails closed.
+supported for `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, and the default XLSX `REPORT` layout. XLSX `DATA`
+fails closed because it cannot preserve a child grid inside the invoking parent cell.
 
 ## Recommended preparation workflow
 

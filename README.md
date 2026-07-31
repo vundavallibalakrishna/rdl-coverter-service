@@ -317,7 +317,7 @@ Excel chart objects, while the surrounding workbook remains editable.
 | `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
-| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL`; see [Supplying subreports](./docs/SUBREPORTS.md). |
+| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; see [Supplying subreports](./docs/SUBREPORTS.md). |
 | `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, places “Continued from previous page” above the next table fragment for renderer-confirmed logical-row continuations. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
 | `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
@@ -507,8 +507,9 @@ sorts, nested and dynamic groups, merged cells, repeated headers, per-side borde
 safe HTML-to-text normalization, z-order, keep-together, page settings and breaks, and a catalogued safe
 expression subset. Expression-capable paragraph spacing and line height are resolved per row, and
 `TextRun/Value@EvaluationMode="Constant"` preserves a leading `=` as literal text. Caller-bundled,
-invocation-scoped tablix subreports render in PDF, editable DOCX, and visual DOCX; unresolved subreports and
-subreports in XLSX remain fail-closed. Maps, gauges, custom code, and non-embedded images are rejected.
+invocation-scoped tablix subreports render in PDF, editable DOCX, visual DOCX, and XLSX `REPORT`; unresolved
+subreports and subreports in XLSX `DATA` remain fail-closed. Maps, gauges, custom code, and non-embedded
+images are rejected.
 
 To ask the service instead of reading docs, `POST /v1/analyze`. To dump the whole schema catalogue:
 

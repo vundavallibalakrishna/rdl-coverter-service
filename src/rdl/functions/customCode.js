@@ -44,8 +44,41 @@ function calculateColor(args) {
   return '#ff0000';
 }
 
+// Native equivalent of the client RDL's GetPercentLevel(Double) helper. SSRS/VB coerces Nothing to the
+// numeric default for a Double argument, so nullish input starts at zero. Non-numeric input cannot produce
+// a meaningful maturity band and also falls back to that deterministic default instead of executing code.
+function getPercentLevel(args) {
+  const raw = args[0];
+  const totalScore = raw === null || raw === undefined || raw === '' ? 0 : Number(raw);
+  const pct = (Number.isFinite(totalScore) ? totalScore : 0) * 100;
+  if (pct <= 20) return 'Level 1';
+  if (pct <= 40) return 'Level 2';
+  if (pct <= 60) return 'Level 3';
+  if (pct <= 80) return 'Level 4';
+  return 'Level 5';
+}
+
+// Native equivalent of GetDistinct(Object()). The VB implementation returns Nothing for a missing array
+// and a de-duplicated object array otherwise. Preserve first occurrence order to keep service output
+// deterministic; Hashtable key enumeration order is unspecified and must not leak runtime-dependent order.
+function getDistinct(args) {
+  const input = args[0];
+  if (input === null || input === undefined) return null;
+  const values = Array.isArray(input) ? input : [input];
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
 export const CUSTOM_CODE_FUNCTIONS = Object.freeze({
   'Code.CalculateColor': calculateColor,
+  'Code.GetPercentLevel': getPercentLevel,
+  'Code.GetDistinct': getDistinct,
 });
 
 export const CUSTOM_CODE_FUNCTION_NAMES = Object.freeze(Object.keys(CUSTOM_CODE_FUNCTIONS));
@@ -53,4 +86,3 @@ export const CUSTOM_CODE_FUNCTION_NAMES = Object.freeze(Object.keys(CUSTOM_CODE_
 export const CUSTOM_CODE_FUNCTION_REGISTRY = Object.freeze(Object.fromEntries(
   Object.entries(CUSTOM_CODE_FUNCTIONS).map(([name, implementation]) => [name.toLowerCase(), implementation]),
 ));
-

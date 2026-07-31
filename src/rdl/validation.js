@@ -219,7 +219,12 @@ function headerDescriptors(path = []) {
 }
 
 function descriptorKey(descriptor, fields, parameters, globals, dataset, datasets, rowIndex) {
-  if (descriptor.groups.length === 0) return `row:${rowIndex}`;
+  // A static row-header member is one hierarchy instance even when dynamic descendants expand it into
+  // several physical rows (and even when a static footer sibling follows those descendants). Keying that
+  // owner by the emitted row index duplicates the header instead of giving it one vertical span. Static
+  // headers nested inside an outer dynamic member still carry that enclosing group in `groups`, so they
+  // correctly restart for each outer group instance below.
+  if (descriptor.groups.length === 0) return 'static-root';
   return JSON.stringify(descriptor.groups.map((group) => groupValue(group, fields, parameters, globals, dataset, datasets, rowIndex)));
 }
 
@@ -293,6 +298,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
   if (unrenderable) {
     throw new ServiceError('UNSUPPORTED_FEATURE', `Tablix cell content is not supported: ${unrenderable.type}`);
   }
+  const duplicateItems = new Array(cell.items.length).fill(null);
   const values = cell.items.map((item, itemIndex) => {
     if (item.type === 'Tablix' || item.type === 'Subreport') return '';
     const value = itemValue(item, context);
@@ -301,7 +307,19 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     const current = { scope: scopeResolver(item.hideDuplicates), value: String(value ?? '') };
     const previous = duplicateState.get(key);
     duplicateState.set(key, current);
-    return previous && previous.scope === current.scope && previous.value === current.value ? '' : value;
+    const suppressed = Boolean(previous && previous.scope === current.scope && previous.value === current.value);
+    // Preserve why the display value became empty. Renderers must never re-evaluate the raw expression and
+    // accidentally resurrect a duplicate, while Excel can use a run of explicitly suppressed duplicates to
+    // represent an otherwise borderless repeated region as one native vertical cell. A genuinely empty
+    // expression has no such metadata and therefore remains distinguishable from HideDuplicates.
+    duplicateItems[itemIndex] = {
+      key,
+      scope: current.scope,
+      value: current.value,
+      scopeName: item.hideDuplicates,
+      suppressed,
+    };
+    return suppressed ? '' : value;
   });
   const nestedTablixes = cell.items.filter((item) => item.type === 'Tablix').map((item) => {
     const depth = (context.nestedTablixDepth || 0) + 1;
@@ -376,6 +394,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
   return {
     ...cell,
     values,
+    duplicateItems,
     nestedTablixes,
     // Preserve the exact materialization scope for expression-backed cell styles. Matrix values are
     // evaluated at the row∩column intersection; evaluating their background, borders, or font later

@@ -660,15 +660,75 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
 
   const drawContinuationMarker = (label, row) => {
     const { style, context, fontSize, height } = markerDetails(row);
+    const markerY = y;
+    const markerStyle = {
+      ...style,
+      fontSize,
+      fontStyle: 'Italic',
+      fontWeight: 'Normal',
+      color: '#000000',
+      textAlign: 'Right',
+      verticalAlign: 'Middle',
+    };
     doc.save();
-    doc.rect(startX, y, totalWidth, height).fill('#FFFFFF');
+    doc.rect(startX, markerY, totalWidth, height).fill('#FFFFFF');
     const family = styleValue(style.fontFamily, context, 'Arial');
-    doc.font(pdfFont(config, family, false, true, label))
+    const fontFile = pdfFont(config, family, false, true, label);
+    doc.font(fontFile)
       .fontSize(fontSize)
       .fillColor('#000000')
-      .text(label, startX + 2, y + Math.max(0, (height - fontSize) / 2 - 1), {
+      .text(label, startX + 2, markerY + Math.max(0, (height - fontSize) / 2 - 1), {
         width: Math.max(1, totalWidth - 4), height, align: 'right', lineBreak: false,
       });
+    // The marker already occupies this exact PDF region and advances `y` below. Trace the resolved native
+    // text into that existing region so page-locked Word fills the canonical gap instead of inserting a
+    // flow paragraph that could repaginate the table. Recording is deliberately side-effect-free: all
+    // metrics come from the font state already used to draw the marker.
+    const textWidth = doc.widthOfString(label);
+    const contentHeight = doc.currentLineHeight(true);
+    const textY = markerY + Math.max(0, (height - fontSize) / 2 - 1);
+    const font = {
+      ...resolvedTraceFont(config, markerStyle, context, label),
+      family: String(family),
+      file: fontFile,
+    };
+    const textX = startX + totalWidth - 2 - textWidth;
+    const baseline = font.metrics ? textY + font.metrics.ascender : textY;
+    recordLayoutItem(doc, {
+      kind: 'textbox',
+      itemName: null,
+      tablixName: item.name || null,
+      traceRole: 'continuationMarker',
+      continuation: true,
+      zIndex: item.zIndex || 0,
+      x: startX,
+      y: markerY,
+      width: totalWidth,
+      height,
+      text: label,
+      lines: [{
+        width: textWidth,
+        height: contentHeight,
+        contentHeight,
+        before: 0,
+        after: 0,
+        top: textY - markerY,
+        textTop: textY - markerY,
+        x: textX,
+        y: textY,
+        baseline,
+        paragraphEnd: true,
+        wrapped: false,
+        alignment: 'right',
+        runs: [{ text: label, x: textX, y: textY, baseline, width: textWidth, font }],
+      }],
+      writingMode: 'default',
+      verticalAlign: 'middle',
+      padding: { top: 0, right: 2, bottom: 0, left: 2 },
+      textOffsetY: textY - markerY,
+      backgroundColor: '#FFFFFF',
+      borders: { top: null, right: null, bottom: null, left: null },
+    });
     doc.restore();
     y += height;
     addedHeight += height;

@@ -1,4 +1,5 @@
 import { ServiceError } from '../errors.js';
+import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { parseRdl } from './parser.js';
 import { parameterSignature, validateRenderInput } from './validation.js';
 
@@ -127,10 +128,15 @@ export function resolveBundledSubreports(model, request, config) {
   ], (item) => {
     if (item.type === 'Subreport') hasSubreports = true;
   });
-  if (hasSubreports && !['PDF', 'DOCX_VISUAL', 'DOCX_EDITABLE'].includes(String(request.output || '').toUpperCase())) {
+  const output = String(request.output || '').toUpperCase();
+  const supportsBundledSubreports = ['PDF', 'DOCX_VISUAL', 'DOCX_EDITABLE'].includes(output)
+    || (output === 'XLSX' && resolveExcelLayoutMode(request) === 'REPORT');
+  if (hasSubreports && !supportsBundledSubreports) {
     throw new ServiceError(
       'UNSUPPORTED_FEATURE',
-      'Bundled subreports are supported only for PDF and DOCX output',
+      output === 'XLSX'
+        ? 'Bundled subreports require Excel REPORT mode'
+        : 'Bundled subreports are supported only for PDF, DOCX, and Excel REPORT output',
       400,
       { features: ['Subreport'] },
     );

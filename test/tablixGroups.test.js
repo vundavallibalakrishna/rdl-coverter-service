@@ -98,6 +98,18 @@ test('HideDuplicates resets for the same child value in a different parent group
     { Parent: 'B', Child: null },
   ], {}, {}, {});
   assert.deepEqual(values(rows), ['Not Assessed', '', 'Not Assessed', '']);
+  assert.deepEqual(
+    rows.map((row) => row.cells[0].duplicateItems[0] && {
+      suppressed: row.cells[0].duplicateItems[0].suppressed,
+      scopeName: row.cells[0].duplicateItems[0].scopeName,
+    }),
+    [
+      { suppressed: false, scopeName: 'ChildGroup' },
+      { suppressed: true, scopeName: 'ChildGroup' },
+      { suppressed: false, scopeName: 'ChildGroup' },
+      { suppressed: true, scopeName: 'ChildGroup' },
+    ],
+  );
 });
 
 test('HideIfNoRows, NoRowsMessage and ToggleItem no longer fail closed', () => {

@@ -86,7 +86,8 @@ server*, and this service deliberately has no report server, catalogue, filesyst
 `OmitBorderOnPageBreak`. Analysis cannot declare that dependency renderable because it has no render-time
 bundle.
 
-`PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL` rendering can resolve the dependency only when the same request supplies:
+`PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT` rendering can resolve the dependency only when the
+same request supplies:
 
 - the exact child RDL as `rdlBase64`;
 - one invocation record for each evaluated child parameter signature; and
@@ -98,8 +99,9 @@ with a row-spanned parent cell cannot itself exceed every available page segment
 Definitions are capped, recursion is cycle/depth checked, all parent/child row and request limits apply, and
 unused definitions are rejected. Child queries are metadata and are never executed.
 
-`XLSX` still rejects bundled subreports because its native nested-grid composition has not been
-implemented. This prevents a child from being silently flattened or omitted.
+XLSX `REPORT` composes each tablix-only child as native editable cells within the invoking parent region.
+XLSX `DATA` rejects bundled subreports because its data-first sheet model cannot preserve that nested
+parent-cell geometry. This prevents a child from being silently flattened or omitted.
 
 See [Supplying subreports](./SUBREPORTS.md) for the exact HTTP/library request contract, invocation matching,
 empty-result handling, and nested child/grandchild example.

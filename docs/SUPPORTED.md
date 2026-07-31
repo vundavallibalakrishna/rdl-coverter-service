@@ -69,7 +69,7 @@ structure, not SSRS/VB runtime semantics. That distinction is also the origin of
 | `Image` | **`Source=Embedded` only.** `Sizing`: `Fit`, `FitProportional`, `Clip`, `AutoSize` |
 | `Line` | Body level only |
 | `Chart` | See [Charts](#charts) |
-| `Subreport` | `PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL`, with caller-bundled child RDL and invocation-scoped datasets; tablix-only child body |
+| `Subreport` | `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT`, with caller-bundled child RDL and invocation-scoped datasets; tablix-only child body; XLSX `DATA` fails closed |
 
 `Image` with `Source=External` or `Source=Database` is rejected (`ImageSource:<source>`) — the service does
 not fetch remote resources or read databases.

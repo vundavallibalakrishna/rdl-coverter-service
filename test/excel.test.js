@@ -6,10 +6,12 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
+import PDFDocument from 'pdfkit';
 import { parseRdl } from '../src/rdl/parser.js';
 import { loadConfig } from '../src/config.js';
 import { renderExcel, resolveExcelLayoutMode } from '../src/render/excel.js';
 import { renderDocument, OUTPUTS } from '../src/render/index.js';
+import { measureTextboxHeight } from '../src/render/pdf.js';
 
 const model = parseRdl(await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url)));
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
@@ -26,10 +28,58 @@ function groupedRdl() {
   </TablixCells></TablixRow></TablixRows></TablixBody>
   <TablixColumnHierarchy><TablixMembers><TablixMember/><TablixMember/></TablixMembers></TablixColumnHierarchy>
   <TablixRowHierarchy><TablixMembers><TablixMember><Group Name="Regions"><GroupExpressions><GroupExpression>=Fields!Region.Value</GroupExpression></GroupExpressions></Group>
-  <TablixHeader><Size>0.75in</Size><CellContents><Textbox Name="r"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Region.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox></CellContents></TablixHeader><FixedData>true</FixedData>
+  <TablixHeader><Size>0.75in</Size><CellContents><Textbox Name="r"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Region.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border></Style></Textbox></CellContents></TablixHeader><FixedData>true</FixedData>
   <TablixMembers><TablixMember><Group Name="Details"/></TablixMember></TablixMembers></TablixMember></TablixMembers></TablixRowHierarchy>
   <DataSetName>D</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.75in</Height><Width>2.75in</Width><Style/></Tablix></ReportItems><Height>3in</Height><Style/></Body>
   <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth></Page></ReportSection></ReportSections></Report>`;
+}
+
+function hideDuplicatesRdl() {
+  return `<?xml version="1.0"?><Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <DataSets><DataSet Name="D"><Fields>
+    <Field Name="Region"><DataField>Region</DataField></Field>
+    <Field Name="Score"><DataField>Score</DataField></Field>
+    <Field Name="Status"><DataField>Status</DataField></Field>
+  </Fields><Query><CommandText>x</CommandText></Query></DataSet></DataSets>
+  <ReportSections><ReportSection><Body><ReportItems><Tablix Name="T"><TablixBody>
+  <TablixColumns><TablixColumn><Width>1in</Width></TablixColumn><TablixColumn><Width>1.5in</Width></TablixColumn></TablixColumns>
+  <TablixRows><TablixRow><Height>0.25in</Height><TablixCells>
+    <TablixCell><CellContents><Textbox Name="score"><HideDuplicates>Regions</HideDuplicates><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Score.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>Orange</BackgroundColor></Style></Textbox></CellContents></TablixCell>
+    <TablixCell><CellContents><Textbox Name="status"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Status.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox></CellContents></TablixCell>
+  </TablixCells></TablixRow></TablixRows></TablixBody>
+  <TablixColumnHierarchy><TablixMembers><TablixMember/><TablixMember/></TablixMembers></TablixColumnHierarchy>
+  <TablixRowHierarchy><TablixMembers><TablixMember><Group Name="Regions"><GroupExpressions><GroupExpression>=Fields!Region.Value</GroupExpression></GroupExpressions></Group>
+    <TablixMembers><TablixMember><Group Name="Details"/></TablixMember></TablixMembers>
+  </TablixMember></TablixMembers></TablixRowHierarchy>
+  <DataSetName>D</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.75in</Height><Width>2.5in</Width><Style/></Tablix></ReportItems><Height>3in</Height><Style/></Body>
+  <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.5in</LeftMargin><RightMargin>0.5in</RightMargin><TopMargin>0.5in</TopMargin><BottomMargin>0.5in</BottomMargin></Page></ReportSection></ReportSections></Report>`;
+}
+
+function rectangleWrappedSymbolRdl() {
+  return `<?xml version="1.0"?><Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <DataSets><DataSet Name="D"><Fields><Field Name="Movement"><DataField>Movement</DataField></Field></Fields>
+    <Query><CommandText>x</CommandText></Query></DataSet></DataSets>
+  <ReportSections><ReportSection><Body><ReportItems><Tablix Name="T"><TablixBody>
+  <TablixColumns><TablixColumn><Width>1.25in</Width></TablixColumn></TablixColumns>
+  <TablixRows><TablixRow><Height>0.75in</Height><TablixCells><TablixCell><CellContents>
+    <Rectangle Name="MovementContainer"><ReportItems><Textbox Name="MovementSymbol"><CanGrow>true</CanGrow>
+      <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Movement.Value</Value><Style>
+        <FontFamily>Segoe UI Symbol</FontFamily><FontSize>26pt</FontSize><Color>Gray</Color>
+      </Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+      <Left>0.1in</Left><Top>0.1in</Top><Width>1.05in</Width><Height>0.45in</Height>
+      <Style><Border><Style>None</Style></Border><VerticalAlign>Middle</VerticalAlign></Style>
+    </Textbox></ReportItems><Style><Border><Style>None</Style></Border></Style></Rectangle>
+  </CellContents></TablixCell></TablixCells></TablixRow></TablixRows></TablixBody>
+  <TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
+  <TablixRowHierarchy><TablixMembers><TablixMember><Group Name="Details"/></TablixMember></TablixMembers></TablixRowHierarchy>
+  <DataSetName>D</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.75in</Height><Width>1.25in</Width>
+  <Style><Border><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></Border>
+    <FontFamily>Arial</FontFamily><FontSize>10pt</FontSize><Color>Black</Color>
+    <TextAlign>Left</TextAlign><VerticalAlign>Top</VerticalAlign></Style>
+  </Tablix></ReportItems><Height>1in</Height><Style/></Body><Width>1.25in</Width>
+  <Page><PageHeight>3in</PageHeight><PageWidth>3in</PageWidth><LeftMargin>0.25in</LeftMargin>
+    <RightMargin>0.25in</RightMargin><TopMargin>0.25in</TopMargin><BottomMargin>0.25in</BottomMargin></Page>
+  </ReportSection></ReportSections></Report>`;
 }
 
 function chartReportRdl() {
@@ -141,6 +191,48 @@ test('REPORT mode honors CanGrow for wrapped cell text and preserves a fixed Can
     growingSheet.getRow(growingCell.row).height > detailRow.height,
     `expected CanGrow row to exceed its declared ${detailRow.height}pt height`,
   );
+  const measureDoc = new PDFDocument({ autoFirstPage: false });
+  measureDoc.addPage({ size: [1000, 1000], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+  const measurementContext = {
+    parameters: growingRequest.parameters,
+    globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: {} },
+    fields: growingRequest.datasets.Sales[0],
+    dataset: growingRequest.datasets.Sales,
+    datasets: growingRequest.datasets,
+  };
+  const pdfContentHeight = measureTextboxHeight(
+    measureDoc,
+    config,
+    textbox,
+    measurementContext,
+    'establishment',
+    tablix.columns[0],
+  );
+  const resolvedLineHeight = measureTextboxHeight(
+    measureDoc,
+    config,
+    textbox,
+    measurementContext,
+    'e',
+    tablix.columns[0],
+  );
+  measureDoc.end();
+  assert.ok(
+    growingSheet.getRow(growingCell.row).height >= pdfContentHeight + 4 + resolvedLineHeight - 0.25,
+    'a wrapped CanGrow row must reserve one resolved font line beyond the exact PDF height for Excel reflow',
+  );
+
+  const shortSheet = await load((await renderExcel(growingModel, {
+    ...request,
+    datasets: { ...request.datasets, Sales: [{ Name: 'North', Amount: 1 }] },
+  }, config, null)).buffer);
+  const shortCell = findCell(shortSheet, 'North');
+  assert.ok(shortCell);
+  assert.equal(
+    shortSheet.getRow(shortCell.row).height,
+    detailRow.height,
+    'a single-line CanGrow value must not receive the multi-line Excel reserve',
+  );
 
   const fixedModel = structuredClone(growingModel);
   fixedModel.body.items.find((item) => item.type === 'Tablix')
@@ -214,6 +306,13 @@ test('valid horizontal header spans are merged', async () => {
   const result = await renderExcel(merged, request, config, null);
   const sheetXml = await (await JSZip.loadAsync(result.buffer)).file('xl/worksheets/sheet1.xml').async('string');
   assert.match(sheetXml, /<mergeCell ref="[A-Z]+\d+:[A-Z]+\d+"/);
+  const ws = await load(result.buffer);
+  const header = findCell(ws, 'Name');
+  const headerMerge = (ws.model.merges || []).find((range) => range.startsWith(`${header.master.address}:`));
+  assert.ok(headerMerge, 'expected the spanning header to remain a native merged range');
+  const [, headerEnd] = headerMerge.split(':');
+  assert.equal(ws.getCell(headerEnd).border?.top?.style, 'thin', 'wide merged headers must retain their top perimeter');
+  assert.equal(ws.getCell(headerEnd).border?.bottom?.style, 'thin', 'wide merged headers must retain their bottom perimeter');
 });
 
 test('section boundaries inside a logical tablix cell do not create blank Excel gaps', async () => {
@@ -324,7 +423,9 @@ test('REPORT columns come from RDL coordinates and do not autofit to content', a
 
 test('explicit page breaks create stable section worksheets and normal views have no zero split', async () => {
   const sectioned = structuredClone(model);
-  sectioned.body.items.find((item) => item.type === 'Tablix').pageBreak = { location: 'Start', disabled: 'false' };
+  const sectionTablix = sectioned.body.items.find((item) => item.type === 'Tablix');
+  sectionTablix.pageBreak = { location: 'Start', disabled: 'false' };
+  sectionTablix.top = 1500;
   const result = await renderExcel(sectioned, request, config, null);
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(result.buffer);
@@ -334,6 +435,48 @@ test('explicit page breaks create stable section worksheets and normal views hav
     assert.ok(sheet.views.every((view) => view.state !== 'frozen' || (view.xSplit || 0) > 0 || (view.ySplit || 0) > 0));
     assert.match(sheet.pageSetup.printArea, /^A1:[A-Z]+\d+$/);
   }
+  assert.ok(
+    Math.max(...Array.from({ length: wb.worksheets[1].rowCount }, (_, index) => wb.worksheets[1].getRow(index + 1).height || 0)) < 100,
+    'a later page-break section must use a worksheet-local vertical origin instead of retaining its global body Top',
+  );
+});
+
+test('page-dependent Excel header visibility uses the explicit section first/middle/last context', async () => {
+  const sectioned = structuredClone(model);
+  const source = sectioned.body.items.find((item) => item.type === 'Textbox');
+  const textbox = (name, value, top, pageBreak = null) => {
+    const item = structuredClone(source);
+    item.name = name;
+    item.value = value;
+    item.paragraphs = [[{ value, markupType: 'None', style: item.style }]];
+    item.top = top;
+    item.left = 0;
+    item.width = 200;
+    item.height = 20;
+    item.pageBreak = pageBreak;
+    return item;
+  };
+  sectioned.body.items = [
+    textbox('FirstSection', 'First section', 0),
+    textbox('MiddleSection', 'Middle section', 100, { location: 'Start', disabled: 'false' }),
+    textbox('LastSection', 'Last section', 200, { location: 'Start', disabled: 'false' }),
+  ];
+  const middleHeader = textbox('MiddleHeader', 'Interior section header', 0);
+  middleHeader.hidden = '=IIF(Globals!PageNumber = 1, True, IIF(Globals!PageNumber = Globals!TotalPages, True, False))';
+  sectioned.page.header = {
+    height: 20,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [middleHeader],
+  };
+
+  const rendered = await renderExcel(sectioned, request, config, null);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(rendered.buffer);
+  assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ['First section', 'Middle section', 'Last section']);
+  assert.equal(findCell(workbook.worksheets[0], 'Interior section header'), null);
+  assert.ok(findCell(workbook.worksheets[1], 'Interior section header'));
+  assert.equal(findCell(workbook.worksheets[2], 'Interior section header'), null);
 });
 
 test('a declared RDL PageName is preferred for the native section worksheet name', async () => {
@@ -375,6 +518,23 @@ test('multiple RDL text runs remain native Excel rich text', async () => {
   assert.equal(cell.value.richText[1].font.color.argb, 'FFCC0000');
 });
 
+test('rectangle-wrapped tablix text keeps inner run and paragraph formatting while the grid keeps its border', async () => {
+  const wrapped = parseRdl(rectangleWrappedSymbolRdl());
+  const wrappedRequest = { outputFileName: 'Movement', parameters: {}, datasets: { D: [{ Movement: '⬍' }] } };
+  const ws = await load((await renderExcel(wrapped, wrappedRequest, config, null)).buffer);
+  const cell = findCell(ws, '⬍');
+  assert.ok(cell, 'expected the movement symbol in a native Excel cell');
+  assert.equal(cell.font?.name, 'Segoe UI Symbol');
+  assert.equal(cell.font?.size, 26);
+  assert.equal(cell.font?.color?.argb, 'FF808080');
+  assert.equal(cell.alignment?.horizontal, 'center');
+  assert.equal(cell.alignment?.vertical, 'middle');
+  assert.equal(cell.border?.top?.style, 'thin');
+  assert.equal(cell.border?.right?.style, 'thin');
+  assert.equal(cell.border?.bottom?.style, 'thin');
+  assert.equal(cell.border?.left?.style, 'thin');
+});
+
 test('REPORT mode preserves vertical group spans as native merges and closes the final grid edge', async () => {
   const grouped = parseRdl(groupedRdl());
   const groupedRequest = { outputFileName: 'Grouped', parameters: {}, datasets: { D: [
@@ -397,11 +557,54 @@ test('REPORT mode preserves vertical group spans as native merges and closes the
   const [, endAddress] = eastMerge.split(':');
   assert.notEqual(endAddress.replace(/\d+/g, ''), '');
   assert.notEqual(Number(endAddress.match(/\d+/)?.[0]), Number(eastMaster.match(/\d+/)?.[0]));
+  assert.equal(
+    ws.getCell(endAddress).border?.bottom?.style,
+    'thin',
+    'the last physical cell of a vertical group merge must retain the merged bottom perimeter',
+  );
   const finalRow = ws.getRow(ws.rowCount);
   for (let column = 1; column <= ws.columnCount; column += 1) {
     assert.equal(finalRow.getCell(column).border?.bottom?.style, 'thin', `missing final bottom border in column ${column}`);
   }
   assert.ok((ws.views.find((view) => view.state === 'frozen')?.xSplit || 0) > 0);
+});
+
+test('REPORT mode coalesces only borderless HideDuplicates runs and never resurrects suppressed typed values', async () => {
+  const hiddenDuplicates = parseRdl(hideDuplicatesRdl());
+  const result = await renderExcel(hiddenDuplicates, {
+    outputFileName: 'HideDuplicates',
+    parameters: {},
+    datasets: { D: [
+      { Region: 'East', Score: 15, Status: 'Partially Effective' },
+      { Region: 'East', Score: 15, Status: 'Partially Effective' },
+      { Region: 'West', Score: 20, Status: 'Partially Effective' },
+    ] },
+    excel: { layoutMode: 'REPORT' },
+  }, config, null);
+  const ws = await load(result.buffer);
+  const zip = await JSZip.loadAsync(result.buffer);
+  const sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+  const mergeRefs = [...sheetXml.matchAll(/<mergeCell ref="([A-Z]+\d+:[A-Z]+\d+)"/g)].map((match) => match[1]);
+
+  const scoreCells = [];
+  const statusCells = [];
+  ws.eachRow((row) => row.eachCell({ includeEmpty: false }, (cell) => {
+    if (cell.value === 15) scoreCells.push(cell);
+    if (cell.value === 'Partially Effective') statusCells.push(cell);
+  }));
+  assert.ok(scoreCells.length >= 2);
+  const scoreMaster = scoreCells[0].master.address;
+  assert.ok(
+    mergeRefs.some((range) => range.startsWith(`${scoreMaster}:`) && Number(range.match(/:(?:[A-Z]+)(\d+)/)?.[1]) > scoreCells[0].row),
+    `the visible score and its explicitly suppressed duplicate must be one vertical merge: ${mergeRefs.join(', ')}`,
+  );
+  assert.equal(new Set(scoreCells.map((cell) => cell.master.address)).size, 1);
+  assert.equal(
+    new Set(statusCells.slice(0, 2).map((cell) => cell.master.address)).size,
+    2,
+    'ordinary repeated detail text must remain independently editable',
+  );
+  assert.equal((sheetXml.match(/<v>15<\/v>/g) || []).length, 1, 'the suppressed numeric expression must not be emitted again');
 });
 
 test('REPORT embedded images use pictures without emitting layout shapes or native chart parts', async () => {
@@ -454,6 +657,82 @@ test('REPORT mode anchors visible charts as pictures while preserving RDL sectio
   assert.equal(anchors.length, 2);
   assert.equal(anchors[0].row, anchors[1].row, 'side-by-side chart peers must share their top row');
   assert.notEqual(anchors[0].column, anchors[1].column);
+});
+
+test('REPORT mode schedules growing tablixes and drawings in independent horizontal lanes', async () => {
+  const charted = parseRdl(chartReportRdl());
+  const scheduled = structuredClone(charted);
+  const tablix = structuredClone(model.body.items.find((item) => item.type === 'Tablix'));
+  tablix.top = 54;
+  tablix.left = 0;
+  tablix.height = 39.6;
+
+  const chart = structuredClone(charted.body.items.find((item) => item.type === 'Chart'));
+  chart.top = 54;
+  chart.left = 380;
+  chart.width = 216;
+  chart.height = 144;
+
+  const literalTextbox = (name, value, top, left, width) => {
+    const textbox = structuredClone(model.body.items.find((item) => item.type === 'Textbox'));
+    textbox.name = name;
+    textbox.top = top;
+    textbox.left = left;
+    textbox.width = width;
+    textbox.height = 18;
+    textbox.paragraphs = textbox.paragraphs.map((paragraph) => paragraph.map((run) => ({ ...run, value })));
+    return textbox;
+  };
+  const belowTablix = literalTextbox('BelowTablix', 'Below growing table', 100, 0, 360);
+  const fullWidthFollower = literalTextbox('FullWidthFollower', 'After both lanes', 210, 0, 596);
+
+  scheduled.datasets = [
+    ...structuredClone(charted.datasets),
+    ...structuredClone(model.datasets),
+  ];
+  // Deliberately keep the tall chart after the downstream textboxes in XML/source order. Layout scheduling
+  // must be driven by RDL coordinates, never by the order in which peer elements happened to be serialized.
+  scheduled.body.items = [tablix, belowTablix, fullWidthFollower, chart];
+  scheduled.body.width = 596;
+  scheduled.body.height = 240;
+
+  const rendered = await renderExcel(scheduled, {
+    outputFileName: 'Scheduled peers',
+    parameters: request.parameters,
+    datasets: {
+      D: [{ Category: 'A', Amount: 2 }, { Category: 'B', Amount: 3 }],
+      Sales: request.datasets.Sales,
+      Choices: request.datasets.Choices,
+    },
+    excel: { layoutMode: 'REPORT' },
+  }, config, null);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(rendered.buffer);
+  const worksheet = workbook.worksheets[0];
+  const north = findCell(worksheet, 'North');
+  const below = findCell(worksheet, 'Below growing table');
+  const follower = findCell(worksheet, 'After both lanes');
+  assert.ok(north && below && follower);
+
+  const image = worksheet.getImages()[0];
+  assert.ok(image);
+  assert.equal(
+    image.range.tl.nativeRow + 1,
+    findCell(worksheet, 'Name').row,
+    'a coincident chart and tablix in disjoint horizontal lanes must share their top row',
+  );
+  assert.ok(
+    below.row > north.row,
+    'an item below the tablix must follow the tablix materialized rows rather than its design-time height',
+  );
+  assert.ok(
+    below.row - 1 < image.range.br.nativeRow,
+    'the tall chart in a disjoint lane must not serialize the item below the shorter tablix',
+  );
+  assert.ok(
+    follower.row - 1 >= image.range.br.nativeRow,
+    'a later full-width item must follow the tallest intersecting lane',
+  );
 });
 
 test('an untrusted value beginning with = is stored as a typed string, never a live formula', async () => {
