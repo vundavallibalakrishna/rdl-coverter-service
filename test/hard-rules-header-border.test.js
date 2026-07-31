@@ -174,6 +174,28 @@ test('a dynamic borderless narrative tablix honors Border=None instead of receiv
   assert.doesNotMatch(xml, /<w:bottom w:val="single"/);
 });
 
+test('a trailing static matrix axis row does not receive a synthetic bottom rule', () => {
+  const bordered = {
+    items: [{
+      type: 'Textbox',
+      style: {
+        borders: {
+          top: { style: 'Solid', color: '#000000', width: 1 },
+          right: { style: 'Solid', color: '#000000', width: 1 },
+          bottom: { style: 'Solid', color: '#000000', width: 1 },
+          left: { style: 'Solid', color: '#000000', width: 1 },
+        },
+      },
+    }],
+  };
+  const rows = [
+    { isStatic: false, cells: [bordered] },
+    { isStatic: true, role: 'static', cells: [{ items: [], values: [] }] },
+  ];
+
+  assert.equal(shouldEnforceTablixBottom(rows, { style: {} }), false);
+});
+
 test('a vertical-merge owner reaching the last row carries the enforced bottom border', async () => {
   const m = parseRdl(flatTablixRdl);
   const tablix = m.body.items.find((item) => item.type === 'Tablix');

@@ -595,7 +595,7 @@ function intersectRows(a, b) {
 
 // Ordered distinct group instances for a member's group over `rows`, preserving first-appearance
 // order. Rows are SLICED (never cloned) so positional expression functions keep working.
-function partitionByGroup(group, rows, parameters, globals, sourceRows, datasets) {
+function partitionByGroup(group, rows, parameters, globals, sourceRows, datasets, sortExpressions = []) {
   const byKey = new Map();
   const order = [];
   rows.forEach((fields, index) => {
@@ -603,7 +603,33 @@ function partitionByGroup(group, rows, parameters, globals, sourceRows, datasets
     if (!byKey.has(key)) { byKey.set(key, { key, rows: [] }); order.push(key); }
     byKey.get(key).rows.push(fields);
   });
-  return order.map((key) => byKey.get(key));
+  const instances = order.map((key, index) => ({ ...byKey.get(key), sourceIndex: index }));
+  if (!sortExpressions?.length) return instances;
+  return instances.sort((left, right) => {
+    for (const sort of sortExpressions) {
+      const leftValue = expressionValue(sort.value, {
+        fields: left.rows[0] || {},
+        parameters,
+        globals,
+        dataset: left.rows,
+        outermostDataset: sourceRows,
+        datasets,
+      });
+      const rightValue = expressionValue(sort.value, {
+        fields: right.rows[0] || {},
+        parameters,
+        globals,
+        dataset: right.rows,
+        outermostDataset: sourceRows,
+        datasets,
+      });
+      const compared = typeof leftValue === 'string' || typeof rightValue === 'string'
+        ? String(leftValue ?? '').localeCompare(String(rightValue ?? ''))
+        : Number(leftValue ?? 0) - Number(rightValue ?? 0);
+      if (compared !== 0) return /^desc/i.test(sort.direction) ? -compared : compared;
+    }
+    return left.sourceIndex - right.sourceIndex;
+  });
 }
 
 // Column axis of a matrix: ordered leaf column instances (each = the rows for one distinct column-group
@@ -625,7 +651,15 @@ function matrixColumnData(tablix, sourceRows, parameters, globals, datasets) {
     for (const member of members || []) {
       const group = member.group;
       if (group?.expressions?.length) {
-        for (const instance of partitionByGroup(group, incomingRows, parameters, globals, sourceRows, datasets)) {
+        for (const instance of partitionByGroup(
+          group,
+          incomingRows,
+          parameters,
+          globals,
+          sourceRows,
+          datasets,
+          member.sortExpressions,
+        )) {
           const childScopes = group.name ? { ...scopes, [group.name]: instance.rows } : scopes;
           const childLeafCount = member.children?.length
             ? walk(member.children, instance.rows, childScopes, depth + 1)
@@ -745,7 +779,15 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       if (group?.parent) { walkRecursive(member, path, incomingRows, scopes, indentLevel); continue; }
       if (group?.expressions?.length) {
         const breaks = /^(Start|End|Between|StartAndEnd)$/i.test(String(group.pageBreak || 'None'));
-        for (const instance of partitionByGroup(group, incomingRows, parameters, globals, sourceRows, datasets)) {
+        for (const instance of partitionByGroup(
+          group,
+          incomingRows,
+          parameters,
+          globals,
+          sourceRows,
+          datasets,
+          member.sortExpressions,
+        )) {
           if (member.hideIfNoRows && instance.rows.length === 0) continue;
           if (breaks) {
             const previous = lastBreakKey.get(group);

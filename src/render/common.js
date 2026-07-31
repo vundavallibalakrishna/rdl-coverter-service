@@ -139,6 +139,10 @@ function itemDeclaresVisibleBorder(item) {
 export function shouldEnforceTablixBottom(rows, tablix) {
   const hasDynamicRows = (rows || []).some((row) => row.isStatic === false);
   if (!hasDynamicRows) return false;
+  // A trailing static row is an intentional matrix/footer band. Its own declared edges are authoritative:
+  // synthesizing a bottom closure across it turns borderless axis labels and legends into a decorative
+  // horizontal rule that SSRS does not draw. Dynamic detail and group-footer rows remain covered below.
+  if (rows?.at(-1)?.isStatic === true) return false;
   if (styleDeclaresVisibleBorder(tablix?.style)) return true;
   // Spans are structural grid intent even if individual sides are omitted. Their physical fragments must
   // still close where a merged owner reaches a page/table boundary.

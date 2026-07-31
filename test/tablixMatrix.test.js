@@ -111,6 +111,24 @@ test('a mixed static and dynamic column hierarchy repeats only the dynamic leaf 
   );
 });
 
+test('a dynamic column group honors its declared sort instead of incoming row order', () => {
+  const rdl = matrixRdl().replace(
+    '</Group>\n      <TablixHeader>',
+    '</Group><SortExpressions><SortExpression><Value>=Fields!Product.Value</Value></SortExpression></SortExpressions>\n      <TablixHeader>',
+  );
+  const tablix = tablixOf(rdl);
+  const source = [
+    { Region: 'East', Product: 'C', Amount: 30 },
+    { Region: 'East', Product: 'A', Amount: 10 },
+    { Region: 'East', Product: 'B', Amount: 20 },
+  ];
+
+  assert.deepEqual(
+    materializeTablixRows(tablix, source, {}, {}, {})[0].cells.map((cell) => (cell.values || []).join('')),
+    ['Region', 'A', 'B', 'C'],
+  );
+});
+
 test('matrix cells preserve their row-column intersection for expression-backed styles', () => {
   const rdl = matrixRdl().replace(
     '<Style/></Textbox></CellContents></TablixCell></TablixCells></TablixRow>',
