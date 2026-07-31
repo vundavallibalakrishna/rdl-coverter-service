@@ -1,6 +1,6 @@
 import { evaluateExpression } from '../rdl/expression.js';
 import { pdfFont } from './fonts.js';
-import { color as resolveColor, styleColor, styleSize, styleValue } from './common.js';
+import { color as resolveColor, isHidden, styleColor, styleSize, styleValue } from './common.js';
 
 const AXIS_COLOR = '#d9d9d9';
 const TICK_LABEL_COLOR = '#595959';
@@ -18,12 +18,74 @@ function niceScale(maxValue) {
   return { max: Math.ceil(maxValue / interval) * interval, interval };
 }
 
-function setFont(doc, config, { size = 8, bold = false } = {}) {
-  doc.font(pdfFont(config, 'Arial', bold, false)).fontSize(size);
+function setFont(doc, config, { size = 8, bold = false, italic = false, family = 'Arial' } = {}) {
+  doc.font(pdfFont(config, family, bold, italic)).fontSize(size);
 }
 
 function fillText(doc, text, x, y, options = {}) {
   doc.save().fillColor(options.color || LABEL_COLOR).text(String(text), x, y, { lineBreak: false, ...options }).restore();
+}
+
+function styleFont(doc, config, style, context, fallbackSize = 8) {
+  const weight = String(styleValue(style?.fontWeight, context, 'Normal'));
+  const fontStyle = String(styleValue(style?.fontStyle, context, 'Normal'));
+  const appearance = {
+    family: String(styleValue(style?.fontFamily, context, 'Arial')),
+    size: styleSize(style?.fontSize, context, fallbackSize) || fallbackSize,
+    bold: /bold|[6-9]00/i.test(weight),
+    italic: /italic/i.test(fontStyle),
+    color: styleColor(style?.color, context, LABEL_COLOR),
+  };
+  setFont(doc, config, appearance);
+  return appearance;
+}
+
+function chartPaint(value, context, fallback = null) {
+  const resolved = styleColor(value, context, fallback);
+  if (!resolved) return null;
+  const argb = /^#([0-9a-f]{8})$/i.exec(resolved);
+  if (!argb) return { color: resolved, opacity: 1 };
+  const opacity = Number.parseInt(argb[1].slice(0, 2), 16) / 255;
+  if (opacity <= 0) return null;
+  return { color: `#${argb[1].slice(2)}`, opacity };
+}
+
+function strokeChartEdge(doc, x1, y1, x2, y2, border, context) {
+  if (!border) return;
+  const style = String(styleValue(border.style, context, 'None'));
+  const paint = chartPaint(border.color, context, '#000000');
+  const width = styleSize(border.width, context, 1);
+  if (/^none$/i.test(style) || !paint || width <= 0) return;
+  doc.save().strokeColor(paint.color).strokeOpacity(paint.opacity).lineWidth(Math.max(0.25, width));
+  if (/dash/i.test(style)) doc.dash(Math.max(2, width * 3));
+  else if (/dot/i.test(style)) doc.dash(Math.max(1, width), { space: Math.max(1, width * 2) });
+  else doc.lineCap('square').lineJoin('miter');
+  if (/double/i.test(style)) {
+    const strand = Math.max(0.25, width / 3);
+    const vertical = x1 === x2;
+    const offsetX = vertical ? strand : 0;
+    const offsetY = vertical ? 0 : strand;
+    doc.lineWidth(strand);
+    doc.moveTo(x1 - offsetX, y1 - offsetY).lineTo(x2 - offsetX, y2 - offsetY).stroke();
+    doc.moveTo(x1 + offsetX, y1 + offsetY).lineTo(x2 + offsetX, y2 + offsetY).stroke();
+  } else {
+    doc.moveTo(x1, y1).lineTo(x2, y2).stroke();
+  }
+  doc.restore();
+}
+
+function drawStyledBox(doc, x, y, width, height, style, context, { fill = true, border = true } = {}) {
+  if (!(width > 0 && height > 0)) return;
+  if (fill) {
+    const paint = chartPaint(style?.backgroundColor, context, null);
+    if (paint) doc.save().fillColor(paint.color).fillOpacity(paint.opacity).rect(x, y, width, height).fill().restore();
+  }
+  if (!border) return;
+  const borders = style?.borders || {};
+  strokeChartEdge(doc, x, y, x + width, y, borders.top, context);
+  strokeChartEdge(doc, x + width, y, x + width, y + height, borders.right, context);
+  strokeChartEdge(doc, x, y + height, x + width, y + height, borders.bottom, context);
+  strokeChartEdge(doc, x, y, x, y + height, borders.left, context);
 }
 
 function axisFont(doc, config, axis, context, labels, slot, fallback = 8) {
@@ -31,55 +93,106 @@ function axisFont(doc, config, axis, context, labels, slot, fallback = 8) {
   const configured = styleSize(style.fontSize, context, fallback) || fallback;
   const disabled = String(styleValue(axis?.labelsAutoFitDisabled, context, 'false')).toLowerCase() === 'true';
   let size = configured;
-  setFont(doc, config, { size, bold: /bold|[6-9]00/i.test(String(styleValue(style.fontWeight, context, 'Normal'))) });
+  const appearance = styleFont(doc, config, style, context, configured);
   // SSRS auto-fit can shrink/offset/rotate labels. This renderer implements the deterministic shrink part;
   // when auto-fit is disabled the declared font size is retained exactly.
   if (!disabled && slot > 0 && labels?.length) {
     const widest = Math.max(0, ...labels.map((label) => doc.widthOfString(String(label ?? ''))));
     if (widest > slot) size = Math.max(6, configured * slot / widest);
   }
-  setFont(doc, config, { size, bold: /bold|[6-9]00/i.test(String(styleValue(style.fontWeight, context, 'Normal'))) });
-  return { color: styleColor(style.color, context, TICK_LABEL_COLOR), size };
+  setFont(doc, config, { ...appearance, size });
+  return { ...appearance, color: styleColor(style.color, context, TICK_LABEL_COLOR), size };
 }
 
-// Legend: colour swatch + label chips wrapped across the width and centred. Returns the height used.
-function drawLegend(doc, config, entries, x, y, width) {
-  if (!entries.length) return 0;
-  setFont(doc, config, { size: 8 });
-  const swatch = 10;
-  const gap = 4;
-  const spacing = 14;
-  const lineHeight = 16;
-  const chips = entries.map((entry) => ({ ...entry, chipWidth: swatch + gap + doc.widthOfString(String(entry.label)) + spacing }));
+function legendLayout(doc, config, legend, entries, maxWidth, maxHeight, context, orientation) {
+  const appearance = styleFont(doc, config, legend.style || {}, context, 8);
+  const padding = 4;
+  const swatch = Math.max(8, appearance.size);
+  const gap = Math.max(3, appearance.size * 0.5);
+  const spacing = Math.max(8, appearance.size * 1.5);
+  const lineHeight = Math.max(swatch, appearance.size * 1.25) + 4;
+  const chips = entries.map((entry) => ({
+    ...entry,
+    width: swatch + gap + doc.widthOfString(String(entry.label)) + spacing,
+  }));
+  if (orientation === 'vertical') {
+    const rowsPerColumn = Math.max(1, Math.floor(Math.max(lineHeight, maxHeight - padding * 2) / lineHeight));
+    const columns = [];
+    for (let index = 0; index < chips.length; index += rowsPerColumn) {
+      const values = chips.slice(index, index + rowsPerColumn);
+      columns.push({ chips: values, width: Math.max(0, ...values.map((chip) => chip.width)) });
+    }
+    return {
+      appearance, chips, columns, orientation, padding, swatch, gap, spacing, lineHeight,
+      width: Math.min(maxWidth, padding * 2 + columns.reduce((sum, column) => sum + column.width, 0)),
+      height: Math.min(maxHeight, padding * 2 + Math.min(rowsPerColumn, chips.length) * lineHeight),
+    };
+  }
   const rows = [[]];
+  const usableWidth = Math.max(1, maxWidth - padding * 2);
   let rowWidth = 0;
   for (const chip of chips) {
-    if (rowWidth + chip.chipWidth > width && rows[rows.length - 1].length) { rows.push([]); rowWidth = 0; }
+    if (rowWidth + chip.width > usableWidth && rows[rows.length - 1].length) { rows.push([]); rowWidth = 0; }
     rows[rows.length - 1].push(chip);
-    rowWidth += chip.chipWidth;
+    rowWidth += chip.width;
   }
-  rows.forEach((row, rowIndex) => {
-    const total = row.reduce((sum, chip) => sum + chip.chipWidth, 0) - spacing;
-    let cursor = x + Math.max(0, (width - total) / 2);
-    const rowY = y + rowIndex * lineHeight;
-    for (const chip of row) {
-      doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(cursor, rowY, swatch, swatch).fill().restore();
-      fillText(doc, chip.label, cursor + swatch + gap, rowY + 1, { color: TICK_LABEL_COLOR });
-      cursor += chip.chipWidth;
-    }
-  });
-  return rows.length * lineHeight;
+  return {
+    appearance, chips, rows, orientation, padding, swatch, gap, spacing, lineHeight,
+    width: Math.min(maxWidth, padding * 2 + Math.max(0, ...rows.map((row) => row.reduce((sum, chip) => sum + chip.width, 0) - spacing))),
+    height: Math.min(maxHeight, padding * 2 + rows.length * lineHeight),
+  };
 }
 
-function drawTitle(doc, config, chart, data, x, y, width, context) {
+function drawLegend(doc, config, layout, legend, x, y, context, alignment = 'center') {
+  if (!layout.chips.length) return;
+  drawStyledBox(doc, x, y, layout.width, layout.height, legend.style, context);
+  setFont(doc, config, layout.appearance);
+  const textColor = layout.appearance.color || TICK_LABEL_COLOR;
+  if (layout.orientation === 'vertical') {
+    let columnX = x + layout.padding;
+    for (const column of layout.columns) {
+      column.chips.forEach((chip, rowIndex) => {
+        const rowY = y + layout.padding + rowIndex * layout.lineHeight;
+        doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(columnX, rowY, layout.swatch, layout.swatch).fill().restore();
+        fillText(doc, chip.label, columnX + layout.swatch + layout.gap, rowY + 1, { color: textColor });
+      });
+      columnX += column.width;
+    }
+    return;
+  }
+  layout.rows.forEach((row, rowIndex) => {
+    const rowWidth = row.reduce((sum, chip) => sum + chip.width, 0) - layout.spacing;
+    const offset = alignment === 'left' ? 0 : alignment === 'right' ? layout.width - layout.padding * 2 - rowWidth : (layout.width - layout.padding * 2 - rowWidth) / 2;
+    let cursor = x + layout.padding + Math.max(0, offset);
+    const rowY = y + layout.padding + rowIndex * layout.lineHeight;
+    for (const chip of row) {
+      doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(cursor, rowY, layout.swatch, layout.swatch).fill().restore();
+      fillText(doc, chip.label, cursor + layout.swatch + layout.gap, rowY + 1, { color: textColor });
+      cursor += chip.width;
+    }
+  });
+}
+
+function titleHeight(chart, context) {
+  const style = chart.title?.style || {};
+  return Math.max(14, (styleSize(style.fontSize, context, 9) || 9) * 1.35
+    + styleSize(style.paddingTop, context, 2) + styleSize(style.paddingBottom, context, 2));
+}
+
+function drawTitle(doc, config, chart, x, y, width, height, context) {
   const caption = String(evaluateExpression(chart.title.caption, context) ?? '').trim();
   const style = chart.title.style || {};
-  const height = 18;
-  const background = styleColor(style.backgroundColor, context, null);
-  if (background) doc.save().fillColor(background).rect(x, y, width, height).fill().restore();
-  setFont(doc, config, { size: 9, bold: true });
-  fillText(doc, caption, x, y + 4, { width, align: 'center', color: styleColor(style.color, context, '#000000') });
-  return height;
+  drawStyledBox(doc, x, y, width, height, style, context);
+  const appearance = styleFont(doc, config, style, context, 9);
+  const align = String(styleValue(style.textAlign, context, 'Center')).toLowerCase();
+  const paddingLeft = styleSize(style.paddingLeft, context, 2);
+  const paddingRight = styleSize(style.paddingRight, context, 2);
+  const paddingTop = styleSize(style.paddingTop, context, 2);
+  fillText(doc, caption, x + paddingLeft, y + paddingTop, {
+    width: Math.max(1, width - paddingLeft - paddingRight),
+    align: ['left', 'right', 'center'].includes(align) ? align : 'center',
+    color: appearance.color,
+  });
 }
 
 function drawValueGrid(doc, config, scale, plot, orientation, axis, context) {
@@ -182,36 +295,52 @@ function drawColumnChart(doc, config, chart, data, plot, stacked, context) {
 }
 
 // Pie (innerRatio 0) and doughnut (innerRatio > 0) share this: each slice is an annulus segment.
+// The RDL exploded subtypes move every slice away from the common centre along its bisector. The ratio is
+// a renderer-level semantic used for every exploded shape chart; the radius is reduced first so no slice,
+// label, or callout can leave the declared plot rectangle.
 function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
   const points = (data.series[0]?.points || []).filter((point) => point.y && point.y > 0);
   const total = points.reduce((sum, point) => sum + point.y, 0);
   if (total <= 0) return;
-  const radius = Math.max(10, Math.min(plot.width, plot.height) / 2 - 8);
+  const explosionRatio = chart.exploded && points.length > 1 ? 0.1 : 0;
+  const outerLimit = Math.max(10, Math.min(plot.width, plot.height) / 2 - 8);
+  const radius = Math.max(10, outerLimit / (1 + explosionRatio));
+  const explosion = radius * explosionRatio;
   const inner = radius * innerRatio;
   const centerX = plot.x + plot.width / 2;
   const centerY = plot.y + plot.height / 2;
-  const at = (angle, r) => [centerX + Math.cos(angle) * r, centerY + Math.sin(angle) * r];
+  const at = (angle, r, offsetX = 0, offsetY = 0) => [
+    centerX + offsetX + Math.cos(angle) * r,
+    centerY + offsetY + Math.sin(angle) * r,
+  ];
   setFont(doc, config, { size: 8 });
-  let angle = -Math.PI / 2; // start at 12 o'clock
+  // SSRS pie and doughnut charts use PieStartAngle=0 by default, which places the first value at
+  // 3 o'clock (90 degrees clockwise from the top). A declared PieStartAngle rotates clockwise in
+  // degrees; 270 therefore places the first value at 12 o'clock.
+  const rawStartAngle = styleValue(chart.seriesDefs?.[0]?.customProperties?.PieStartAngle, context, 0);
+  const startAngleDegrees = Number(rawStartAngle);
+  let angle = (Number.isFinite(startAngleDegrees) ? startAngleDegrees : 0) * (Math.PI / 180);
   for (const point of points) {
     const sweep = (point.y / total) * Math.PI * 2;
+    const middle = angle + sweep / 2;
+    const offsetX = Math.cos(middle) * explosion;
+    const offsetY = Math.sin(middle) * explosion;
     const steps = Math.max(2, Math.ceil((sweep / (Math.PI * 2)) * 120));
     doc.save().fillColor(resolveColor(point.color, '#808080'));
-    doc.moveTo(...at(angle, radius));
-    for (let step = 1; step <= steps; step += 1) doc.lineTo(...at(angle + (sweep * step) / steps, radius));
-    for (let step = steps; step >= 0; step -= 1) doc.lineTo(...at(angle + (sweep * step) / steps, inner));
+    doc.moveTo(...at(angle, radius, offsetX, offsetY));
+    for (let step = 1; step <= steps; step += 1) doc.lineTo(...at(angle + (sweep * step) / steps, radius, offsetX, offsetY));
+    for (let step = steps; step >= 0; step -= 1) doc.lineTo(...at(angle + (sweep * step) / steps, inner, offsetX, offsetY));
     doc.fill().restore();
     if (point.label) {
-      const middle = angle + sweep / 2;
       if (/outside/i.test(point.labelPosition || '')) {
-        const [lineStartX, lineStartY] = at(middle, radius * 0.92);
-        const [lineEndX, lineEndY] = at(middle, radius + 9);
+        const [lineStartX, lineStartY] = at(middle, radius * 0.92, offsetX, offsetY);
+        const [lineEndX, lineEndY] = at(middle, radius + 9, offsetX, offsetY);
         const calloutColor = styleColor(chart.seriesDefs?.[0]?.customProperties?.PieLineColor, context, '#000000');
         doc.save().lineWidth(0.75).strokeColor(calloutColor).moveTo(lineStartX, lineStartY).lineTo(lineEndX, lineEndY).stroke().restore();
         const right = Math.cos(middle) >= 0;
         fillText(doc, point.label, right ? lineEndX + 2 : lineEndX - 42, lineEndY - 4, { width: 40, align: right ? 'left' : 'right' });
       } else {
-        const [labelX, labelY] = at(middle, inner + (radius - inner) * 0.55);
+        const [labelX, labelY] = at(middle, inner + (radius - inner) * 0.55, offsetX, offsetY);
         fillText(doc, point.label, labelX - 12, labelY - 4, { width: 24, align: 'center' });
       }
     }
@@ -323,27 +452,90 @@ function drawScatterChart(doc, config, chart, data, plot, context) {
 // bar/column/pie/doughnut/line/area/scatter types the parser accepts (bar/column/area honour the
 // stacked & percent-stacked subtypes); everything else is fail-closed before we get here.
 export function drawChart(doc, config, chart, data, x, y, width, height, context) {
+  drawStyledBox(doc, x, y, width, height, chart.style, context, { fill: true, border: false });
   doc.save().rect(x, y, width, height).clip();
-  let top = y + 6;
-  let bottom = y + height - 6;
-  if (chart.title) top += drawTitle(doc, config, chart, data, x + 4, top, width - 8, context) + 6;
+  const content = {
+    left: x + 8,
+    top: y + 6,
+    right: x + width - 8,
+    bottom: y + height - 6,
+  };
+
+  const titleVisible = chart.title && !isHidden(chart.title.hidden, context);
+  if (titleVisible) {
+    const measuredHeight = titleHeight(chart, context);
+    const titlePosition = String(styleValue(chart.title.position, context, 'TopCenter')).toLowerCase();
+    if (titlePosition.startsWith('bottom')) {
+      drawTitle(doc, config, chart, content.left, content.bottom - measuredHeight, content.right - content.left, measuredHeight, context);
+      content.bottom -= measuredHeight + 6;
+    } else {
+      drawTitle(doc, config, chart, content.left, content.top, content.right - content.left, measuredHeight, context);
+      content.top += measuredHeight + 6;
+    }
+  }
+
+  const legendVisible = chart.legend?.visible && !isHidden(chart.legend.hidden, context) && data.legend.length;
+  if (legendVisible) {
+    const position = String(styleValue(chart.legend.position, context, 'RightTop')).replace(/\s+/g, '').toLowerCase();
+    const layoutSetting = String(styleValue(chart.legend.layout, context, 'AutoTable')).toLowerCase();
+    const side = position.startsWith('left') ? 'left'
+      : position.startsWith('right') ? 'right'
+        : position.startsWith('top') ? 'top' : 'bottom';
+    const orientation = /^row$/i.test(layoutSetting) ? 'horizontal'
+      : /^column$/i.test(layoutSetting) ? 'vertical'
+        : (side === 'left' || side === 'right' ? 'vertical' : 'horizontal');
+    const contentWidth = Math.max(1, content.right - content.left);
+    const contentHeight = Math.max(1, content.bottom - content.top);
+    const maxLegendWidth = side === 'left' || side === 'right' ? Math.min(180, contentWidth * 0.42) : contentWidth;
+    const maxLegendHeight = side === 'top' || side === 'bottom' ? Math.min(90, contentHeight * 0.35) : contentHeight;
+    const layout = legendLayout(doc, config, chart.legend, data.legend, maxLegendWidth, maxLegendHeight, context, orientation);
+    let legendX = content.left;
+    let legendY = content.top;
+    let horizontalAlignment = 'center';
+    if (side === 'left' || side === 'right') {
+      legendX = side === 'left' ? content.left : content.right - layout.width;
+      const verticalAlignment = position.endsWith('bottom') ? 'bottom' : position.endsWith('center') ? 'center' : 'top';
+      legendY = verticalAlignment === 'bottom' ? content.bottom - layout.height
+        : verticalAlignment === 'center' ? content.top + (contentHeight - layout.height) / 2
+          : content.top;
+      if (side === 'left') content.left += layout.width + 8;
+      else content.right -= layout.width + 8;
+    } else {
+      horizontalAlignment = position.endsWith('left') ? 'left' : position.endsWith('right') ? 'right' : 'center';
+      legendX = horizontalAlignment === 'left' ? content.left
+        : horizontalAlignment === 'right' ? content.right - layout.width
+          : content.left + (contentWidth - layout.width) / 2;
+      legendY = side === 'top' ? content.top : content.bottom - layout.height;
+      if (side === 'top') content.top += layout.height + 8;
+      else content.bottom -= layout.height + 8;
+    }
+    drawLegend(doc, config, layout, chart.legend, legendX, legendY, context, horizontalAlignment);
+  }
+
   if (!data.hasData) {
     setFont(doc, config, { size: 10, bold: true });
-    fillText(doc, chart.noDataMessage || 'No Data Available', x, y + height / 2 - 6, { width, align: 'center', color: TICK_LABEL_COLOR });
+    fillText(doc, chart.noDataMessage || 'No Data Available', content.left, content.top + (content.bottom - content.top) / 2 - 6, {
+      width: content.right - content.left,
+      align: 'center',
+      color: TICK_LABEL_COLOR,
+    });
     doc.restore();
+    drawStyledBox(doc, x, y, width, height, chart.style, context, { fill: false, border: true });
     return;
   }
-  if (chart.legend?.visible && data.legend.length) {
-    const band = measureLegendHeight(doc, config, data.legend, width - 16);
-    drawLegend(doc, config, data.legend, x + 8, bottom - band, width - 16);
-    bottom -= band + 8;
-  }
+
   // Plot area, leaving gutters for axis/category labels.
   const circular = chart.chartType === 'pie' || chart.chartType === 'doughnut';
-  const leftGutter = chart.chartType === 'bar' ? 165 : 40;
+  const leftGutter = chart.chartType === 'bar' ? Math.min(165, (content.right - content.left) * 0.4) : circular ? 0 : 40;
   const bottomGutter = circular ? 0 : 16;
-  const plot = { x: x + leftGutter, y: top + 6, width: width - leftGutter - 24, height: bottom - top - 6 - bottomGutter };
+  const plot = {
+    x: content.left + leftGutter,
+    y: content.top + 6,
+    width: content.right - content.left - leftGutter - (circular ? 0 : 24),
+    height: content.bottom - content.top - 6 - bottomGutter,
+  };
   if (plot.width > 10 && plot.height > 10) {
+    drawStyledBox(doc, plot.x, plot.y, plot.width, plot.height, chart.chartArea?.style, context, { fill: true, border: false });
     const stacked = chart.stacked || 'none';
     if (chart.chartType === 'bar') drawBarChart(doc, config, chart, data, plot, stacked, context);
     else if (chart.chartType === 'column') drawColumnChart(doc, config, chart, data, plot, stacked, context);
@@ -352,20 +544,8 @@ export function drawChart(doc, config, chart, data, x, y, width, height, context
     else if (chart.chartType === 'line') drawLineChart(doc, config, chart, data, plot, context);
     else if (chart.chartType === 'area') drawAreaChart(doc, config, chart, data, plot, stacked, context);
     else if (chart.chartType === 'scatter') drawScatterChart(doc, config, chart, data, plot, context);
+    drawStyledBox(doc, plot.x, plot.y, plot.width, plot.height, chart.chartArea?.style, context, { fill: false, border: true });
   }
   doc.restore();
-}
-
-// Pre-measures wrapped legend height so the plot area can reserve exactly the right band.
-function measureLegendHeight(doc, config, entries, width) {
-  if (!entries.length) return 0;
-  setFont(doc, config, { size: 8 });
-  const swatch = 10; const gap = 4; const spacing = 14; const lineHeight = 16;
-  let rows = 1; let rowWidth = 0;
-  for (const entry of entries) {
-    const chipWidth = swatch + gap + doc.widthOfString(String(entry.label)) + spacing;
-    if (rowWidth + chipWidth > width && rowWidth > 0) { rows += 1; rowWidth = 0; }
-    rowWidth += chipWidth;
-  }
-  return rows * lineHeight;
+  drawStyledBox(doc, x, y, width, height, chart.style, context, { fill: false, border: true });
 }

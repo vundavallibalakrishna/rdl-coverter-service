@@ -2,8 +2,16 @@ import { evaluateExpression } from '../rdl/expression.js';
 import { filterMatches } from '../rdl/validation.js';
 import { color as resolveNamedColor } from './common.js';
 
-// Deterministic fallback palette for chart points whose colour expression evaluates to Nothing.
+// Legacy deterministic fallback retained for reports that explicitly request the RDL "Default" palette.
 const FALLBACK_PALETTE = ['#4472c4', '#ed7d31', '#a5a5a5', '#ffc000', '#5b9bd5', '#70ad47', '#264478', '#9e480e'];
+
+// Reporting Services' modern default palette. Shape charts consume one colour per data point; other
+// charts consume one colour per series. Keeping this named palette separate from the fallback makes
+// Palette=Pacific deterministic and lets an explicit point/series colour continue to take precedence.
+const PACIFIC_PALETTE = [
+  '#01b8aa', '#374649', '#fd625e', '#f2c80f', '#5f6b6d',
+  '#8ad4eb', '#fe9666', '#a66999', '#3599b8', '#dfbfbf',
+];
 
 function evalIn(expression, row, base) {
   return evaluateExpression(expression, { ...base, fields: row || {} });
@@ -44,10 +52,25 @@ function groupsFor(member, rows, base) {
   return groups;
 }
 
-function pointColor(expression, row, base, index) {
+function chartPalette(chart, base) {
+  const requested = String(evaluateExpression(chart.palette || 'Default', base) ?? 'Default').trim();
+  if (/^custom$/i.test(requested)) {
+    const colors = (chart.customPaletteColors || [])
+      .map((entry) => evaluateExpression(entry, base))
+      .filter((entry) => entry !== null && entry !== undefined && entry !== '')
+      .map((entry) => resolveNamedColor(String(entry), '#ffffff'));
+    // MS-RDL specifies white when Palette=Custom has no custom colour collection.
+    return colors.length ? colors : ['#ffffff'];
+  }
+  if (/^pacific(?:light|semitransparent)?$/i.test(requested)) return PACIFIC_PALETTE;
+  return FALLBACK_PALETTE;
+}
+
+function pointColor(expression, row, base, index, palette) {
   const evaluated = expression ? evalIn(expression, row, base) : null;
-  if (evaluated === null || evaluated === undefined || evaluated === '') return FALLBACK_PALETTE[index % FALLBACK_PALETTE.length];
-  return resolveNamedColor(String(evaluated), FALLBACK_PALETTE[index % FALLBACK_PALETTE.length]);
+  const fallback = palette[index % palette.length];
+  if (evaluated === null || evaluated === undefined || evaluated === '') return fallback;
+  return resolveNamedColor(String(evaluated), fallback);
 }
 
 function pointLabel(dataLabel, y, row, base) {
@@ -67,6 +90,7 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
   const rows = datasetsByName[chart.datasetName] || [];
   const base = { parameters, globals, datasets: datasetsByName, dataset: rows, fields: {} };
   const seriesDef = chart.seriesDefs[0] || {};
+  const palette = chartPalette(chart, base);
 
   const categories = groupsFor(chart.category, rows, base);
   const grouped = Boolean(chart.series?.group);
@@ -80,7 +104,7 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
     // For a grouped chart the colour is a property of the SERIES (e.g. Incident Type), so evaluate it
     // once from a row of this series. Evaluating per-cell would mis-colour empty cells, whose fallback
     // row belongs to a different series.
-    const seriesColor = grouped ? pointColor(seriesDef.color, group.rows[0] || rows[0] || {}, base, seriesIndex) : null;
+    const seriesColor = grouped ? pointColor(seriesDef.color, group.rows[0] || rows[0] || {}, base, seriesIndex, palette) : null;
     const points = categories.map((category, categoryIndex) => {
       const cellRows = category.rows.filter((row) => groupSet.has(row));
       const first = cellRows[0] || category.rows[0] || rows[0] || {};
@@ -88,7 +112,7 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
       const raw = evaluateExpression(seriesDef.y, context);
       const numeric = raw === null || raw === undefined || raw === '' ? null : Number(raw);
       const y = Number.isFinite(numeric) ? numeric : null;
-      const color = grouped ? seriesColor : pointColor(seriesDef.color, first, base, categoryIndex);
+      const color = grouped ? seriesColor : pointColor(seriesDef.color, first, base, categoryIndex, palette);
       return {
         y,
         color,
@@ -100,8 +124,8 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
   });
 
   const legend = grouped
-    ? series.map((entry) => ({ label: entry.label, color: entry.color || FALLBACK_PALETTE[0] }))
-    : categories.map((category, index) => ({ label: category.label, color: series[0]?.points[index]?.color || FALLBACK_PALETTE[index % FALLBACK_PALETTE.length] }));
+    ? series.map((entry) => ({ label: entry.label, color: entry.color || palette[0] }))
+    : categories.map((category, index) => ({ label: category.label, color: series[0]?.points[index]?.color || palette[index % palette.length] }));
 
   const maxY = Math.max(0, ...series.flatMap((entry) => entry.points.map((point) => point.y || 0)));
   return {

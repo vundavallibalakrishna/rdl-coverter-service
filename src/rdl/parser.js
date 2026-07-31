@@ -287,6 +287,10 @@ function chartStackMode(rawType, rawSubtype) {
   return 'none';
 }
 
+function chartExploded(rawType, rawSubtype) {
+  return String(rawType).toLowerCase() === 'shape' && /exploded/.test(String(rawSubtype || '').toLowerCase());
+}
+
 function parseChart(value, defaultFontFamily) {
   const item = baseItem('Chart', value, defaultFontFamily);
   const seriesCollection = asArray(value.ChartData?.ChartSeriesCollection?.ChartSeries);
@@ -296,12 +300,19 @@ function parseChart(value, defaultFontFamily) {
   const rawSubtype = textValue(seriesCollection[0]?.Subtype, '');
   const chartType = chartTypeFor(rawType, rawSubtype);
   const stacked = chartStackMode(rawType, rawSubtype);
+  const exploded = chartExploded(rawType, rawSubtype);
   const seriesMember = parseChartMember(asArray(value.ChartSeriesHierarchy?.ChartMembers?.ChartMember)[0]);
   const area = asArray(value.ChartAreas?.ChartArea)[0] || {};
   const valueAxis = asArray(area.ChartValueAxes?.ChartAxis)[0] || {};
   const categoryAxis = asArray(area.ChartCategoryAxes?.ChartAxis)[0] || {};
   const legend = asArray(value.ChartLegends?.ChartLegend)[0];
   const title = asArray(value.ChartTitles?.ChartTitle)[0];
+  const legendStyle = styleOf(legend?.Style, defaultFontFamily);
+  if (legend?.Style?.FontSize === undefined) legendStyle.fontSize = 8;
+  const titleStyle = styleOf(title?.Style, defaultFontFamily);
+  if (title?.Style?.FontSize === undefined) titleStyle.fontSize = 9;
+  if (title?.Style?.FontWeight === undefined) titleStyle.fontWeight = 'Bold';
+  if (title?.Style?.TextAlign === undefined) titleStyle.textAlign = 'Center';
   const parseAxis = (axis) => ({
     interval: textValue(axis.Interval, null),
     labelsAutoFitDisabled: textValue(axis.LabelsAutoFitDisabled, 'false'),
@@ -312,7 +323,7 @@ function parseChart(value, defaultFontFamily) {
     .filter(([name]) => name));
   const propertyAllowed = (name) => {
     if (/^PointWidth$/i.test(name)) return chartType === 'bar' || chartType === 'column';
-    if (/^PieLineColor$/i.test(name)) return chartType === 'pie' || chartType === 'doughnut';
+    if (/^(?:PieLineColor|PieStartAngle)$/i.test(name)) return chartType === 'pie' || chartType === 'doughnut';
     return false;
   };
   return {
@@ -320,6 +331,9 @@ function parseChart(value, defaultFontFamily) {
     datasetName: textValue(value.DataSetName),
     chartType,
     stacked,
+    exploded,
+    palette: textValue(value.Palette, 'Default'),
+    customPaletteColors: asArray(value.ChartCustomPaletteColors?.ChartCustomPaletteColor).map((entry) => textValue(entry)),
     unsupportedType: chartType ? null : rawType,
     category: parseChartMember(asArray(value.ChartCategoryHierarchy?.ChartMembers?.ChartMember)[0]),
     series: seriesMember?.group ? seriesMember : null,
@@ -346,8 +360,21 @@ function parseChart(value, defaultFontFamily) {
     // Draw the built-in legend only when the RDL declares one. Charts without <ChartLegends> (Chart1/
     // Chart2 here) rely on a manual legend built from separate report items, so a synthetic legend
     // would duplicate it.
-    legend: { visible: Boolean(legend), position: textValue(legend?.Position, 'BottomCenter') },
-    title: title ? { caption: textValue(title.Caption, null), style: styleOf(title.Style, defaultFontFamily) } : null,
+    chartArea: { style: styleOf(area.Style, defaultFontFamily) },
+    legend: {
+      visible: Boolean(legend),
+      hidden: textValue(legend?.Hidden, 'false'),
+      position: textValue(legend?.Position, 'RightTop'),
+      layout: textValue(legend?.Layout, 'AutoTable'),
+      dockOutsideChartArea: textValue(legend?.DockOutsideChartArea, 'false'),
+      style: legendStyle,
+    },
+    title: title ? {
+      caption: textValue(title.Caption, null),
+      hidden: textValue(title.Hidden, 'false'),
+      position: textValue(title.Position, 'TopCenter'),
+      style: titleStyle,
+    } : null,
     noDataMessage: textValue(value.ChartNoDataMessage?.Caption, 'No Data Available'),
   };
 }
