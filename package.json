@@ -23,7 +23,7 @@
     ".env.example"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22 <23"
   },
   "scripts": {
     "start": "node src/server.js",

@@ -36,7 +36,7 @@ Use it two ways, both supported and both backed by the identical pipeline:
 
 | Requirement | Why |
 | --- | --- |
-| **Node.js ≥ 22** | ESM, native test runner |
+| **Node.js 22.x** | Certified runtime; ESM and native test runner |
 | **Poppler** (`pdftoppm`) | `DOCX_VISUAL`, and chart images in `DOCX_EDITABLE`/XLSX `REPORT`/`DATA` modes — rasterizes PDF/chart pages. `brew install poppler` / `apt install poppler-utils` |
 | **Licensed fonts** | Production only. See [Fonts](#fonts) |
 
@@ -266,7 +266,7 @@ await converter.render({ rdl, output: 'PDF', datasets, signal: AbortSignal.timeo
 
 | | HTTP service | Library |
 | --- | --- | --- |
-| Language | Any | Node.js ≥ 22 only |
+| Language | Any | Node.js 22.x only |
 | Isolation | Separate process **and** host; independently restartable | Worker per render; shares your host |
 | Resource limits | Contained by the service's own memory/CPU budget | Renders compete with your app |
 | Operations | Another deployment to run | Nothing extra |
@@ -413,6 +413,7 @@ At the default `LOG_LEVEL=info`, every render emits bounded JSON phase events to
 - temporary-storage preparation and input-write time;
 - worker-memory estimation, selected heap limit, worker startup, and cleanup;
 - input reads, JSON decoding, RDL parsing, bundled-subreport resolution, font checks, and validation;
+- requested renderer-module loading (unused PDF, DOCX, and XLSX dependency graphs are not loaded);
 - renderer start/completion, artifact write/read, page/sheet/row counts, and output size;
 - for direct PDF output: canonical body layout (including aggregate tablix materialization, setup, initial
   measurement, and drawing time), page header/footer bands, PDFKit serialization, and final PDF validation;
