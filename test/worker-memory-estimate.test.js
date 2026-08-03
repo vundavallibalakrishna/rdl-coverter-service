@@ -8,6 +8,12 @@ const config = loadConfig({
   RDL_WORKER_MEMORY_MAX_MB: '2048',
 });
 
+test('the default hard ceiling accommodates large page-locked OOXML packaging without raising the baseline', () => {
+  const defaults = loadConfig({});
+  assert.equal(defaults.workerMemoryMb, 512);
+  assert.equal(defaults.workerMemoryMaxMb, 4096);
+});
+
 function rdl({ width = '11.69in', columns = 2 } = {}) {
   return Buffer.from(`<Report><PageWidth>${width}</PageWidth><TablixColumns>${
     '<TablixColumn><Width>1in</Width></TablixColumn>'.repeat(columns)
@@ -103,4 +109,21 @@ test('page-locked DOCX estimates repeated native cell topology independently of 
   assert.equal(estimate.metrics.datasetValueCount, 20_000);
   assert.equal(estimate.memoryMb, 1792);
   assert.equal(estimate.capped, false);
+});
+
+test('the default ceiling gives a large page-locked native-cell workload more than the former 2 GB cap', () => {
+  const defaults = loadConfig({});
+  const emptyRecord = Object.fromEntries(
+    Array.from({ length: 20 }, (_, index) => [`Field${index + 1}`, '']),
+  );
+  const estimate = estimateWorkerMemory(rdl({ columns: 12 }), {
+    output: 'DOCX_EDITABLE',
+    datasets: {
+      LongReport: Array.from({ length: 3_500 }, () => ({ ...emptyRecord })),
+    },
+  }, defaults);
+
+  assert.equal(estimate.metrics.datasetValueCount, 70_000);
+  assert.equal(estimate.memoryMb, 4096);
+  assert.equal(estimate.memoryMb > 2048, true);
 });

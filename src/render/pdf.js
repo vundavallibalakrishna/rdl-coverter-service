@@ -634,10 +634,13 @@ function splitTextForHeight(doc, config, textbox, context, text, width, height) 
 }
 
 function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage, globals, statistics }) {
+  const tablixStartedAt = performance.now();
   const { rows, columns } = tablixRows(item, request, globals, model);
+  const materializedAt = performance.now();
   statistics.tablixCount += 1;
   statistics.tablixRowCount += rows.length;
   statistics.tablixCellCount += rows.reduce((sum, row) => sum + row.cells.length, 0);
+  statistics.tablixMaterializationMs += materializedAt - tablixStartedAt;
   const enforceBottomClosure = shouldEnforceTablixBottom(rows, item);
   const datasets = normalizeDatasets(model, request);
   // A matrix expands to a data-dependent column grid wider than the design width; use its natural
@@ -1099,7 +1102,10 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (cacheable) pageCache.set(textKey, measured);
     return measured;
   };
+  const measurementStartedAt = performance.now();
+  statistics.tablixSetupMs += measurementStartedAt - materializedAt;
   const measuredHeights = rows.map((row) => measureRow(row));
+  statistics.tablixInitialMeasurementMs += performance.now() - measurementStartedAt;
   const headerMeasurementsByPage = new Map();
   const headerMeasurements = () => {
     const pageNumber = globals.PageNumber;
@@ -1452,10 +1458,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
   };
 
+  const drawingStartedAt = performance.now();
   for (const row of rows) drawRow(row);
   for (const span of openSpans) drawSpanSegment(span, y); // flush any spans still open at the tablix end
   openSpans = [];
   closeOuterBorderFragment(y);
+  statistics.tablixDrawingMs += performance.now() - drawingStartedAt;
   return { height: Math.max(item.height, addedHeight), endY: y };
 }
 
@@ -1511,6 +1519,10 @@ export async function renderPdf(model, request, config, options = {}) {
     tablixCount: 0,
     tablixRowCount: 0,
     tablixCellCount: 0,
+    tablixMaterializationMs: 0,
+    tablixSetupMs: 0,
+    tablixInitialMeasurementMs: 0,
+    tablixDrawingMs: 0,
     rowMeasurementRequests: 0,
     rowMeasurementsComputed: 0,
     rowMeasurementCacheHits: 0,

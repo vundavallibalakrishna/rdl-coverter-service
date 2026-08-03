@@ -391,7 +391,7 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_MAX_CONCURRENCY` | `2` | Concurrent renders. Beyond this → `BUSY`. |
 | `RDL_RENDER_TIMEOUT_MS` | `120000` | Hard render deadline. |
 | `RDL_WORKER_MEMORY_MB` | `512` | Baseline V8 heap cap for an ordinary worker. |
-| `RDL_WORKER_MEMORY_MAX_MB` | `2048` | Hard cap for deterministic PDF workload-based heap scaling. Never lower than the baseline. |
+| `RDL_WORKER_MEMORY_MAX_MB` | `4096` | Hard cap for deterministic PDF/page-locked DOCX workload-based heap scaling. Never lower than the baseline. |
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
 | `RDL_PDFTOPPM_PATH` | `pdftoppm` | Poppler binary for `DOCX_VISUAL`. |
@@ -407,15 +407,21 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 At the default `LOG_LEVEL=info`, every render emits bounded JSON phase events to stdout with
 `event: "render.phase"` and the Fastify request ID. The HTTP layer, runner, and isolated worker report:
 
+- one startup `runtime.profile` event with the OS/Node architecture, available parallelism, physical memory,
+  concurrency, worker-heap bounds, and timeout used by that process;
 - request decoding and structural input sizes;
 - temporary-storage preparation and input-write time;
 - worker-memory estimation, selected heap limit, worker startup, and cleanup;
 - input reads, JSON decoding, RDL parsing, bundled-subreport resolution, font checks, and validation;
 - renderer start/completion, artifact write/read, page/sheet/row counts, and output size;
-- for direct PDF output: canonical body layout, page header/footer bands, PDFKit serialization, and final
-  PDF validation;
+- for direct PDF output: canonical body layout (including aggregate tablix materialization, setup, initial
+  measurement, and drawing time), page header/footer bands, PDFKit serialization, and final PDF validation;
+- for page-locked editable DOCX: its canonical PDF phases, trace validation, font loading, bounded page
+  construction progress, OOXML packing, font-variant packaging, and internal-artifact cleanup;
 - elapsed and phase duration, process RSS/heap/external memory, CPU time, and event-loop utilization;
 - timeout, abort, worker-exit, validation, rendering, and cleanup failure phases using stable error codes.
+  Fatal worker exits are classified as `V8_HEAP_OUT_OF_MEMORY`, `NATIVE_RUNTIME_ABORT`, `PROCESS_ABORT`, or
+  `WORKER_EXIT`; raw worker stderr is bounded in memory and never written to logs or returned to callers.
 
 The terminal `RDL rendering completed` event remains the request summary. Fastify's subsequent
 `request completed` event includes response transmission time, so comparing the two separates server-side
@@ -504,7 +510,16 @@ heap, completes the whole artifact before response headers are sent, and has its
 success, failure, timeout, disconnect, **and** shutdown.
 
 Defaults: 10 MB per RDL, 25 MB per request, 100,000 rows, 120 s, two concurrent workers, a 512 MB
-baseline heap, and a 2048 MB hard per-worker cap for exceptionally wide or text-heavy PDF workloads.
+baseline heap, and a 4096 MB hard per-worker cap for exceptionally wide or text-heavy PDF/page-locked
+DOCX workloads. The cap is a V8 limit, not a reservation; ordinary renders remain at the baseline.
+For a large page-locked DOCX workload on a sufficiently provisioned Windows host, operators may raise
+`RDL_WORKER_MEMORY_MB` and `RDL_WORKER_MEMORY_MAX_MB`; restart the service after changing either value and
+use the `memory-estimated` plus fatal-category telemetry to verify the result. On hosts that cannot safely
+accommodate two multi-gigabyte workers, reduce `RDL_MAX_CONCURRENCY` rather than lowering a worker below the
+memory required to construct its complete native OOXML package.
+For a low-core Windows VM serving large PDF/DOCX requests, start with `RDL_MAX_CONCURRENCY=1`. Compare one
+isolated render before increasing it: two simultaneous CPU-bound layouts can increase latency while a large
+DOCX also raises the host working set by several gigabytes.
 
 ## Docker
 

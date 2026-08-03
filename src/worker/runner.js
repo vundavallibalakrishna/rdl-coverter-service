@@ -18,12 +18,37 @@ const REFERENCE_BINARY_WORKING_SET_BYTES = 32 * 1024 * 1024;
 const FALLBACK_FONT_VARIANT_BYTES = 2 * 1024 * 1024;
 const CHART_RASTER_WORKING_BYTES = 8 * 1024 * 1024;
 const IMAGE_RASTER_WORKING_BYTES = 4 * 1024 * 1024;
+const MAX_WORKER_STDERR_BYTES = 32 * 1024;
 const FONT_VARIANTS = [
   [false, false],
   [true, false],
   [false, true],
   [true, true],
 ];
+
+// A render worker can die below JavaScript's catch boundary (V8 heap exhaustion, a native assertion, or
+// process.abort()). Its stderr may contain file paths and native stack text, so never forward or log it.
+// Reduce the bounded tail to a stable category that is safe for telemetry and operational diagnostics.
+export function classifyWorkerFatalStderr(stderr, exitCode = null, exitSignal = null) {
+  const source = String(stderr || '');
+  if (/heap out of memory|reached heap limit|allocation failed[^\r\n]*javascript heap/i.test(source)) {
+    return 'V8_HEAP_OUT_OF_MEMORY';
+  }
+  if (/fatal process out of memory|process out of memory/i.test(source)) return 'V8_HEAP_OUT_OF_MEMORY';
+  if (/check failed|assertion failed|fatal error/i.test(source)) return 'NATIVE_RUNTIME_ABORT';
+  if (Number(exitCode) === 134 || /ABRT/i.test(String(exitSignal || ''))) return 'PROCESS_ABORT';
+  return 'WORKER_EXIT';
+}
+
+function appendWorkerStderr(state, chunk) {
+  const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  state.bytes += bytes.length;
+  state.tail = Buffer.concat([state.tail, bytes]);
+  if (state.tail.length > MAX_WORKER_STDERR_BYTES) {
+    state.tail = state.tail.subarray(state.tail.length - MAX_WORKER_STDERR_BYTES);
+    state.truncated = true;
+  }
+}
 
 function datasetTextBytes(request) {
   let bytes = 0;
@@ -249,10 +274,15 @@ export class RenderRunner {
         ...memoryEstimate.metrics,
       });
       child = fork(workerPath, [], {
-        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        // stdout remains discarded because render code must never log report content. stderr is retained
+        // only as a bounded private tail and reduced to a fixed fatal category; raw bytes never leave this
+        // function or enter application logs.
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
         env: process.env,
         execArgv: [`--max-old-space-size=${memoryEstimate.memoryMb}`],
       });
+      const workerStderr = { tail: Buffer.alloc(0), bytes: 0, truncated: false };
+      child.stderr?.on('data', (chunk) => appendWorkerStderr(workerStderr, chunk));
       this.active.add(child);
       telemetry.mark('worker-created', 'completed', { workerPid: child.pid, workerMemoryMb: memoryEstimate.memoryMb });
       const metadata = await new Promise((resolve, reject) => {
@@ -280,10 +310,34 @@ export class RenderRunner {
           telemetry.mark('worker-start-error', 'failed');
           finish(reject, new ServiceError('RENDER_FAILED', 'Render worker could not be started', 500));
         });
-        child.once('exit', (code, exitSignal) => {
+        // `close` follows stderr closure, unlike `exit`, so the fatal classifier sees V8's complete final
+        // message on Windows as well as Unix-like hosts.
+        child.once('close', (code, exitSignal) => {
           if (!settled && code !== 0) {
-            telemetry.mark('worker-exited', 'failed', { exitCode: code, exitSignal: exitSignal || undefined });
-            finish(reject, new ServiceError('RENDER_FAILED', `Render worker stopped unexpectedly (${exitSignal || code})`, 500));
+            const fatalCategory = classifyWorkerFatalStderr(workerStderr.tail.toString('utf8'), code, exitSignal);
+            telemetry.mark('worker-exited', 'failed', {
+              exitCode: code,
+              exitSignal: exitSignal || undefined,
+              fatalCategory,
+              stderrBytes: workerStderr.bytes,
+              stderrTruncated: workerStderr.truncated,
+              workerMemoryMb: memoryEstimate.memoryMb,
+              uncappedWorkerMemoryMb: memoryEstimate.uncappedMb,
+              memoryEstimateCapped: memoryEstimate.capped,
+            });
+            const failure = new ServiceError('RENDER_FAILED', `Render worker stopped unexpectedly (${exitSignal || code})`, 500);
+            failure.diagnostic = {
+              name: 'RenderWorkerExit',
+              message: fatalCategory,
+              exitCode: code,
+              exitSignal: exitSignal || undefined,
+              workerMemoryMb: memoryEstimate.memoryMb,
+              uncappedWorkerMemoryMb: memoryEstimate.uncappedMb,
+              memoryEstimateCapped: memoryEstimate.capped,
+              stderrBytes: workerStderr.bytes,
+              stderrTruncated: workerStderr.truncated,
+            };
+            finish(reject, failure);
           }
         });
         child.on('message', (message) => {

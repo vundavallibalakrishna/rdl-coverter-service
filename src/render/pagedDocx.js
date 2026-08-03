@@ -1379,11 +1379,24 @@ async function cleanupInternalArtifacts(files) {
   await Promise.all(Object.values(files).map((file) => fs.unlink(file).catch(() => {})));
 }
 
-export async function renderPagedEditableDocx(model, request, config, tempDir) {
+export async function renderPagedEditableDocx(model, request, config, tempDir, telemetry) {
   config ||= loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
+  const reportTelemetry = (phase, metrics = {}) => {
+    try { telemetry?.(phase, metrics); } catch { /* Telemetry cannot affect canonical PDF or DOCX output. */ }
+  };
   validateWindowsWordRequest(request);
-  const canonical = await renderPdf(model, request, config, { captureLayoutTrace: true });
+  reportTelemetry('docx.compatibility-validated');
+  const canonical = await renderPdf(model, request, config, {
+    captureLayoutTrace: true,
+    telemetry: (phase, metrics) => reportTelemetry(`docx.canonical-${phase}`, metrics),
+  });
   const trace = canonical.layoutTrace;
+  const tracedItemCount = trace.pages.reduce((sum, page) => sum + (page.items?.length || 0), 0);
+  reportTelemetry('docx.canonical-pdf-completed', {
+    pageCount: canonical.pageCount,
+    canonicalPdfBytes: canonical.buffer.length,
+    tracedItemCount,
+  });
   try {
     validateLayoutTrace(trace, canonical.pageCount);
   } catch (error) {
@@ -1391,6 +1404,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
       cause: error.message,
     });
   }
+  reportTelemetry('docx.layout-trace-validated', { pageCount: canonical.pageCount, tracedItemCount });
   let ownedTempDir = null;
   let workingTempDir = tempDir;
   const requiresChartWorkspace = trace.pages.some((page) => (
@@ -1403,10 +1417,20 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
     await fs.chmod(ownedTempDir, 0o700);
     workingTempDir = ownedTempDir;
   }
+  reportTelemetry('docx.workspace-prepared', { requiresChartWorkspace, ownsWorkspace: Boolean(ownedTempDir) });
   let internalFiles = null;
   try {
     internalFiles = await writeInternalArtifacts(workingTempDir, canonical.buffer, trace);
+    reportTelemetry('docx.internal-artifacts-written', { written: Boolean(internalFiles) });
     const embeddedFonts = await embeddedFontFamilies(trace, config);
+    const embeddedFontBytes = embeddedFonts.reduce((familySum, embedded) => (
+      familySum + Object.values(embedded.files).reduce((variantSum, variant) => variantSum + variant.data.length, 0)
+    ), 0);
+    reportTelemetry('docx.fonts-loaded', {
+      embeddedFontFamilyCount: embeddedFonts.length,
+      embeddedFontVariantCount: embeddedFonts.length * VARIANTS.length,
+      embeddedFontBytes,
+    });
     const resources = modelResources(model);
     const canonicalRequest = { ...request, __canonicalPageCount: canonical.pageCount };
     const chartCounter = { value: 0 };
@@ -1440,7 +1464,18 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
           chartCounter,
         )],
       });
+      if ((index + 1) % 25 === 0 || index + 1 === trace.pages.length) {
+        reportTelemetry('docx.page-construction-progress', {
+          pagesConstructed: index + 1,
+          pageCount: trace.pages.length,
+          chartCount: chartCounter.value,
+        });
+      }
     }
+    reportTelemetry('docx.native-pages-constructed', {
+      pageCount: sections.length,
+      chartCount: chartCounter.value,
+    });
     const document = new Document({
       creator: 'RDL Converter Service',
       title: request.outputFileName || model.name,
@@ -1463,8 +1498,15 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
       },
       sections,
     });
+    reportTelemetry('docx.ooxml-pack-started', { pageCount: sections.length });
     let buffer = await Packer.toBuffer(document);
+    reportTelemetry('docx.ooxml-pack-completed', { packageBytes: buffer.length });
     buffer = await addFontVariants(buffer, embeddedFonts);
+    reportTelemetry('docx.font-variants-packaged', {
+      packageBytes: buffer.length,
+      embeddedFontFamilyCount: embeddedFonts.length,
+      embeddedFontVariantCount: embeddedFonts.length * VARIANTS.length,
+    });
     return {
       buffer,
       pageCount: canonical.pageCount,
@@ -1477,5 +1519,6 @@ export async function renderPagedEditableDocx(model, request, config, tempDir) {
   } finally {
     await cleanupInternalArtifacts(internalFiles);
     if (ownedTempDir) await fs.rm(ownedTempDir, { recursive: true, force: true });
+    reportTelemetry('docx.internal-artifacts-cleaned');
   }
 }

@@ -19,7 +19,7 @@ function booleanFlag(value, fallback = false) {
 export function loadConfig(env = process.env) {
   const strictFonts = env.RDL_STRICT_FONTS !== 'false';
   const workerMemoryMb = positiveInteger(env.RDL_WORKER_MEMORY_MB, 512);
-  const workerMemoryMaxMb = Math.max(workerMemoryMb, positiveInteger(env.RDL_WORKER_MEMORY_MAX_MB, 2048));
+  const workerMemoryMaxMb = Math.max(workerMemoryMb, positiveInteger(env.RDL_WORKER_MEMORY_MAX_MB, 4096));
   return Object.freeze({
     port: positiveInteger(env.PORT, 7070),
     host: env.HOST || '0.0.0.0',
