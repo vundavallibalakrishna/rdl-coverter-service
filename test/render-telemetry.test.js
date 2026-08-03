@@ -54,6 +54,20 @@ test('render telemetry reports bounded structural phases without report or datas
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'pdf.validated'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'renderer-completed'));
   assert.ok(events.some(({ source, phase }) => source === 'runner' && phase === 'cleanup-completed'));
+  const pdfBody = events.find(({ source, phase }) => source === 'worker' && phase === 'pdf.body-layout-completed');
+  assert.equal(pdfBody.metrics.optimizationsEnabled, true);
+  assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementRequests), true);
+  assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementsComputed), true);
+  assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementCacheHits), true);
+  const rendererCompleted = events.find(({ source, phase }) => source === 'worker' && phase === 'renderer-completed');
+  assert.equal(rendererCompleted.metrics.expressionPlanCache.enabled, true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.entries), true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.hits), true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.misses), true);
+  assert.equal(rendererCompleted.metrics.pdfFontSelectionCache.enabled, true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.pdfFontSelectionCache.entries), true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.pdfFontSelectionCache.hits), true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.pdfFontSelectionCache.misses), true);
   for (const event of events) {
     assert.equal(Number.isFinite(event.phaseDurationMs), true);
     assert.equal(Number.isFinite(event.totalDurationMs), true);

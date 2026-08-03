@@ -3,15 +3,23 @@ import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { ServiceError, toServiceError } from '../errors.js';
 import { parseRdl } from '../rdl/parser.js';
+import { configureExpressionPlanCache, expressionPlanCacheStatistics } from '../rdl/expression.js';
 import { resolveBundledSubreports } from '../rdl/subreports.js';
 import { validateRenderInput } from '../rdl/validation.js';
 import { renderDocument } from '../render/index.js';
-import { checkFonts, takeFontSubstitutions } from '../render/fonts.js';
+import {
+  checkFonts,
+  configurePdfFontSelectionCache,
+  pdfFontSelectionCacheStatistics,
+  takeFontSubstitutions,
+} from '../render/fonts.js';
 import { createTelemetryClock } from '../telemetry.js';
 
 process.on('message', async (message) => {
   if (message?.type !== 'render') return;
   const config = Object.freeze({ ...loadConfig(), ...(message.config || {}) });
+  configureExpressionPlanCache(config.expressionPlanCache !== false);
+  configurePdfFontSelectionCache(config.pdfFontSelectionCache !== false);
   const sendTelemetry = (event) => {
     if (process.connected) process.send?.({ type: 'telemetry', event });
   };
@@ -75,6 +83,8 @@ process.on('message', async (message) => {
       sheetCount: rendered.sheetCount,
       workbookRowCount: rendered.rowCount,
       editableTextRatio: rendered.editableTextRatio,
+      expressionPlanCache: expressionPlanCacheStatistics(),
+      pdfFontSelectionCache: pdfFontSelectionCacheStatistics(config),
     });
     const outputPath = path.join(message.tempDir, `artifact.${rendered.extension}`);
     await fs.writeFile(outputPath, rendered.buffer, { mode: 0o600 });

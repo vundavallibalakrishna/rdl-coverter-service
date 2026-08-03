@@ -9,7 +9,11 @@
 // simply stopped halfway across, with no error anywhere.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateExpression } from '../src/rdl/expression.js';
+import {
+  configureExpressionPlanCache,
+  evaluateExpression,
+  expressionPlanCacheStatistics,
+} from '../src/rdl/expression.js';
 
 const ev = (expr, fields = {}) => evaluateExpression(expr, { fields, parameters: {}, globals: {}, dataset: [], datasets: {} });
 
@@ -75,4 +79,30 @@ test('relational operators treat Nothing as 0 and fall back to string order for 
   assert.equal(ev('=5 > Fields!x.Value', { x: null }), true);
   assert.equal(ev('=Fields!a.Value < Fields!b.Value', { a: 'apple', b: 'banana' }), true); // string order
   assert.equal(ev('=Fields!a.Value > Fields!b.Value', { a: 'zebra', b: 'apple' }), true);
+});
+
+test('cached expression plans resolve every row context afresh instead of caching values', () => {
+  const expression = '=IIF(Fields!score.Value >= 80, Fields!label.Value & " pass", Fields!label.Value & " review")';
+  const before = expressionPlanCacheStatistics();
+  assert.equal(ev(expression, { score: 90, label: 'Alpha' }), 'Alpha pass');
+  assert.equal(ev(expression, { score: 40, label: 'Beta' }), 'Beta review');
+  const after = expressionPlanCacheStatistics();
+  assert.ok(after.entries >= before.entries);
+  assert.ok(after.misses > before.misses);
+  assert.ok(after.hits > before.hits);
+});
+
+test('expression plan caching has a complete operational rollback path', () => {
+  configureExpressionPlanCache(false);
+  try {
+    assert.equal(ev('=Fields!value.Value + 1', { value: 1 }), 2);
+    assert.equal(ev('=Fields!value.Value + 1', { value: 5 }), 6);
+    const statistics = expressionPlanCacheStatistics();
+    assert.equal(statistics.enabled, false);
+    assert.equal(statistics.entries, 0);
+    assert.equal(statistics.hits, 0);
+    assert.ok(statistics.misses > 0);
+  } finally {
+    configureExpressionPlanCache(true);
+  }
 });

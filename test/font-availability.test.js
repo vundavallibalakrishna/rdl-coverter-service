@@ -8,7 +8,15 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { buildApp } from '../src/app.js';
-import { fontAvailability, pdfFont, resolveFontFile, renderableGlyphText, takeFontSubstitutions } from '../src/render/fonts.js';
+import {
+  configurePdfFontSelectionCache,
+  fontAvailability,
+  pdfFont,
+  pdfFontSelectionCacheStatistics,
+  resolveFontFile,
+  renderableGlyphText,
+  takeFontSubstitutions,
+} from '../src/render/fonts.js';
 import { loadConfig } from '../src/config.js';
 
 // A real, parseable font file from this host, whatever it happens to have. The glyph-coverage tests need
@@ -233,6 +241,55 @@ test('taking the substitution record clears it, so it stays scoped to one render
   pdfFont(config, 'Arial', false, false, `Score ${UNCOVERABLE}`);
   assert.equal(takeFontSubstitutions().length > 0, true);
   assert.deepEqual(takeFontSubstitutions(), []);
+});
+
+test('PDF font selections are cached per request config without changing substitution accounting', async (context) => {
+  const installed = anyInstalledFont();
+  if (!installed) return context.skip('no parseable font on this host');
+  const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-font-selection-cache-'));
+  await fs.copyFile(installed, path.join(fontDir, 'arial.ttf'));
+  const config = loadConfig({ ...process.env, RDL_FONT_DIR: fontDir, RDL_STRICT_FONTS: 'true' });
+  takeFontSubstitutions();
+  configurePdfFontSelectionCache(true);
+  try {
+    const text = `Repeated ${UNCOVERABLE} value`;
+    const first = pdfFont(config, 'Arial', false, false, text);
+    const afterFirst = pdfFontSelectionCacheStatistics(config);
+    const second = pdfFont(config, 'Arial', false, false, text);
+    const afterSecond = pdfFontSelectionCacheStatistics(config);
+    assert.equal(second, first);
+    assert.equal(afterFirst.entries, 1);
+    assert.equal(afterFirst.misses, 1);
+    assert.equal(afterSecond.hits, 1);
+    const [substitution] = takeFontSubstitutions();
+    assert.equal(substitution.runs, 2);
+  } finally {
+    configurePdfFontSelectionCache(true);
+    takeFontSubstitutions();
+    await fs.rm(fontDir, { recursive: true, force: true });
+  }
+});
+
+test('PDF font selection cache has a semantics-preserving rollback switch', async (context) => {
+  const installed = anyInstalledFont();
+  if (!installed) return context.skip('no parseable font on this host');
+  const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-font-selection-rollback-'));
+  await fs.copyFile(installed, path.join(fontDir, 'arial.ttf'));
+  const config = loadConfig({ ...process.env, RDL_FONT_DIR: fontDir, RDL_STRICT_FONTS: 'true' });
+  configurePdfFontSelectionCache(false);
+  try {
+    assert.equal(pdfFont(config, 'Arial', false, false, 'Repeated value'), pdfFont(config, 'Arial', false, false, 'Repeated value'));
+    assert.deepEqual(pdfFontSelectionCacheStatistics(config), {
+      enabled: false,
+      entries: 0,
+      hits: 0,
+      misses: 2,
+    });
+  } finally {
+    configurePdfFontSelectionCache(true);
+    takeFontSubstitutions();
+    await fs.rm(fontDir, { recursive: true, force: true });
+  }
 });
 
 test('a family with no file at all still fails closed in strict mode', () => {
