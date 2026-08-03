@@ -42,6 +42,9 @@ export function loadConfig(env = process.env) {
     maxXmlNodes: positiveInteger(env.RDL_MAX_XML_NODES, 250_000),
     maxXmlDepth: positiveInteger(env.RDL_MAX_XML_DEPTH, 256),
     pdftoppmPath: env.RDL_PDFTOPPM_PATH || 'pdftoppm',
+    // Generic operational rollback for semantics-preserving PDF layout caches. Keep this for the first
+    // optimized release so production can return to the v0.1.0 computation path without report matching.
+    pdfLayoutOptimizations: booleanFlag(env.RDL_PDF_LAYOUT_OPTIMIZATIONS, true),
     // Minimum PDF border stroke width in points. 0 = honour the RDL width exactly (default). A floor only
     // makes borders heavier, not more uniform (the unevenness is a viewer sub-pixel artifact, not width),
     // so it is opt-in and off by default.

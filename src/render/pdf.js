@@ -633,8 +633,11 @@ function splitTextForHeight(doc, config, textbox, context, text, width, height) 
   };
 }
 
-function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage, globals }) {
+function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage, globals, statistics }) {
   const { rows, columns } = tablixRows(item, request, globals, model);
+  statistics.tablixCount += 1;
+  statistics.tablixRowCount += rows.length;
+  statistics.tablixCellCount += rows.reduce((sum, row) => sum + row.cells.length, 0);
   const enforceBottomClosure = shouldEnforceTablixBottom(rows, item);
   const datasets = normalizeDatasets(model, request);
   // A matrix expands to a data-dependent column grid wider than the design width; use its natural
@@ -792,6 +795,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   let pendingEdges = [];
   const collectEdge = (x, y, width, height, side, border, context, traceMeta = null) => {
     if (!border) return;
+    statistics.borderEdgesCollected += 1;
     const vertical = side === 'left' || side === 'right';
     const pos = vertical ? (side === 'right' ? x + width : x) : (side === 'bottom' ? y + height : y);
     const [a, b] = vertical ? [y, y + height] : [x, x + width];
@@ -819,6 +823,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         else { runs.push([runStart, runEnd]); [runStart, runEnd] = [s, e]; }
       }
       runs.push([runStart, runEnd]);
+      statistics.borderRunsDrawn += runs.length;
       for (const [s, e] of runs) {
         const vertical = edge.orient === 'V';
         if (traceMeta && !/^none$/i.test(String(styleValue(edge.border.style, edge.context, 'None')))) {
@@ -1056,15 +1061,58 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     });
   };
 
-  const measureRow = (row, texts) => layoutsForRow(row, texts).reduce((height, layout) => Math.max(
-    height,
-    measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
-      + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
-    Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
-      (nested.item.top || 0) + nestedLayout(nested, layout.width).height
-    ))),
-  ), row.height);
+  const rowMeasurementCache = new WeakMap();
+  const measureRow = (row, texts = row.cells.map((cell) => cellText(cell))) => {
+    statistics.rowMeasurementRequests += 1;
+    // Nested child rows may be temporarily replaced with one page fragment during subreport pagination.
+    // Their geometry is mutable, so they deliberately bypass this otherwise exact memoization path.
+    const cacheable = config.pdfLayoutOptimizations !== false
+      && !row.cells.some((cell) => (cell.nestedTablixes || []).length > 0);
+    const pageNumber = globals.PageNumber;
+    const textKey = cacheable ? JSON.stringify(texts) : null;
+    let pageCache;
+    if (cacheable) {
+      let rowCache = rowMeasurementCache.get(row);
+      if (!rowCache) {
+        rowCache = new Map();
+        rowMeasurementCache.set(row, rowCache);
+      }
+      pageCache = rowCache.get(pageNumber);
+      if (!pageCache) {
+        pageCache = new Map();
+        rowCache.set(pageNumber, pageCache);
+      }
+      if (pageCache.has(textKey)) {
+        statistics.rowMeasurementCacheHits += 1;
+        return pageCache.get(textKey);
+      }
+    }
+    statistics.rowMeasurementsComputed += 1;
+    const measured = layoutsForRow(row, texts).reduce((height, layout) => Math.max(
+      height,
+      measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
+        + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
+      Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
+        (nested.item.top || 0) + nestedLayout(nested, layout.width).height
+      ))),
+    ), row.height);
+    if (cacheable) pageCache.set(textKey, measured);
+    return measured;
+  };
   const measuredHeights = rows.map((row) => measureRow(row));
+  const headerMeasurementsByPage = new Map();
+  const headerMeasurements = () => {
+    const pageNumber = globals.PageNumber;
+    if (config.pdfLayoutOptimizations !== false && headerMeasurementsByPage.has(pageNumber)) {
+      statistics.headerMeasurementCacheHits += 1;
+      return headerMeasurementsByPage.get(pageNumber);
+    }
+    statistics.headerMeasurementsComputed += 1;
+    const heights = headers.map((header) => measureRow(header));
+    const result = { heights, total: heights.reduce((sum, height) => sum + height, 0) };
+    if (config.pdfLayoutOptimizations !== false) headerMeasurementsByPage.set(pageNumber, result);
+    return result;
+  };
 
   // Draw one segment of an open merged cell: its fill + value + borders from segStartY down to endY,
   // clamped to the reserved body area so it never bleeds into the footer band. When the value is taller
@@ -1252,7 +1300,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     y = addPage.bodyTop;
     if (showContinuationMarkers && logicalContinuationRow) drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, logicalContinuationRow);
     fragmentStartY = y;
-    for (const header of headers) drawRowContent(header, measureRow(header));
+    const repeatedHeaders = headerMeasurements();
+    headers.forEach((header, index) => drawRowContent(header, repeatedHeaders.heights[index]));
     // Continue overflowing values from where they were clipped; repeat values that fully fit.
     for (const span of openSpans) {
       if (span.pendingTail) { span.text = span.pendingTail; span.pendingTail = null; }
@@ -1266,7 +1315,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (row.pageBreakBefore && y > addPage.bodyTop) startContinuationPage();
     let remainingTexts = row.cells.map((cell) => cellText(cell));
     let measured = measureRow(row, remainingTexts);
-    const repeatedHeaderHeight = headers.reduce((sum, header) => sum + measureRow(header), 0);
+    const repeatedHeaderHeight = headerMeasurements().total;
     const freshPageCapacity = pageBottom - addPage.bodyTop - repeatedHeaderHeight;
     // KeepTogether is best-effort: when a physical data row does not fit in the current remainder, move it
     // before splitting any cell text. If an oversized row is already at the fresh-page content boundary, it
@@ -1356,10 +1405,23 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       measured = measureRow(row, remainingTexts);
     }
     const rowIndex = rowIndexes.get(row);
-    const protectedHeight = row.cells.reduce((maximum, cell) => Math.max(
-      maximum,
-      measuredHeights.slice(rowIndex, rowIndex + Math.max(1, cell.rowSpan || 1)).reduce((sum, value) => sum + value, 0),
-    ), measured);
+    let protectedHeight;
+    if (config.pdfLayoutOptimizations === false) {
+      protectedHeight = row.cells.reduce((maximum, cell) => Math.max(
+        maximum,
+        measuredHeights.slice(rowIndex, rowIndex + Math.max(1, cell.rowSpan || 1)).reduce((sum, value) => sum + value, 0),
+      ), measured);
+      statistics.rowSpanHeightCalculations += row.cells.length;
+    } else {
+      const maximumRowSpan = row.cells.reduce((maximum, cell) => Math.max(maximum, Math.max(1, cell.rowSpan || 1)), 1);
+      // Row heights are non-negative. Therefore the longest declared span always has the largest protected
+      // height. Sum that range once in the same top-to-bottom order as the previous per-cell reductions.
+      let spannedHeight = 0;
+      const spanEnd = Math.min(measuredHeights.length, rowIndex + maximumRowSpan);
+      for (let spanIndex = rowIndex; spanIndex < spanEnd; spanIndex += 1) spannedHeight += measuredHeights[spanIndex];
+      statistics.rowSpanHeightCalculations += 1;
+      protectedHeight = Math.max(measured, spannedHeight);
+    }
     if (y + protectedHeight > pageBottom && protectedHeight <= freshPageCapacity) startContinuationPage();
     measured = measureRow(row, remainingTexts);
     if (y + measured <= pageBottom) {
@@ -1374,9 +1436,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       // Row-span (merged) cells are continued only by activeSpans/redrawActiveSpans, which re-draws the whole
       // value at the top of each continuation page (SSRS merged-cell behaviour). They must never also produce a
       // split tail here, or the tail and the redrawn value overlap on the continuation page.
-      const parts = layouts.map((layout) => ((layout.cell.rowSpan || 1) > 1
-        ? { head: layout.text, tail: '' }
-        : splitTextForHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width, availableHeight)));
+      const parts = layouts.map((layout) => {
+        if ((layout.cell.rowSpan || 1) > 1) return { head: layout.text, tail: '' };
+        statistics.textSplitRequests += 1;
+        return splitTextForHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width, availableHeight);
+      });
       const hasContinuation = parts.some((part) => part.tail.length > 0);
       const heads = parts.map((part) => part.head);
       const segmentHeight = hasContinuation ? availableHeight : Math.min(availableHeight, measureRow(row, heads));
@@ -1442,6 +1506,21 @@ export async function renderPdf(model, request, config, options = {}) {
   };
 
   const datasets = normalizeDatasets(model, request);
+  const statistics = {
+    optimizationsEnabled: config.pdfLayoutOptimizations !== false,
+    tablixCount: 0,
+    tablixRowCount: 0,
+    tablixCellCount: 0,
+    rowMeasurementRequests: 0,
+    rowMeasurementsComputed: 0,
+    rowMeasurementCacheHits: 0,
+    headerMeasurementsComputed: 0,
+    headerMeasurementCacheHits: 0,
+    rowSpanHeightCalculations: 0,
+    textSplitRequests: 0,
+    borderEdgesCollected: 0,
+    borderRunsDrawn: 0,
+  };
   reportTelemetry('pdf.initialized', {
     bodyItemCount: model.body?.items?.length || 0,
     normalizedDatasetCount: Object.keys(datasets || {}).length,
@@ -1462,6 +1541,7 @@ export async function renderPdf(model, request, config, options = {}) {
         pageBottom,
         addPage: pageAdvance,
         globals,
+        statistics,
       });
     }
     if (item.type === 'Textbox' && item.canGrow) {
@@ -1788,6 +1868,7 @@ export async function renderPdf(model, request, config, options = {}) {
   reportTelemetry('pdf.body-layout-completed', {
     pageCount: doc.bufferedPageRange().count,
     bodyItemCount: items.length,
+    ...statistics,
   });
 
   const range = doc.bufferedPageRange();

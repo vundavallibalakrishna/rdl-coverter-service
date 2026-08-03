@@ -395,6 +395,7 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_MAX_XML_NODES` | `250000` | XML expansion guard. |
 | `RDL_MAX_XML_DEPTH` | `256` | XML nesting guard. |
 | `RDL_PDFTOPPM_PATH` | `pdftoppm` | Poppler binary for `DOCX_VISUAL`. |
+| `RDL_PDF_LAYOUT_OPTIMIZATIONS` | `true` | Generic PDF measurement-cache optimization. Set `false` for an immediate rollback to the v0.1.0 computation path. |
 | `RDL_BORDER_WIDTH_FLOOR_PT` | `0` | Minimum PDF border stroke, in points. `0` honours the RDL exactly. |
 | `LOG_LEVEL` | `info` | Fastify log level. |
 | `RDL_SAMPLES_DIR` | `<repo>/tmp` | Dev only. Where client samples live for tests and smoke scripts. See [Client samples](#client-samples). |

@@ -54,6 +54,11 @@ test('render telemetry reports bounded structural phases without report or datas
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'pdf.validated'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'renderer-completed'));
   assert.ok(events.some(({ source, phase }) => source === 'runner' && phase === 'cleanup-completed'));
+  const pdfBody = events.find(({ source, phase }) => source === 'worker' && phase === 'pdf.body-layout-completed');
+  assert.equal(pdfBody.metrics.optimizationsEnabled, true);
+  assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementRequests), true);
+  assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementsComputed), true);
+  assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementCacheHits), true);
   for (const event of events) {
     assert.equal(Number.isFinite(event.phaseDurationMs), true);
     assert.equal(Number.isFinite(event.totalDurationMs), true);

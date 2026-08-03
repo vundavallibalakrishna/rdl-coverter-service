@@ -127,6 +127,11 @@ test('removed DOCX profile environment settings do not enter the runtime config'
   assert.equal('docxProfileAuto' in config, false);
 });
 
+test('PDF layout optimization rollback is generic and defaults on', () => {
+  assert.equal(loadConfig({}).pdfLayoutOptimizations, true);
+  assert.equal(loadConfig({ RDL_PDF_LAYOUT_OPTIMIZATIONS: 'false' }).pdfLayoutOptimizations, false);
+});
+
 test('renders equivalent PDF contracts for JSON and multipart requests and cleans temp files', async (context) => {
   const { app, tempRoot } = await application(context);
   const json = await app.inject({ method: 'POST', url: '/v1/render', payload: { ...renderOptions, rdlBase64: fixture.toString('base64') } });
