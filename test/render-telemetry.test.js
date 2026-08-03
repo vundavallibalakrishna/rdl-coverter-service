@@ -48,6 +48,7 @@ test('render telemetry reports bounded structural phases without report or datas
   assert.ok(events.some(({ source, phase }) => source === 'runner' && phase === 'memory-estimated'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'rdl-parsed'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'input-validated'));
+  assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'renderer-module-loaded'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'pdf.body-layout-completed'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'pdf.page-bands-completed'));
   assert.ok(events.some(({ source, phase }) => source === 'worker' && phase === 'pdf.serialized'));
