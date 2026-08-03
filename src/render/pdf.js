@@ -105,7 +105,10 @@ function resolvedTraceBorders(style, context = {}, explicitEdges = null) {
 }
 
 function traceTextbox(doc, config, item, x, y, context, details) {
-  if (details.trace === false) return;
+  // Direct PDF output has no attached trace. Do not resolve trace-only fonts, vertical metrics, lines, or
+  // borders merely to pass them to recordLayoutItem(), which would discard them. DOCX_EDITABLE attaches
+  // the canonical trace before drawing and therefore retains the complete existing path.
+  if (details.trace === false || !doc._rdlLayoutTrace) return;
   const layout = details.styledLayout;
   const fallbackFont = resolvedTraceFont(config, item.style || {}, context, details.text);
   let lineOffset = details.localTextY || 0;

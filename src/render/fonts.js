@@ -89,6 +89,10 @@ const GENERIC_COVERAGE = Object.freeze([
 ]);
 
 const openedFonts = new Map();
+// Font files and their OpenType metrics are immutable for the lifetime of one isolated render worker.
+// Cache normalized vertical metrics by resolved file so trace construction does not issue an existsSync
+// and re-read font metadata for every textbox—particularly expensive through C:\\Windows\\Fonts.
+const verticalMetricsCache = new Map();
 
 // pdfFont runs once per drawn text run, and every miss now walks a ladder of families. Cache the coverage
 // verdict per (file, text) so a repeated column value or header costs one fontkit layout, not one per row.
@@ -506,18 +510,28 @@ export function editableFontEmbeddingPermission(file, family = null, variant = n
 // active PDF graphics/text state. Layout tracing uses these values to record physical baselines while the
 // ordinary PDF drawing path remains byte-for-byte independent of trace capture.
 export function fontVerticalMetrics(file, size) {
-  try {
-    if (!file || !fs.existsSync(file)) return null;
-    const font = openedFont(file);
-    const unitsPerEm = Number(font.unitsPerEm || 1000);
-    return {
-      ascender: Number(font.ascent || 0) * Number(size || 0) / unitsPerEm,
-      descender: Number(font.descent || 0) * Number(size || 0) / unitsPerEm,
-      lineGap: Number(font.lineGap || 0) * Number(size || 0) / unitsPerEm,
-    };
-  } catch {
-    return null;
+  if (!file) return null;
+  if (!verticalMetricsCache.has(file)) {
+    try {
+      const font = openedFont(file);
+      const unitsPerEm = Number(font.unitsPerEm || 1000);
+      verticalMetricsCache.set(file, {
+        ascender: Number(font.ascent || 0) / unitsPerEm,
+        descender: Number(font.descent || 0) / unitsPerEm,
+        lineGap: Number(font.lineGap || 0) / unitsPerEm,
+      });
+    } catch {
+      verticalMetricsCache.set(file, null);
+    }
   }
+  const metrics = verticalMetricsCache.get(file);
+  if (!metrics) return null;
+  const fontSize = Number(size || 0);
+  return {
+    ascender: metrics.ascender * fontSize,
+    descender: metrics.descender * fontSize,
+    lineGap: metrics.lineGap * fontSize,
+  };
 }
 
 export function fontEmbeddingEligibility(config, families = []) {
