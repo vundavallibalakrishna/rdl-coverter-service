@@ -740,6 +740,24 @@ function lineCoincidesWithEdge(line, box) {
   return false;
 }
 
+function lineCrossesInterior(line, box) {
+  const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
+  const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
+  if (horizontal) {
+    const insideVertically = line.y > box.y + GEOMETRY_EPSILON
+      && line.y < box.y + box.height - GEOMETRY_EPSILON;
+    const overlap = Math.min(line.x + line.width, box.x + box.width) - Math.max(line.x, box.x);
+    return insideVertically && overlap > GEOMETRY_EPSILON;
+  }
+  if (vertical) {
+    const insideHorizontally = line.x > box.x + GEOMETRY_EPSILON
+      && line.x < box.x + box.width - GEOMETRY_EPSILON;
+    const overlap = Math.min(line.y + line.height, box.y + box.height) - Math.max(line.y, box.y);
+    return insideHorizontally && overlap > GEOMETRY_EPSILON;
+  }
+  return false;
+}
+
 function resolvedCellBorders(box, owner, decorators, lines) {
   return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => {
     let resolved = owner?.borders?.[side] || null;
@@ -879,13 +897,10 @@ function preparePageGrid(page, {
 
   for (const line of lines) {
     for (const owner of owners) {
-      if (positiveOverlap({
-        x: line.x - GEOMETRY_EPSILON,
-        y: line.y - GEOMETRY_EPSILON,
-        width: Math.max(line.width, GEOMETRY_EPSILON * 2),
-        height: Math.max(line.height, GEOMETRY_EPSILON * 2),
-      }, owner)
-        && !lineCoincidesWithEdge(line, owner)) {
+      // A line ending exactly where an adjacent item begins is a valid border junction, not an overlap.
+      // Reject only a positive-length crossing through the item's interior. Collinear edge segments and
+      // endpoint/corner contacts remain representable as independent native Word cell borders.
+      if (lineCrossesInterior(line, owner) && !lineCoincidesWithEdge(line, owner)) {
         unsupported('An RDL line crosses editable content instead of coinciding with a cell edge', {
           page: page.number,
           line: line.itemName,

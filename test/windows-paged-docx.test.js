@@ -539,6 +539,45 @@ test('standalone page-band lines are traced and materialized as native Word bord
   );
 });
 
+test('page-locked DOCX accepts line endpoints that meet editable content without crossing it', async () => {
+  const endpointFixture = Buffer.from(fixture.toString('utf8').replace(
+    '          <Tablix Name="SalesTable">',
+    `          <Line Name="EndpointLine">
+            <Top>0.4in</Top><Left>0.1in</Left><Height>0.2in</Height><Width>0in</Width>
+            <Style><Border><Style>Solid</Style><Width>1pt</Width><Color>#123456</Color></Border></Style>
+          </Line>
+          <Tablix Name="SalesTable">`,
+  ));
+  const endpointModel = parseRdl(endpointFixture);
+  const canonical = await renderPdf(endpointModel, request, config, { captureLayoutTrace: true });
+  const title = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'TitleBox');
+  const endpoint = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'EndpointLine');
+  assert.equal(endpoint.y, title.y + title.height, 'the line must begin exactly at the textbox endpoint');
+  const rendered = await renderEditableDocx(endpointModel, request, config);
+  const zip = await JSZip.loadAsync(rendered.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  assert.match(documentXml, /<w:(?:left|right) w:val="single" w:color="123456" w:sz="8"\/>/);
+});
+
+test('page-locked DOCX still rejects a line that penetrates editable content', async () => {
+  const crossingFixture = Buffer.from(fixture.toString('utf8').replace(
+    '          <Tablix Name="SalesTable">',
+    `          <Line Name="CrossingLine">
+            <Top>0.1in</Top><Left>1in</Left><Height>0.2in</Height><Width>0in</Width>
+            <Style><Border><Style>Solid</Style><Width>1pt</Width><Color>#123456</Color></Border></Style>
+          </Line>
+          <Tablix Name="SalesTable">`,
+  ));
+  const crossingModel = parseRdl(crossingFixture);
+  await assert.rejects(
+    renderEditableDocx(crossingModel, request, config),
+    (error) => error.code === 'UNSUPPORTED_FEATURE'
+      && /line crosses editable content/.test(error.message)
+      && error.details?.line === 'CrossingLine'
+      && error.details?.item === 'TitleBox',
+  );
+});
+
 test('OS/2 restricted embedding metadata returns FONT_EMBEDDING_FORBIDDEN', async (context) => {
   const source = resolveFontFile(config.fontDir, 'Arial', false, false);
   assert.ok(source, 'the renderer test environment must provide Arial');
