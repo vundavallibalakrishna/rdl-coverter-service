@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { ServiceError } from '../errors.js';
 import { toPoints } from '../units.js';
 import { resolveFontFile } from '../render/fonts.js';
+import { createTelemetryClock } from '../telemetry.js';
 
 const workerPath = fileURLToPath(new URL('./renderWorker.js', import.meta.url));
 const MEMORY_STEP_MB = 128;
@@ -207,29 +208,53 @@ export class RenderRunner {
     this.shuttingDown = false;
   }
 
-  async render({ rdlBuffer, request, signal }) {
+  async render({ rdlBuffer, request, signal, onTelemetry }) {
     if (this.shuttingDown) throw new ServiceError('BUSY', 'Service is shutting down', 503);
     if (this.inFlight >= this.config.maxConcurrency) throw new ServiceError('BUSY', 'Render capacity is currently full', 503, { retryAfterSeconds: 5 });
     this.inFlight += 1;
+    const telemetry = createTelemetryClock('runner', onTelemetry);
+    const output = String(request?.output || '').toUpperCase().slice(0, 32);
+    const inputMetrics = {
+      output,
+      rdlBytes: rdlBuffer.length,
+      datasetCount: Object.keys(request?.datasets || {}).length,
+      datasetTextBytes: datasetTextBytes(request),
+      datasetValueCount: datasetValueCount(request),
+      bundledSubreportCount: Object.keys(request?.subreports || {}).length,
+      inFlight: this.inFlight,
+      maxConcurrency: this.config.maxConcurrency,
+    };
+    telemetry.mark('admitted', 'completed', inputMetrics);
     let tempDir;
     let child;
+    let outcome = 'failed';
     try {
       tempDir = await fs.mkdtemp(path.join(this.config.tempRoot, 'request-'));
       await fs.chmod(tempDir, 0o700);
+      telemetry.mark('temporary-storage-prepared');
       const rdlPath = path.join(tempDir, 'input.rdl');
       const requestPath = path.join(tempDir, 'request.json');
+      const requestJson = JSON.stringify(request);
       await Promise.all([
         fs.writeFile(rdlPath, rdlBuffer, { mode: 0o600 }),
-        fs.writeFile(requestPath, JSON.stringify(request), { mode: 0o600 }),
+        fs.writeFile(requestPath, requestJson, { mode: 0o600 }),
       ]);
+      telemetry.mark('inputs-written', 'completed', { requestBytes: Buffer.byteLength(requestJson) });
 
       const memoryEstimate = estimateWorkerMemory(rdlBuffer, request, this.config);
+      telemetry.mark('memory-estimated', 'completed', {
+        workerMemoryMb: memoryEstimate.memoryMb,
+        uncappedWorkerMemoryMb: memoryEstimate.uncappedMb,
+        memoryEstimateCapped: memoryEstimate.capped,
+        ...memoryEstimate.metrics,
+      });
       child = fork(workerPath, [], {
         stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
         env: process.env,
         execArgv: [`--max-old-space-size=${memoryEstimate.memoryMb}`],
       });
       this.active.add(child);
+      telemetry.mark('worker-created', 'completed', { workerPid: child.pid, workerMemoryMb: memoryEstimate.memoryMb });
       const metadata = await new Promise((resolve, reject) => {
         let settled = false;
         const finish = (callback, value) => {
@@ -241,19 +266,31 @@ export class RenderRunner {
         };
         const timeout = setTimeout(() => {
           child.kill('SIGKILL');
+          telemetry.mark('worker-timeout', 'failed', { timeoutMs: this.config.renderTimeoutMs });
           finish(reject, new ServiceError('RENDER_TIMEOUT', 'Rendering exceeded the configured timeout', 504));
         }, this.config.renderTimeoutMs);
         const abort = () => {
           child.kill('SIGKILL');
+          telemetry.mark('client-aborted', 'failed');
           finish(reject, new ServiceError('RENDER_FAILED', 'Client disconnected before rendering completed', 499));
         };
         signal?.addEventListener('abort', abort, { once: true });
         if (signal?.aborted) abort();
-        child.once('error', () => finish(reject, new ServiceError('RENDER_FAILED', 'Render worker could not be started', 500)));
+        child.once('error', () => {
+          telemetry.mark('worker-start-error', 'failed');
+          finish(reject, new ServiceError('RENDER_FAILED', 'Render worker could not be started', 500));
+        });
         child.once('exit', (code, exitSignal) => {
-          if (!settled && code !== 0) finish(reject, new ServiceError('RENDER_FAILED', `Render worker stopped unexpectedly (${exitSignal || code})`, 500));
+          if (!settled && code !== 0) {
+            telemetry.mark('worker-exited', 'failed', { exitCode: code, exitSignal: exitSignal || undefined });
+            finish(reject, new ServiceError('RENDER_FAILED', `Render worker stopped unexpectedly (${exitSignal || code})`, 500));
+          }
         });
         child.on('message', (message) => {
+          if (message?.type === 'telemetry') {
+            try { onTelemetry?.(message.event); } catch { /* Logging cannot affect rendering. */ }
+            return;
+          }
           if (message?.type === 'failed') {
             const failure = new ServiceError(message.error.code, message.error.message, message.error.statusCode, message.error.details);
             // Server-side only: the underlying exception behind a scrubbed RENDER_FAILED (see renderWorker).
@@ -264,14 +301,30 @@ export class RenderRunner {
         });
         child.send({ type: 'render', tempDir, rdlPath, requestPath, config: this.config });
       });
+      telemetry.mark('worker-completed', 'completed', {
+        pageCount: metadata.pageCount,
+        outputBytes: metadata.size,
+        totalRows: metadata.totalRows,
+        sheetCount: metadata.sheetCount,
+        workbookRowCount: metadata.rowCount,
+      });
       const buffer = await fs.readFile(metadata.outputPath);
+      telemetry.mark('artifact-read', 'completed', { outputBytes: buffer.length });
+      outcome = 'completed';
       return { ...metadata, buffer, workerMemoryMb: memoryEstimate.memoryMb, workerMemoryEstimate: memoryEstimate };
+    } catch (error) {
+      telemetry.mark('render-failed', 'failed', {
+        errorCode: error?.code || 'RENDER_FAILED',
+        statusCode: error?.statusCode || 500,
+      });
+      throw error;
     } finally {
       if (child?.connected) child.disconnect();
       if (child && !child.killed) child.kill('SIGTERM');
       if (child) this.active.delete(child);
       this.inFlight -= 1;
       if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
+      telemetry.mark('cleanup-completed', outcome, { inFlight: this.inFlight });
     }
   }
 

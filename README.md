@@ -399,6 +399,29 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `LOG_LEVEL` | `info` | Fastify log level. |
 | `RDL_SAMPLES_DIR` | `<repo>/tmp` | Dev only. Where client samples live for tests and smoke scripts. See [Client samples](#client-samples). |
 
+### Render telemetry
+
+At the default `LOG_LEVEL=info`, every render emits bounded JSON phase events to stdout with
+`event: "render.phase"` and the Fastify request ID. The HTTP layer, runner, and isolated worker report:
+
+- request decoding and structural input sizes;
+- temporary-storage preparation and input-write time;
+- worker-memory estimation, selected heap limit, worker startup, and cleanup;
+- input reads, JSON decoding, RDL parsing, bundled-subreport resolution, font checks, and validation;
+- renderer start/completion, artifact write/read, page/sheet/row counts, and output size;
+- for direct PDF output: canonical body layout, page header/footer bands, PDFKit serialization, and final
+  PDF validation;
+- elapsed and phase duration, process RSS/heap/external memory, CPU time, and event-loop utilization;
+- timeout, abort, worker-exit, validation, rendering, and cleanup failure phases using stable error codes.
+
+The terminal `RDL rendering completed` event remains the request summary. Fastify's subsequent
+`request completed` event includes response transmission time, so comparing the two separates server-side
+rendering from a slow client/network download.
+
+Telemetry is intentionally structural and bounded. It never contains RDL XML, queries, parameter values,
+dataset values, temporary paths, output binary content, request/response bodies, or authorization headers. Raising
+`LOG_LEVEL` changes log filtering only; it does not weaken that content boundary.
+
 `RDL_BORDER_WIDTH_FLOOR_PT` exists for a reported "uneven borders" symptom that turned out to be viewer
 sub-pixel rasterization, not stroke width. A floor only makes borders *heavier*, not more uniform, so it is
 opt-in and off by default.

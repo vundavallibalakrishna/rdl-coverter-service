@@ -68,9 +68,29 @@ export async function buildApp(options = {}) {
     request.raw.once('aborted', abort);
     reply.raw.once('close', abort);
     const { rdlBuffer, options: renderRequest } = await readInput(request, config);
+    request.log.info({
+      event: 'render.phase',
+      requestId: request.id,
+      source: 'http',
+      phase: 'request-decoded',
+      status: 'completed',
+      totalDurationMs: Date.now() - startedAt,
+      rdlBytes: rdlBuffer.length,
+      output: String(renderRequest.output || '').toUpperCase().slice(0, 32),
+      datasetCount: Object.keys(renderRequest.datasets || {}).length,
+      bundledSubreportCount: Object.keys(renderRequest.subreports || {}).length,
+    }, 'RDL render phase');
     let rendered;
     try {
-      rendered = await runner.render({ rdlBuffer, request: renderRequest, signal: abortController.signal });
+      rendered = await runner.render({
+        rdlBuffer,
+        request: renderRequest,
+        signal: abortController.signal,
+        onTelemetry: (telemetry) => {
+          request.renderTelemetry = telemetry;
+          request.log.info({ event: 'render.phase', requestId: request.id, ...telemetry }, 'RDL render phase');
+        },
+      });
     } finally {
       request.raw.removeListener('aborted', abort);
       reply.raw.removeListener('close', abort);
@@ -91,6 +111,10 @@ export async function buildApp(options = {}) {
       docxProfileCertified: rendered.docxProfile?.certified,
       docxNativePageFragments: rendered.docxNativePageFragments,
       fontSubstitutions: rendered.fontSubstitutions?.length ? rendered.fontSubstitutions : undefined,
+      workerMemoryMb: rendered.workerMemoryMb,
+      workerMemoryEstimate: rendered.workerMemoryEstimate,
+      sheetCount: rendered.sheetCount,
+      workbookRowCount: rendered.rowCount,
       durationMs,
     }, 'RDL rendering completed');
     reply
@@ -126,7 +150,13 @@ export async function buildApp(options = {}) {
     // safe.diagnostic carries the real exception behind a scrubbed RENDER_FAILED (see renderWorker). It is
     // logged here and deliberately left out of the reply below, which stays free of report-derived detail.
     const diagnostic = safe.diagnostic || (safe.cause ? { name: safe.cause.name, message: safe.cause.message, stack: safe.cause.stack } : undefined);
-    request.log.error({ requestId: request.id, code: safe.code, statusCode: safe.statusCode, diagnostic }, 'RDL request failed');
+    request.log.error({
+      requestId: request.id,
+      code: safe.code,
+      statusCode: safe.statusCode,
+      lastRenderTelemetry: request.renderTelemetry,
+      diagnostic,
+    }, 'RDL request failed');
     if (safe.code === 'BUSY') reply.header('Retry-After', safe.details?.retryAfterSeconds || 5);
     return reply.code(safe.statusCode).header('X-Request-Id', request.id).send({ error: { code: safe.code, message: safe.message, details: safe.details } });
   });

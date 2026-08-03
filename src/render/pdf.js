@@ -1396,6 +1396,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
 }
 
 export async function renderPdf(model, request, config, options = {}) {
+  // Timing callbacks are observation-only. They receive bounded counts/sizes and must never inspect or
+  // mutate PDFKit state, report content, coordinates, or the canonical trace.
+  const reportTelemetry = (phase, metrics = {}) => {
+    try { options.telemetry?.(phase, metrics); } catch { /* Telemetry cannot affect canonical PDF output. */ }
+  };
   borderWidthFloor = config?.borderWidthFloorPt || 0;
   const doc = new PDFDocument({ autoFirstPage: false, bufferPages: true, compress: true, info: { Title: request.outputFileName || model.name, Producer: 'RDL Converter Service' } });
   const layoutTrace = options.captureLayoutTrace ? createLayoutTrace(model, request) : null;
@@ -1437,6 +1442,11 @@ export async function renderPdf(model, request, config, options = {}) {
   };
 
   const datasets = normalizeDatasets(model, request);
+  reportTelemetry('pdf.initialized', {
+    bodyItemCount: model.body?.items?.length || 0,
+    normalizedDatasetCount: Object.keys(datasets || {}).length,
+    captureLayoutTrace: Boolean(layoutTrace),
+  });
   const renderBodyItem = (item, x, y, context, pagination = {}) => {
     const pageAdvance = pagination.addPage || addPage;
     if (isHidden(item.hidden, context)) return { endY: y };
@@ -1775,6 +1785,11 @@ export async function renderPdf(model, request, config, options = {}) {
     }
   }
 
+  reportTelemetry('pdf.body-layout-completed', {
+    pageCount: doc.bufferedPageRange().count,
+    bodyItemCount: items.length,
+  });
+
   const range = doc.bufferedPageRange();
   globals.TotalPages = range.count;
   for (let index = 0; index < range.count; index += 1) {
@@ -1790,12 +1805,20 @@ export async function renderPdf(model, request, config, options = {}) {
       for (const item of [...page.footer.items].sort((left, right) => left.zIndex - right.zIndex || left.top - right.top || left.left - right.left)) drawSimpleItem(doc, config, model, item, page.marginLeft + item.left, footerTop + item.top, context);
     }
   }
+  reportTelemetry('pdf.page-bands-completed', {
+    pageCount: range.count,
+    headerItemCount: page.header?.items?.length || 0,
+    footerItemCount: page.footer?.items?.length || 0,
+  });
   doc.end();
   const buffer = await completion;
+  reportTelemetry('pdf.serialized', { pageCount: range.count, outputBytes: buffer.length });
   const parsed = await PdfLibDocument.load(buffer);
+  const parsedPageCount = parsed.getPageCount();
+  reportTelemetry('pdf.validated', { pageCount: parsedPageCount, outputBytes: buffer.length });
   return {
     buffer,
-    pageCount: parsed.getPageCount(),
+    pageCount: parsedPageCount,
     mimeType: 'application/pdf',
     extension: 'pdf',
     ...(layoutTrace ? { layoutTrace: finalizeLayoutTrace(layoutTrace) } : {}),
