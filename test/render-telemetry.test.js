@@ -64,6 +64,10 @@ test('render telemetry reports bounded structural phases without report or datas
   assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.entries), true);
   assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.hits), true);
   assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.misses), true);
+  assert.equal(rendererCompleted.metrics.pdfFontSelectionCache.enabled, true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.pdfFontSelectionCache.entries), true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.pdfFontSelectionCache.hits), true);
+  assert.equal(Number.isInteger(rendererCompleted.metrics.pdfFontSelectionCache.misses), true);
   for (const event of events) {
     assert.equal(Number.isFinite(event.phaseDurationMs), true);
     assert.equal(Number.isFinite(event.totalDurationMs), true);

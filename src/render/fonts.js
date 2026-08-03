@@ -143,10 +143,13 @@ const resolutionCache = new Map();
 
 export function resolveFontFile(fontDir, family, bold = false, italic = false) {
   const exact = styleKey(family, bold, italic);
+  // Check the cache before rebuilding and joining the complete cross-platform directory ladder. Include
+  // the Windows environment inputs because tests—and embedders—may change them during one process.
+  const environmentKey = `${fontDir}\u0000${process.env.SystemRoot || ''}\u0000${process.env.LOCALAPPDATA || ''}`;
+  const cacheKey = `${environmentKey}\u0000${exact}`;
+  if (resolutionCache.has(cacheKey)) return resolutionCache.get(cacheKey);
   const candidates = FILE_CANDIDATES[exact] || FILE_CANDIDATES[family] || [];
   const directories = systemDirectories(fontDir);
-  const cacheKey = `${directories.join('|')} ${exact}`;
-  if (resolutionCache.has(cacheKey)) return resolutionCache.get(cacheKey);
 
   let resolved = null;
   for (const directory of directories) {
@@ -238,6 +241,65 @@ function recordSubstitution(requested, substituted, reason) {
   substitutions.set(key, { requested, substituted, reason, runs: (substitutions.get(key)?.runs || 0) + 1 });
 }
 
+const PDF_FONT_SELECTION_CACHE_LIMIT = 20_000;
+const PDF_SUPPORTED_FAMILIES = new Set([
+  'Arial',
+  'Times New Roman',
+  'Segoe UI',
+  'Segoe UI Emoji',
+  'Segoe UI Symbol',
+  'Noto Emoji',
+]);
+let pdfFontSelectionCacheEnabled = true;
+let pdfFontSelectionCaches = new WeakMap();
+let pdfFontSelectionCacheHits = 0;
+let pdfFontSelectionCacheMisses = 0;
+
+export function configurePdfFontSelectionCache(enabled = true) {
+  pdfFontSelectionCacheEnabled = enabled !== false;
+  pdfFontSelectionCaches = new WeakMap();
+  pdfFontSelectionCacheHits = 0;
+  pdfFontSelectionCacheMisses = 0;
+}
+
+export function pdfFontSelectionCacheStatistics(config) {
+  return {
+    enabled: pdfFontSelectionCacheEnabled,
+    entries: pdfFontSelectionCaches.get(config)?.size || 0,
+    hits: pdfFontSelectionCacheHits,
+    misses: pdfFontSelectionCacheMisses,
+  };
+}
+
+function cachedPdfFontSelection(config, key) {
+  if (!pdfFontSelectionCacheEnabled) {
+    pdfFontSelectionCacheMisses += 1;
+    return null;
+  }
+  const cached = pdfFontSelectionCaches.get(config)?.get(key);
+  if (!cached) {
+    pdfFontSelectionCacheMisses += 1;
+    return null;
+  }
+  pdfFontSelectionCacheHits += 1;
+  if (cached.substitution) recordSubstitution(...cached.substitution);
+  return cached.font;
+}
+
+function rememberPdfFontSelection(config, key, font, substitution = null) {
+  if (pdfFontSelectionCacheEnabled) {
+    let cache = pdfFontSelectionCaches.get(config);
+    if (!cache) {
+      cache = new Map();
+      pdfFontSelectionCaches.set(config, cache);
+    }
+    if (cache.size >= PDF_FONT_SELECTION_CACHE_LIMIT) cache.clear();
+    cache.set(key, { font, substitution });
+  }
+  if (substitution) recordSubstitution(...substitution);
+  return font;
+}
+
 /**
  * Coverage substitutions made since the last call, most-used first, and clears the record. Called once per
  * render so the result can travel back to the caller as render metadata.
@@ -327,63 +389,68 @@ function compatibleFont(config, family, bold, italic, text = '') {
  *    gates this: the alternative is a 503 for a report that renders fine everywhere else.
  */
 export function pdfFont(config, family, bold = false, italic = false, text = '') {
-  const supported = ['Arial', 'Times New Roman', 'Segoe UI', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Emoji'];
-  const normalized = supported.includes(family) ? family : null;
+  const selectionKey = `${family}\u0000${bold ? 1 : 0}${italic ? 1 : 0}\u0000${text}`;
+  const cached = cachedPdfFontSelection(config, selectionKey);
+  if (cached) return cached;
+  const normalized = PDF_SUPPORTED_FAMILIES.has(family) ? family : null;
   if (!normalized) {
     // An unknown family is still worth covering: a real installed font beats both a hard failure and the
     // base-14 approximation below.
     const covering = coveringFont(config, family, bold, italic, text);
     if (covering) {
-      recordSubstitution(family, covering.family, 'family-unsupported');
-      return covering.file;
+      return rememberPdfFontSelection(config, selectionKey, covering.file, [family, covering.family, 'family-unsupported']);
     }
     if (config.strictFonts) throw new ServiceError('FONT_MISSING', `Required font is unavailable: ${family}`, 503);
     if (containsEmoji(text)) {
       const fallback = compatibleFont(config, family, bold, italic, text);
-      if (fallback) return fallback.file;
+      if (fallback) return rememberPdfFontSelection(config, selectionKey, fallback.file);
       throw new ServiceError('FONT_MISSING', `No embedded font covers the required emoji for: ${family}`, 503);
     }
-    return bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica');
+    return rememberPdfFontSelection(config, selectionKey, bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica'));
   }
 
   const file = resolveFontFile(config.fontDir, normalized, bold, italic);
-  if (file && fontUsableFor(file, text)) return file;
+  if (file && fontUsableFor(file, text)) return rememberPdfFontSelection(config, selectionKey, file);
 
   if (file) {
     // The declared font is present and simply cannot draw this text. Never fails: worst case the run keeps
     // the declared font and its uncovered characters come out as .notdef, exactly as SSRS renders them.
     const covering = coveringFont(config, normalized, bold, italic, text);
     if (covering) {
-      recordSubstitution(normalized, covering.family, 'glyph-coverage');
-      return covering.file;
+      return rememberPdfFontSelection(config, selectionKey, covering.file, [normalized, covering.family, 'glyph-coverage']);
     }
     // Returning the declared TrueType file is safe even for emoji: an embedded font renders an uncovered
     // code point as .notdef, whereas the base-14 path below would write corrupt surrogate bytes.
     if (fontEmbeddableFor(file, text)) {
-      if (text) recordSubstitution(normalized, normalized, 'no-covering-font');
-      return file;
+      return rememberPdfFontSelection(
+        config,
+        selectionKey,
+        file,
+        text ? [normalized, normalized, 'no-covering-font'] : null,
+      );
     }
     // The declared font is itself a colour font, so embedding it would abort the render. Anything the
     // renderer can actually embed is better, even if some characters fall back to .notdef.
     const embeddable = embeddableFont(config, normalized, bold, italic, text);
     if (embeddable) {
-      recordSubstitution(normalized, embeddable.family, 'not-embeddable');
-      return embeddable.file;
+      return rememberPdfFontSelection(config, selectionKey, embeddable.file, [normalized, embeddable.family, 'not-embeddable']);
     }
     // Nothing embeddable at all — fall through to the base-14 / fail-closed tail below.
   }
 
   // The declared family has no file at all — whole-family substitution, unchanged fail-closed semantics.
   const fallback = compatibleFont(config, normalized, bold, italic, text);
-  if (fallback) return fallback.file;
+  if (fallback) return rememberPdfFontSelection(config, selectionKey, fallback.file);
   if (config.strictFonts) throw new ServiceError('FONT_MISSING', `Required font is unavailable: ${normalized}`, 503);
   // Base-14 fonts cannot represent supplementary-plane emoji. Failing here prevents the corrupt surrogate
   // bytes that Helvetica otherwise writes while keeping legacy non-strict fallback for ordinary text.
   if (containsEmoji(text)) {
     throw new ServiceError('FONT_MISSING', `No embedded font covers the required emoji for: ${normalized}`, 503);
   }
-  if (normalized === 'Times New Roman') return bold ? (italic ? 'Times-BoldItalic' : 'Times-Bold') : (italic ? 'Times-Italic' : 'Times-Roman');
-  return bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica');
+  if (normalized === 'Times New Roman') {
+    return rememberPdfFontSelection(config, selectionKey, bold ? (italic ? 'Times-BoldItalic' : 'Times-Bold') : (italic ? 'Times-Italic' : 'Times-Roman'));
+  }
+  return rememberPdfFontSelection(config, selectionKey, bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica'));
 }
 
 export function checkFonts(config, families = ['Arial', 'Times New Roman']) {

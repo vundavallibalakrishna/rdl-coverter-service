@@ -132,6 +132,8 @@ test('PDF layout optimization rollback is generic and defaults on', () => {
   assert.equal(loadConfig({ RDL_PDF_LAYOUT_OPTIMIZATIONS: 'false' }).pdfLayoutOptimizations, false);
   assert.equal(loadConfig({}).expressionPlanCache, true);
   assert.equal(loadConfig({ RDL_EXPRESSION_PLAN_CACHE: 'false' }).expressionPlanCache, false);
+  assert.equal(loadConfig({}).pdfFontSelectionCache, true);
+  assert.equal(loadConfig({ RDL_PDF_FONT_SELECTION_CACHE: 'false' }).pdfFontSelectionCache, false);
 });
 
 test('renders equivalent PDF contracts for JSON and multipart requests and cleans temp files', async (context) => {

@@ -397,6 +397,7 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `RDL_PDFTOPPM_PATH` | `pdftoppm` | Poppler binary for `DOCX_VISUAL`. |
 | `RDL_PDF_LAYOUT_OPTIMIZATIONS` | `true` | Generic PDF measurement-cache optimization. Set `false` for an immediate rollback to the v0.1.0 computation path. |
 | `RDL_EXPRESSION_PLAN_CACHE` | `true` | Bounded structural expression-plan cache shared by all renderers. Set `false` to reparse every expression evaluation. |
+| `RDL_PDF_FONT_SELECTION_CACHE` | `true` | Bounded request-scoped cache for repeated PDF font and glyph-coverage selections. Set `false` to resolve every text run independently. |
 | `RDL_BORDER_WIDTH_FLOOR_PT` | `0` | Minimum PDF border stroke, in points. `0` honours the RDL exactly. |
 | `LOG_LEVEL` | `info` | Fastify log level. |
 | `RDL_SAMPLES_DIR` | `<repo>/tmp` | Dev only. Where client samples live for tests and smoke scripts. See [Client samples](#client-samples). |

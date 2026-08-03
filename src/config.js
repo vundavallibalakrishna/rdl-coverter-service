@@ -48,6 +48,10 @@ export function loadConfig(env = process.env) {
     // Structural expression plans contain no row values and are shared across every renderer in one
     // request worker. This switch provides an immediate semantics-preserving rollback path.
     expressionPlanCache: booleanFlag(env.RDL_EXPRESSION_PLAN_CACHE, true),
+    // PDF font selection depends only on the immutable request config, family/style and text. Cache that
+    // decision per request while preserving substitution accounting; this switch is the operational
+    // rollback path for the optimization.
+    pdfFontSelectionCache: booleanFlag(env.RDL_PDF_FONT_SELECTION_CACHE, true),
     // Minimum PDF border stroke width in points. 0 = honour the RDL width exactly (default). A floor only
     // makes borders heavier, not more uniform (the unevenness is a viewer sub-pixel artifact, not width),
     // so it is opt-in and off by default.
