@@ -266,7 +266,7 @@ await converter.render({ rdl, output: 'PDF', datasets, signal: AbortSignal.timeo
 
 | | HTTP service | Library |
 | --- | --- | --- |
-| Language | Any | Node.js ≥ 22 only |
+| Language | Any | Node.js 22.x only |
 | Isolation | Separate process **and** host; independently restartable | Worker per render; shares your host |
 | Resource limits | Contained by the service's own memory/CPU budget | Renders compete with your app |
 | Operations | Another deployment to run | Nothing extra |
