@@ -45,6 +45,9 @@ export function loadConfig(env = process.env) {
     // Generic operational rollback for semantics-preserving PDF layout caches. Keep this for the first
     // optimized release so production can return to the v0.1.0 computation path without report matching.
     pdfLayoutOptimizations: booleanFlag(env.RDL_PDF_LAYOUT_OPTIMIZATIONS, true),
+    // Structural expression plans contain no row values and are shared across every renderer in one
+    // request worker. This switch provides an immediate semantics-preserving rollback path.
+    expressionPlanCache: booleanFlag(env.RDL_EXPRESSION_PLAN_CACHE, true),
     // Minimum PDF border stroke width in points. 0 = honour the RDL width exactly (default). A floor only
     // makes borders heavier, not more uniform (the unevenness is a viewer sub-pixel artifact, not width),
     // so it is opt-in and off by default.

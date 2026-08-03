@@ -422,45 +422,120 @@ function vbLike(text, pattern) {
   try { return new RegExp(`${regex}$`).test(text); } catch { return false; }
 }
 
+const BINARY_OPERATOR_GROUPS = Object.freeze([
+  Object.freeze([' OrElse ', ' Or ']),
+  Object.freeze([' Xor ']),
+  Object.freeze([' AndAlso ', ' And ']),
+  Object.freeze(['<>', '>=', '<=', '=', '>', '<', ' Like ']),
+  Object.freeze(['&']),
+  Object.freeze(['+', '-']),
+  Object.freeze([' Mod ']),
+  Object.freeze(['\\']),
+  Object.freeze(['*', '/']),
+  Object.freeze(['^']),
+]);
+
+// Expressions are immutable report metadata but are evaluated thousands of times against different row
+// contexts. Cache only their structural analysis—not their result—so every field, parameter, scope and
+// page-dependent value is still resolved afresh. The cap keeps direct library use bounded; production
+// workers are already request-scoped and exit after one render.
+const EXPRESSION_PLAN_CACHE_LIMIT = 20_000;
+const expressionPlanCache = new Map();
+let expressionPlanCacheEnabled = true;
+let expressionPlanCacheHits = 0;
+let expressionPlanCacheMisses = 0;
+
+function expressionPlan(source) {
+  const cached = expressionPlanCacheEnabled ? expressionPlanCache.get(source) : undefined;
+  if (cached !== undefined) {
+    expressionPlanCacheHits += 1;
+    return cached;
+  }
+  expressionPlanCacheMisses += 1;
+  const value = unwrap(source);
+  let plan;
+  if (!value) plan = { kind: 'literal', value: '' };
+  else {
+    const functionMatch = value.match(/^((?:Code\.)?[A-Za-z_][A-Za-z0-9_]*)\((.*)\)$/is);
+    if (functionMatch && closesAtEnd(value, functionMatch[1].length)) {
+      plan = { kind: 'function', name: functionMatch[1], args: splitArguments(functionMatch[2]) };
+    } else {
+      const notMatch = value.match(/^Not\b\s*(.+)$/is);
+      if (notMatch) plan = { kind: 'not', operand: notMatch[1] };
+      else {
+        for (const operators of BINARY_OPERATOR_GROUPS) {
+          const found = findTopLevelOperator(value, operators);
+          if (!found) continue;
+          plan = {
+            kind: 'binary',
+            operator: found.operator.trim().toLowerCase(),
+            left: value.slice(0, found.index),
+            right: value.slice(found.index + found.operator.length),
+          };
+          break;
+        }
+      }
+    }
+  }
+  if (!plan) {
+    const member = value.match(/^(Fields|Parameters|Globals|User|ReportItems|Variables)!([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z]+))?(?:\(\s*(\d+)\s*\))?$/i);
+    if (member) {
+      plan = {
+        kind: 'member',
+        collectionName: member[1].toLowerCase(),
+        itemName: member[2],
+        property: (member[3] || 'Value').toLowerCase(),
+        index: member[4] === undefined ? null : Number(member[4]),
+      };
+    } else {
+      const vbConstants = {
+        vbcrlf: '\r\n', vbnewline: '\r\n', vblf: '\n', vbcr: '\r', vbtab: '\t',
+      };
+      const lower = value.toLowerCase();
+      if (Object.hasOwn(vbConstants, lower)) plan = { kind: 'literal', value: vbConstants[lower] };
+      else if (/^Nothing$/i.test(value)) plan = { kind: 'literal', value: null };
+      else if (/^(True|False)$/i.test(value)) plan = { kind: 'literal', value: lower === 'true' };
+      else if (/^-?\d+(?:\.\d+)?$/.test(value)) plan = { kind: 'literal', value: Number(value) };
+      else if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        plan = { kind: 'literal', value: value.slice(1, -1).replace(/""/g, '"') };
+      } else plan = { kind: 'unsupported', value };
+    }
+  }
+  if (expressionPlanCacheEnabled) {
+    if (expressionPlanCache.size >= EXPRESSION_PLAN_CACHE_LIMIT) expressionPlanCache.clear();
+    expressionPlanCache.set(source, plan);
+  }
+  return plan;
+}
+
+export function configureExpressionPlanCache(enabled = true) {
+  expressionPlanCacheEnabled = enabled !== false;
+  expressionPlanCache.clear();
+  expressionPlanCacheHits = 0;
+  expressionPlanCacheMisses = 0;
+}
+
+export function expressionPlanCacheStatistics() {
+  return {
+    enabled: expressionPlanCacheEnabled,
+    entries: expressionPlanCache.size,
+    hits: expressionPlanCacheHits,
+    misses: expressionPlanCacheMisses,
+  };
+}
+
 export function evaluateExpression(input, context = {}) {
   if (input === undefined || input === null) return '';
-  let value = String(input).trim();
-  if (!value.startsWith('=')) return input;
-  value = unwrap(value.slice(1));
-  if (!value) return '';
-
-  // A leading name followed by "(" is only a function call when that parenthesis closes at the very END of
-  // the expression. The regex below spans the first "(" to the last ")", so without this check
-  // `IsNothing(a) And IsNothing(b)` is greedily mis-read as one IsNothing(...) call over mangled text and
-  // never reaches the operator handling below.
-  const functionMatch = value.match(/^((?:Code\.)?[A-Za-z_][A-Za-z0-9_]*)\((.*)\)$/is);
-  if (functionMatch && closesAtEnd(value, functionMatch[1].length)) {
-    return evaluateFunction(functionMatch[1], splitArguments(functionMatch[2]), context);
-  }
-
-  // Unary logical negation (VB `Not x`). `\b` keeps `Nothing`/field names starting with "Not" intact.
-  const notMatch = value.match(/^Not\b\s*(.+)$/is);
-  if (notMatch) return !Boolean(evaluateExpression(`=${notMatch[1]}`, context));
-
-  // Ordered low→high precedence (VB.NET). Split at the lowest-precedence operator first, then recurse.
-  const binaryGroups = [
-    [' OrElse ', ' Or '],
-    [' Xor '],
-    [' AndAlso ', ' And '],
-    ['<>', '>=', '<=', '=', '>', '<', ' Like '],
-    ['&'],
-    ['+', '-'],
-    [' Mod '],
-    ['\\'],
-    ['*', '/'],
-    ['^'],
-  ];
-  for (const operators of binaryGroups) {
-    const found = findTopLevelOperator(value, operators);
-    if (!found) continue;
-    const left = evaluateExpression(`=${value.slice(0, found.index)}`, context);
-    const right = evaluateExpression(`=${value.slice(found.index + found.operator.length)}`, context);
-    switch (found.operator.trim().toLowerCase()) {
+  const source = String(input).trim();
+  if (!source.startsWith('=')) return input;
+  const plan = expressionPlan(source.slice(1));
+  if (plan.kind === 'literal') return plan.value;
+  if (plan.kind === 'function') return evaluateFunction(plan.name, plan.args, context);
+  if (plan.kind === 'not') return !Boolean(evaluateExpression(`=${plan.operand}`, context));
+  if (plan.kind === 'binary') {
+    const left = evaluateExpression(`=${plan.left}`, context);
+    const right = evaluateExpression(`=${plan.right}`, context);
+    switch (plan.operator) {
       case 'or': case 'orelse': return Boolean(left) || Boolean(right);
       case 'and': case 'andalso': return Boolean(left) && Boolean(right);
       case 'xor': return Boolean(left) !== Boolean(right);
@@ -485,10 +560,8 @@ export function evaluateExpression(input, context = {}) {
 
   // Collection member access: Collection!Name[.Property][(index)]. `.Value` (default) keeps the original
   // behaviour; the extra properties cover the common header/footer/conditional idioms.
-  const memberRef = value.match(/^(Fields|Parameters|Globals|User|ReportItems|Variables)!([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z]+))?(?:\(\s*(\d+)\s*\))?$/i);
-  if (memberRef) {
-    const collectionName = memberRef[1].toLowerCase();
-    const itemName = memberRef[2];
+  if (plan.kind === 'member') {
+    const { collectionName, itemName, property, index } = plan;
     if (collectionName === 'variables') {
       // Resolve a report/group Variable by evaluating its definition in the current scope, guarding against
       // a variable that references itself (directly or via another variable).
@@ -498,8 +571,6 @@ export function evaluateExpression(input, context = {}) {
       resolvingVariables.add(itemName);
       return evaluateExpression(String(definition), { ...context, resolvingVariables });
     }
-    const property = (memberRef[3] || 'Value').toLowerCase();
-    const index = memberRef[4] !== undefined ? Number(memberRef[4]) : null;
     const sources = {
       fields: context.fields || {}, parameters: context.parameters || {}, globals: context.globals || {},
       user: context.user || {}, reportitems: context.reportItems || {},
@@ -518,19 +589,5 @@ export function evaluateExpression(input, context = {}) {
     }
     return raw ?? null; // globals, user, reportitems
   }
-  // Built-in VB control-character constants commonly used to assemble multiline labels. These are
-  // declarative literals, not function calls or custom code, and are safe to resolve directly.
-  const vbConstants = {
-    vbcrlf: '\r\n',
-    vbnewline: '\r\n',
-    vblf: '\n',
-    vbcr: '\r',
-    vbtab: '\t',
-  };
-  if (Object.hasOwn(vbConstants, value.toLowerCase())) return vbConstants[value.toLowerCase()];
-  if (/^Nothing$/i.test(value)) return null;
-  if (/^(True|False)$/i.test(value)) return value.toLowerCase() === 'true';
-  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) return value.slice(1, -1).replace(/""/g, '"');
-  throw new ServiceError('UNSUPPORTED_FEATURE', `Unsupported RDL expression: ${value.slice(0, 120)}`);
+  throw new ServiceError('UNSUPPORTED_FEATURE', `Unsupported RDL expression: ${plan.value.slice(0, 120)}`);
 }
