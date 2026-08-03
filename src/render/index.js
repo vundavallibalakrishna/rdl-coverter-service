@@ -10,7 +10,7 @@ export async function renderDocument(model, request, config, tempDir, telemetry)
   const output = String(request.output || '').toUpperCase();
   if (!OUTPUTS.has(output)) throw new ServiceError('RDL_INVALID', `Unsupported output: ${output || 'missing'}`);
   if (output === 'PDF') return renderPdf(model, request, config, { telemetry });
-  if (output === 'DOCX_EDITABLE') return renderEditableDocx(model, request, config, tempDir);
+  if (output === 'DOCX_EDITABLE') return renderEditableDocx(model, request, config, tempDir, telemetry);
   if (output === 'XLSX') return renderExcel(model, request, config, tempDir);
   return renderVisualDocx(model, request, config, tempDir);
 }

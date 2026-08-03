@@ -59,6 +59,15 @@ test('render telemetry reports bounded structural phases without report or datas
   assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementRequests), true);
   assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementsComputed), true);
   assert.equal(Number.isInteger(pdfBody.metrics.rowMeasurementCacheHits), true);
+  for (const metric of [
+    'tablixMaterializationMs',
+    'tablixSetupMs',
+    'tablixInitialMeasurementMs',
+    'tablixDrawingMs',
+  ]) {
+    assert.equal(Number.isFinite(pdfBody.metrics[metric]), true);
+    assert.equal(pdfBody.metrics[metric] >= 0, true);
+  }
   const rendererCompleted = events.find(({ source, phase }) => source === 'worker' && phase === 'renderer-completed');
   assert.equal(rendererCompleted.metrics.expressionPlanCache.enabled, true);
   assert.equal(Number.isInteger(rendererCompleted.metrics.expressionPlanCache.entries), true);
@@ -96,6 +105,31 @@ test('render telemetry records sanitized failure and cleanup phases', async (con
   assert.ok(events.some(({ source, phase, status }) => source === 'runner' && phase === 'render-failed' && status === 'failed'));
   assert.ok(events.some(({ source, phase }) => source === 'runner' && phase === 'cleanup-completed'));
   assert.deepEqual(await fs.readdir(tempRoot), []);
+});
+
+test('page-locked DOCX telemetry identifies canonical PDF, native page, and OOXML packaging phases', async (context) => {
+  const { runner } = await runnerForTest(context);
+  const events = [];
+  const rendered = await runner.render({
+    rdlBuffer: fixture,
+    request: {
+      ...renderRequest({ Sales: [{ Name: 'Telemetry', Amount: 10 }] }),
+      output: 'DOCX_EDITABLE',
+    },
+    onTelemetry: (event) => events.push(event),
+  });
+  assert.equal(rendered.buffer.subarray(0, 2).toString(), 'PK');
+  const phases = new Set(events.filter(({ source }) => source === 'worker').map(({ phase }) => phase));
+  assert.equal(phases.has('docx.compatibility-validated'), true);
+  assert.equal(phases.has('docx.canonical-pdf.body-layout-completed'), true);
+  assert.equal(phases.has('docx.canonical-pdf-completed'), true);
+  assert.equal(phases.has('docx.layout-trace-validated'), true);
+  assert.equal(phases.has('docx.fonts-loaded'), true);
+  assert.equal(phases.has('docx.native-pages-constructed'), true);
+  assert.equal(phases.has('docx.ooxml-pack-started'), true);
+  assert.equal(phases.has('docx.ooxml-pack-completed'), true);
+  assert.equal(phases.has('docx.font-variants-packaged'), true);
+  assert.equal(phases.has('docx.internal-artifacts-cleaned'), true);
 });
 
 test('telemetry sanitizer bounds strings and removes unsupported values', () => {

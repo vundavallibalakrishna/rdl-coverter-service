@@ -104,7 +104,8 @@ process.on('message', async (message) => {
       rowCount: rendered.rowCount,
       // Which declared families could not draw some run and what drew it instead. A coverage substitution
       // is deliberate but still a deviation from the report's declared styling, so it is reported rather
-      // than silent — the worker's stdio is discarded, making the completion message the only way out.
+      // than silent — worker stdout is discarded and stderr is reduced to fatal categories only, making
+      // the completion message the only structured way to carry successful-render metadata out.
       fontSubstitutions: takeFontSubstitutions(),
     });
   } catch (error) {
@@ -113,8 +114,9 @@ process.on('message', async (message) => {
     process.send?.({
       type: 'failed',
       error: { code: safe.code, message: safe.message, statusCode: safe.statusCode, details: safe.details },
-      // RENDER_FAILED deliberately scrubs the message before it reaches the caller, and this worker's
-      // stdio is discarded, so an unexpected exception would otherwise leave no trace anywhere at all.
+      // RENDER_FAILED deliberately scrubs the message before it reaches the caller. Worker stderr is
+      // retained only for fatal process classification, so a caught exception must carry its sanitized
+      // diagnostic through IPC to remain visible in server-side logs.
       // Carry the real one back for the server-side log only; it never enters the HTTP response.
       diagnostic: safe === error ? undefined : {
         name: error?.name,
