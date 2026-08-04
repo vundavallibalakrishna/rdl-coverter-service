@@ -533,10 +533,54 @@ test('standalone page-band lines are traced and materialized as native Word bord
 
   const zip = await JSZip.loadAsync((await renderEditableDocx(lined, request, config)).buffer);
   const footerXml = await zip.file('word/footer1.xml').async('string');
-  assert.match(
+  const dividerBorders = footerXml.match(
+    /<w:(?:top|bottom) w:val="single" w:color="123456" w:sz="12"\/>/g,
+  ) || [];
+  assert.ok(dividerBorders.length > 0, 'the standalone line must become a native Word border');
+  assert.doesNotMatch(
     footerXml,
-    /<w:(?:top|bottom) w:val="single" w:color="123456" w:sz="12"\/>/,
+    /<w:top w:val="single" w:color="123456" w:sz="12"\/>/,
+    'an interior horizontal line must have one owner instead of competing top and bottom borders',
   );
+});
+
+test('footer divider next to a sub-point trace-grid row has one stable Word border owner', async () => {
+  const lined = structuredClone(baseModel);
+  lined.page.footer = {
+    height: 24,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [{
+      type: 'Line',
+      name: 'FooterDivider',
+      left: 0,
+      top: 3.75,
+      width: lined.page.width - lined.page.marginLeft - lined.page.marginRight,
+      height: 0,
+      style: { border: { style: 'Solid', color: '#000000', width: 1 } },
+    }, {
+      type: 'Textbox',
+      name: 'FooterText',
+      left: 0,
+      top: 4,
+      width: 120,
+      height: 10,
+      value: 'Footer text',
+      style: {},
+    }],
+  };
+
+  const zip = await JSZip.loadAsync((await renderEditableDocx(lined, request, config)).buffer);
+  const footerXml = await zip.file('word/footer1.xml').async('string');
+  const bottomBorders = footerXml.match(
+    /<w:bottom w:val="single" w:color="000000" w:sz="8"\/>/g,
+  ) || [];
+  const topBorders = footerXml.match(
+    /<w:top w:val="single" w:color="000000" w:sz="8"\/>/g,
+  ) || [];
+  assert.ok(bottomBorders.length > 0, 'the row above must own the footer divider');
+  assert.equal(topBorders.length, 0, 'the 0.25pt row below must not duplicate the divider');
+  assert.match(footerXml, /<w:trHeight w:val="5" w:hRule="exact"\/>/);
 });
 
 test('page-locked DOCX accepts line endpoints that meet editable content without crossing it', async () => {

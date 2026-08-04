@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -969,10 +969,12 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   });
 
   rows.forEach((row, rowIndex) => {
-    const context = { fields: row.fields || {}, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
     row.cells.forEach((cell, cellIndex) => {
       const start = placements[rowIndex][cellIndex];
       if (start === undefined || start < 0) return;
+      const context = materializedCellContext(cell, row, {
+        parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets,
+      });
       const presentation = cellStyle(item, cell, context);
       const owner = { cell, rowIndex, start, ...presentation };
       owners.push(owner);
@@ -1006,17 +1008,13 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     nestedMeasurements.set(nested, result);
 
     nestedRows.forEach((row, rowIndex) => {
-      const context = {
-        fields: row.fields || {},
-        parameters: request.parameters || {},
-        globals,
-        dataset: row.scopeDataset || datasets[nested.item.datasetName] || [],
-        datasets,
-      };
       row.cells.forEach((cell, cellIndex) => {
         if (cell.hidden) return;
         const start = nestedPlacements[rowIndex][cellIndex];
         if (start === undefined || start < 0) return;
+        const context = materializedCellContext(cell, row, {
+          parameters: request.parameters || {}, globals, dataset: datasets[nested.item.datasetName] || [], datasets,
+        });
         const { textbox, style } = cellStyle(nested.item, cell, context);
         const span = Math.max(1, cell.colSpan || 1);
         const rowSpan = Math.max(1, cell.rowSpan || 1);
@@ -1149,15 +1147,11 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     const nestedHeights = measureNestedTablix(nested).heights;
     nestedRows.forEach((row, index) => rowOffsets.push(point(rowOffsets.at(-1) + nestedHeights[index])));
     for (const [rowIndex, row] of nestedRows.entries()) {
-      const context = {
-        fields: row.fields || {},
-        parameters: request.parameters || {},
-        globals,
-        dataset: row.scopeDataset || datasets[nested.item.datasetName] || [],
-        datasets,
-      };
       for (const [cellIndex, cell] of row.cells.entries()) {
         const start = nestedPlacements[rowIndex][cellIndex];
+        const context = materializedCellContext(cell, row, {
+          parameters: request.parameters || {}, globals, dataset: datasets[nested.item.datasetName] || [], datasets,
+        });
         const presentation = cellStyle(nested.item, cell, context);
         const owner = { cell, rowIndex, start, ...presentation };
         for (let r = 0; r < Math.max(1, cell.rowSpan || 1) && rowIndex + r < nestedRows.length; r += 1) {

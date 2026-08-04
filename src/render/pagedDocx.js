@@ -722,6 +722,24 @@ function lineMatches(line, side, box) {
   return false;
 }
 
+function lineOwnsCellSide(line, side) {
+  const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
+  const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
+  if (horizontal) {
+    // A standalone horizontal line normally separates two trace-grid rows. Writing it on both touching
+    // cell edges leaves Word to resolve two competing borders and is unreliable when either row is only a
+    // few twips high. Give the line to the cell above (its bottom edge). At the canvas origin there is no
+    // preceding row, so the first row owns it on its top edge instead.
+    return side === 'bottom' || (side === 'top' && Math.abs(line.y) <= GEOMETRY_EPSILON);
+  }
+  if (vertical) {
+    // Apply the equivalent single-owner rule horizontally: the cell to the left owns the line, except at
+    // the canvas origin where the first cell must own its left edge.
+    return side === 'right' || (side === 'left' && Math.abs(line.x) <= GEOMETRY_EPSILON);
+  }
+  return false;
+}
+
 function lineCoincidesWithEdge(line, box) {
   const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
   const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
@@ -765,7 +783,9 @@ function resolvedCellBorders(box, owner, decorators, lines) {
       if (edgeMatches(decorator, side, box)) resolved = strongerBorder(resolved, decorator.borders?.[side]);
     }
     for (const line of lines) {
-      if (lineMatches(line, side, box)) resolved = strongerBorder(resolved, lineBorder(line));
+      if (lineOwnsCellSide(line, side) && lineMatches(line, side, box)) {
+        resolved = strongerBorder(resolved, lineBorder(line));
+      }
     }
     return [side, wordBorder(resolved)];
   }));
