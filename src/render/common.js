@@ -178,6 +178,23 @@ export function normalizeDatasets(model, request) {
   ]));
 }
 
+// A materialized cell owns the row/group scope in which SSRS evaluated it. That scope can differ from the
+// physical row currently visiting the cell after row spanning, matrix intersection, nested layout, or page
+// fragmentation. Keep style expressions (especially conditional borders) grounded in the cell owner rather
+// than accidentally re-evaluating them against an adjacent detail row.
+export function materializedCellContext(cell, row, {
+  parameters = {}, globals = {}, dataset = [], datasets = {},
+} = {}) {
+  return {
+    fields: cell?.fields ?? row?.fields ?? {},
+    parameters,
+    globals,
+    dataset: cell?.scopeDataset ?? row?.scopeDataset ?? dataset,
+    datasets,
+    scopes: cell?.scopes ?? row?.scopes ?? {},
+  };
+}
+
 // Returns the materialized rows AND the grid column widths. For static-column tablixes `columns`
 // is identically `item.columns`; for a matrix (dynamic column groups) it is the expanded
 // rowHeader + keys×body column array, so both renderers build the same expanded grid.

@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -756,13 +756,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }
     });
   });
-  const contextForCell = (rowIndex, cell = null) => ({
-    fields: cell?.fields || rows[rowIndex]?.fields || {},
+  const contextForCell = (rowIndex, cell = null) => materializedCellContext(cell, rows[rowIndex], {
     parameters: request.parameters || {},
     globals,
-    dataset: cell?.scopeDataset || rows[rowIndex]?.scopeDataset || datasets[item.datasetName] || [],
+    dataset: datasets[item.datasetName] || [],
     datasets,
-    scopes: cell?.scopes || {},
   });
   // A side's border for a cell, evaluated in that cell's row context. Returns null when the side is
   // absent or resolves to None so the caller can fall back to the neighbouring cell's opposite side.
@@ -881,14 +879,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const textbox = cellTextbox(cell);
       const columnIndex = placements[rowIndex][cellIndex];
       const cellWidth = cellGeometryPt(columns, columnIndex, cell.colSpan || 1).widthPt;
-      const context = {
-        fields: cell.fields || row.fields || {},
+      const context = materializedCellContext(cell, row, {
         parameters: nestedParameters,
         globals: nestedGlobals,
-        dataset: cell.scopeDataset || row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
+        dataset: nestedDatasets[nested.item.datasetName] || [],
         datasets: nestedDatasets,
-        scopes: cell.scopes || {},
-      };
+      });
       const textHeight = textbox && !cell.hidden
         ? measureTextboxHeight(doc, config, textbox, context, cellText(cell), cellWidth)
           + styleSize(textbox.style?.paddingTop, context, 2) + styleSize(textbox.style?.paddingBottom, context, 2)
@@ -924,14 +920,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         const width = columnOffsets[Math.min(layout.columns.length, columnIndex + colSpan)] - columnOffsets[columnIndex];
         const height = rowOffsets[Math.min(layout.heights.length, rowIndex + rowSpan)] - rowOffsets[rowIndex];
         const textbox = cellTextbox(cell);
-        const context = {
-          fields: cell.fields || row.fields || {},
+        const context = materializedCellContext(cell, row, {
           parameters: nestedParameters,
           globals: nestedGlobals,
-          dataset: cell.scopeDataset || row.scopeDataset || nestedDatasets[nested.item.datasetName] || [],
+          dataset: nestedDatasets[nested.item.datasetName] || [],
           datasets: nestedDatasets,
-          scopes: cell.scopes || {},
-        };
+        });
         const style = (cell.containerWrapped ? nested.item.style : textbox?.style) || nested.item.style || {};
         const background = styleColor(style.backgroundColor, context, null);
         if (background) doc.save().rect(x, cellY, width, height).fill(background).restore();
