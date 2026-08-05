@@ -388,6 +388,70 @@ test('safe shared-edge overlaps coalesce without permitting genuine content cros
   assert.doesNotMatch(documentXml, /<wps:wsp>|<v:shape(?:\s|>)/);
 });
 
+test('page-locked DOCX coalesces transparent horizontal neighbours when their smaller overlap is vertical', async () => {
+  const adjacent = structuredClone(baseModel);
+  adjacent.page.header = null;
+  adjacent.page.footer = null;
+  adjacent.page.marginLeft = 0;
+  adjacent.page.marginRight = 0;
+  const source = structuredClone(baseModel.body.items.find((item) => item.type === 'Textbox'));
+  const textBox = (name, value, left) => ({
+    ...structuredClone(source),
+    name,
+    value,
+    paragraphs: [[value]],
+    left,
+    top: 0,
+    width: 80,
+    height: 18,
+    canGrow: false,
+    style: {
+      ...structuredClone(source.style),
+      backgroundColor: null,
+      border: { style: 'None', width: 0, color: '#000000' },
+      borders: Object.fromEntries(
+        ['top', 'right', 'bottom', 'left']
+          .map((side) => [side, { style: 'None', width: 0, color: '#000000' }]),
+      ),
+    },
+  });
+  // The 20pt horizontal overlap is visually empty. Its 18pt vertical overlap is smaller, so the
+  // previous one-axis heuristic tried an impossible vertical split and rejected the report.
+  adjacent.body.items = [textBox('LeftLabel', 'A', 0), textBox('RightValue', 'B', 60)];
+
+  const rendered = await renderEditableDocx(adjacent, request, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+  assert.match(documentXml, />A<\/w:t>/);
+  assert.match(documentXml, />B<\/w:t>/);
+});
+
+test('page-locked DOCX coalesces a centered icon into its declared right padding beside a label', async () => {
+  const iconFixture = Buffer.from(fixture.toString('utf8').replace(
+    '          <Tablix Name="SalesTable">',
+    `          <Textbox Name="CenteredTrendIcon">
+            <CanGrow>false</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>V</Value><Style><FontSize>20pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+            <Top>1.3in</Top><Left>5in</Left><Height>0.4774in</Height><Width>0.3063in</Width>
+            <Style><Border><Style>None</Style></Border><VerticalAlign>Top</VerticalAlign><PaddingLeft>2pt</PaddingLeft><PaddingRight>2pt</PaddingRight><PaddingTop>2pt</PaddingTop><PaddingBottom>2pt</PaddingBottom></Style>
+          </Textbox>
+          <Textbox Name="TrendLabel">
+            <CanGrow>false</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>Downward Trend</Value></TextRun></TextRuns><Style><TextAlign>Left</TextAlign></Style></Paragraph></Paragraphs>
+            <Top>1.3in</Top><Left>5.278in</Left><Height>0.4774in</Height><Width>1.142in</Width>
+            <Style><Border><Style>None</Style></Border><VerticalAlign>Middle</VerticalAlign><PaddingLeft>2pt</PaddingLeft><PaddingRight>2pt</PaddingRight><PaddingTop>2pt</PaddingTop><PaddingBottom>2pt</PaddingBottom></Style>
+          </Textbox>
+          <Tablix Name="SalesTable">`,
+  ));
+  // This is the generic construct in Risk Trend Report: a centered icon overlaps the transparent
+  // left padding of its left-aligned label. The icon's right padding preserves its text rectangle.
+  const adjacent = parseRdl(iconFixture);
+
+  const rendered = await renderEditableDocx(adjacent, request, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+  assert.match(documentXml, />V<\/w:t>/);
+  assert.match(documentXml, /Downward[\s\S]*Trend/);
+});
+
 test('coincident PDF edges remain coincident after the quarter-point Word grid conversion', async () => {
   const adjacent = structuredClone(baseModel);
   adjacent.page.header = null;
@@ -544,7 +608,7 @@ test('standalone page-band lines are traced and materialized as native Word bord
   );
 });
 
-test('footer divider next to a sub-point trace-grid row has one stable Word border owner', async () => {
+test('footer divider within tolerance of the next content edge avoids an empty sub-point Word row', async () => {
   const lined = structuredClone(baseModel);
   lined.page.footer = {
     height: 24,
@@ -579,8 +643,8 @@ test('footer divider next to a sub-point trace-grid row has one stable Word bord
     /<w:top w:val="single" w:color="000000" w:sz="8"\/>/g,
   ) || [];
   assert.ok(bottomBorders.length > 0, 'the row above must own the footer divider');
-  assert.equal(topBorders.length, 0, 'the 0.25pt row below must not duplicate the divider');
-  assert.match(footerXml, /<w:trHeight w:val="5" w:hRule="exact"\/>/);
+  assert.ok(topBorders.length > 0, 'the first content row must retain the same shared divider edge in Word');
+  assert.doesNotMatch(footerXml, /<w:trHeight w:val="5" w:hRule="exact"\/>/);
 });
 
 test('page-locked DOCX accepts line endpoints that meet editable content without crossing it', async () => {

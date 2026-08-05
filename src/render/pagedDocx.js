@@ -159,20 +159,35 @@ function primaryTextAlignment(item) {
 function horizontalTrimPreservesFlow(item, side, reduction) {
   if (reduction <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS) return true;
   const alignmentValue = primaryTextAlignment(item);
+  const remainingTrim = reduction - Number(item.padding?.[side] || 0);
+  // Reducing the padding on the same side by the trim amount keeps the physical text-content
+  // rectangle unchanged. That preserves left, center, and right alignment alike; the outer native
+  // cell merely discards an unpainted edge strip. Without this check a centered icon adjacent to a
+  // label is falsely rejected even when its declared side padding fully absorbs the overlap.
+  if (remainingTrim <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON) return true;
+  // Centered text moves by half of the remaining outer-edge trim. Permit that only while the
+  // resulting position remains inside the 0.5pt certification geometry tolerance.
+  if (alignmentValue === 'center'
+    && remainingTrim <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS * 2 + GEOMETRY_EPSILON) return true;
   if (side === 'right') return alignmentValue === 'left';
   if (alignmentValue === 'right') return true;
-  return alignmentValue === 'left' && Number(item.padding?.left || 0) + GEOMETRY_EPSILON >= reduction;
+  return false;
 }
 
 function verticalTrimPreservesFlow(item, side, reduction) {
   if (reduction <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS) return true;
   const vertical = String(item.verticalAlign || 'top').toLowerCase();
+  const remainingTrim = reduction - Number(item.padding?.[side] || 0);
+  // See horizontalTrimPreservesFlow: same-side padding compensation preserves the complete content
+  // rectangle, including middle-aligned text.
+  if (remainingTrim <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON) return true;
+  if (/middle|center/.test(vertical)
+    && remainingTrim <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS * 2 + GEOMETRY_EPSILON) return true;
   if (side === 'bottom') {
     return /top/.test(vertical)
-      || (/bottom/.test(vertical) && Number(item.padding?.bottom || 0) + GEOMETRY_EPSILON >= reduction);
+      || false;
   }
-  return /bottom/.test(vertical)
-    || (/top/.test(vertical) && Number(item.padding?.top || 0) + GEOMETRY_EPSILON >= reduction);
+  return /bottom/.test(vertical);
 }
 
 function adjustPadding(item, side, reduction) {
@@ -329,9 +344,16 @@ function coalesceShallowEdgeOverlaps(items) {
         - Math.max(left.x, right.x);
       const overlapHeight = Math.min(left.y + left.height, right.y + right.height)
         - Math.max(left.y, right.y);
-      const adjustment = overlapHeight <= overlapWidth
-        ? coalesceVerticalEdge(left, right)
-        : coalesceHorizontalEdge(left, right);
+      // The smaller intersection is only a heuristic, not a representation rule. Two boxes can
+      // have a smaller vertical intersection while still be horizontal neighbours (for example,
+      // a short label overlapping the full height of an adjacent value cell). In that case their
+      // text necessarily crosses a horizontal split, but their unpainted horizontal edge can be
+      // coalesced without moving either painted run. Try the likely axis first, then the other
+      // axis; each helper independently proves that its trim preserves the canonical paint.
+      const preferVertical = overlapHeight <= overlapWidth;
+      const adjustment = preferVertical
+        ? coalesceVerticalEdge(left, right) || coalesceHorizontalEdge(left, right)
+        : coalesceHorizontalEdge(left, right) || coalesceVerticalEdge(left, right);
       if (adjustment) adjustments.push(adjustment);
     }
   }
@@ -383,6 +405,18 @@ function moveCoalescedBorderLines(lines, adjustments) {
         }
       }
     }
+  }
+}
+
+function snapFooterDividersToContentEdges(lines, candidates) {
+  for (const line of lines) {
+    if (line.region !== 'footer' || Math.abs(line.height) > GEOMETRY_EPSILON) continue;
+    const nextContentEdge = candidates
+      .map((candidate) => candidate.y)
+      .filter((edge) => edge > line.y + GEOMETRY_EPSILON
+        && edge - line.y <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON)
+      .sort((left, right) => left - right)[0];
+    if (nextContentEdge !== undefined) line.y = nextContentEdge;
   }
 }
 
@@ -726,11 +760,14 @@ function lineOwnsCellSide(line, side) {
   const horizontal = Math.abs(line.height) <= GEOMETRY_EPSILON;
   const vertical = Math.abs(line.width) <= GEOMETRY_EPSILON;
   if (horizontal) {
-    // A standalone horizontal line normally separates two trace-grid rows. Writing it on both touching
-    // cell edges leaves Word to resolve two competing borders and is unreliable when either row is only a
-    // few twips high. Give the line to the cell above (its bottom edge). At the canvas origin there is no
-    // preceding row, so the first row owns it on its top edge instead.
-    return side === 'bottom' || (side === 'top' && Math.abs(line.y) <= GEOMETRY_EPSILON);
+    // A standalone horizontal line normally belongs to the cell above (or to the first row's top
+    // edge at the canvas origin), avoiding competing borders in ordinary page content.
+    // Word can suppress the bottom border of a thin, otherwise-empty leading footer row. A footer
+    // divider is a shared native table edge, so materialize the same border on both touching cells.
+    // Word resolves identical adjacent borders as one rule; this retains the canonical line at
+    // fractional footer coordinates without rasterizing or changing the PDF layout.
+    return side === 'bottom'
+      || (side === 'top' && (Math.abs(line.y) <= GEOMETRY_EPSILON || line.region === 'footer'));
   }
   if (vertical) {
     // Apply the equivalent single-owner rule horizontally: the cell to the left owns the line, except at
@@ -886,6 +923,11 @@ function preparePageGrid(page, {
   const decorators = normalized.filter((item) => item.kind === 'rectangle');
   const lines = normalized.filter((item) => item.kind === 'line');
   const candidates = normalized.filter((item) => ['textbox', 'tablixCell', 'image', 'chart'].includes(item.kind));
+  // A PDF footer divider may be deliberately offset by a sub-point spacer before the first footer
+  // content row. Word can discard a border on that empty spacer row. Move only to the immediately
+  // following traced content edge and only inside the 0.5pt certification tolerance, so the border
+  // is owned by a material Word row without changing canonical PDF geometry.
+  snapFooterDividersToContentEdges(lines, candidates);
   const demoted = new Set();
   for (const candidate of candidates) {
     if (!isEmptyCell(candidate)) continue;
