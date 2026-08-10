@@ -86,3 +86,27 @@ test('paragraph SpaceBefore, SpaceAfter, and LineHeight are normalized and rende
   assert.match(xml, /<w:spacing[^>]*w:line="400"/);
   assert.match(xml, /<w:spacing[^>]*w:lineRule="exact"/);
 });
+
+test('embedded TextRun newlines receive paragraph spacing once in canonical PDF and editable Word', async () => {
+  const model = parseRdl(paragraphRdl('Line 1\nLine 2', 'Constant'));
+  const title = model.body.items.find((item) => item.name === 'TitleBox');
+  const context = { parameters: request.parameters, globals: {}, fields: {} };
+  const text = textForItem(title, context);
+  assert.equal(text, 'Line 1\nLine 2');
+
+  const measurementDoc = new PDFDocument({ autoFirstPage: false });
+  measurementDoc.on('data', () => {});
+  measurementDoc.addPage();
+  const height = measureTextboxHeight(measurementDoc, config, title, context, text, title.width);
+  measurementDoc.end();
+  // 3pt SpaceBefore + two 20pt lines + one 10pt SpaceAfter. The defect charged SpaceAfter after both
+  // embedded lines and measured 63pt.
+  assert.ok(height >= 52.75 && height <= 53.25, `expected one paragraph spacing contribution, got ${height}`);
+
+  const docx = await renderEditableDocx(model, request, config);
+  const xml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
+  assert.match(xml, />Line<\/w:t>/);
+  assert.match(xml, />1<\/w:t>/);
+  assert.match(xml, />2<\/w:t>/);
+  assert.match(xml, /<w:br\/>/);
+});

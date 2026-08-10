@@ -74,7 +74,15 @@ export function styledSegmentsForText(item, context, requestedText) {
       fullText += text;
     }
     if (paragraphIndex < paragraphs.length - 1) {
-      segments.push({ text: '\n', style: paragraph.style || item.style, paragraphStyle: paragraph.style || item.style, paragraphIndex });
+      // Keep the semantic boundary between two RDL Paragraph nodes. Newlines that arrive inside a TextRun
+      // value are line breaks within that paragraph and must not receive Paragraph.SpaceAfter.
+      segments.push({
+        text: '\n',
+        style: paragraph.style || item.style,
+        paragraphStyle: paragraph.style || item.style,
+        paragraphIndex,
+        paragraphBreak: true,
+      });
       fullText += '\n';
     }
   }

@@ -372,7 +372,7 @@ function layoutStyledText(doc, config, item, context, text, width) {
       if (part === '') continue;
       if (part === '\n') {
         if (!line) line = startLine(segment.style, segment.paragraphStyle, segment.paragraphIndex);
-        finishLine(true);
+        finishLine(segment.paragraphBreak === true);
         continue;
       }
       const tokens = part.match(/[^\S\n]+|[^\s\n]+/g) || [];
@@ -381,6 +381,14 @@ function layoutStyledText(doc, config, item, context, text, width) {
   }
   // PDFKit ignores one trailing empty line. Preserve empty lines between paragraphs, but not a terminal one.
   if (line?.runs.length || lines.length === 0) finishLine(true);
+  else if (lines.length > 0 && !lines.at(-1).paragraphEnd) {
+    // A trailing TextRun newline does not create another visible line. Close its RDL paragraph once so
+    // SpaceAfter is retained exactly once instead of either being lost or charged per embedded newline.
+    const last = lines.at(-1);
+    last.paragraphEnd = true;
+    last.after = styleSize(last.paragraphStyle?.spaceAfter, context, 0);
+    last.height = last.before + last.contentHeight + last.after;
+  }
   return { lines, height: lines.reduce((sum, current) => sum + current.height, 0) };
 }
 
