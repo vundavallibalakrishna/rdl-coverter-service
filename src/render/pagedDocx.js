@@ -482,22 +482,48 @@ function linesForParagraphs(item, bottomPaddingTwips = 0) {
     children: [new TextRun({ text: '' })],
   })];
 
-  const groups = [];
+  const paragraphGroups = [];
   let current = [];
   for (const line of source) {
     current.push(line);
     if (line.paragraphEnd) {
-      groups.push(current);
+      paragraphGroups.push(current);
       current = [];
     }
   }
-  if (current.length > 0) groups.push(current);
+  if (current.length > 0) paragraphGroups.push(current);
+
+  const linePitchTwips = (line) => Math.max(1, pointsToTwips(Number(
+    line.contentHeight
+      ?? Math.max(0, Number(line.height || 0) - Number(line.before || 0) - Number(line.after || 0)),
+  ) || 0.05));
+
+  // Word applies one line pitch to every hard-broken line in a paragraph. A traced PDF paragraph can
+  // legitimately contain different physical line heights, for example a 10pt bold label on its first
+  // line followed by wrapped 9pt parameter text. Using the tallest traced line for the complete Word
+  // paragraph makes the fixed page-grid row too short even though the canonical lines fit. Split only
+  // when the physical pitch changes; equal-pitch lines remain one editable paragraph with native breaks.
+  const groups = [];
+  for (const paragraphGroup of paragraphGroups) {
+    let pitch = null;
+    let segment = [];
+    for (const line of paragraphGroup) {
+      const nextPitch = linePitchTwips(line);
+      if (segment.length > 0 && nextPitch !== pitch) {
+        groups.push({ lines: segment, linePitchTwips: pitch });
+        segment = [];
+      }
+      pitch = nextPitch;
+      segment.push(line);
+    }
+    if (segment.length > 0) groups.push({ lines: segment, linePitchTwips: pitch });
+  }
 
   return groups.map((group, groupIndex) => {
-    const first = group[0];
-    const last = group[group.length - 1];
+    const first = group.lines[0];
+    const last = group.lines[group.lines.length - 1];
     const runs = [];
-    group.forEach((line, lineIndex) => {
+    group.lines.forEach((line, lineIndex) => {
       const lineRuns = line.runs?.length ? line.runs : [{ text: '', font: {} }];
       lineRuns.forEach((run, runIndex) => {
         const font = run.font || {};
@@ -515,12 +541,6 @@ function linesForParagraphs(item, bottomPaddingTwips = 0) {
         }));
       });
     });
-    // Trace line.height includes SpaceBefore/SpaceAfter because PDF advances by the complete physical
-    // line box. Word models those margins independently on w:spacing, so feeding the total back as the
-    // line pitch would count them twice and make the DOCX taller than the canonical PDF.
-    const lineHeight = Math.max(...group.map((line) => Number(
-      line.contentHeight ?? Math.max(0, Number(line.height || 0) - Number(line.before || 0) - Number(line.after || 0)),
-    )), 0.05);
     return new Paragraph({
       alignment: alignment(first.alignment),
       spacing: {
@@ -530,7 +550,7 @@ function linesForParagraphs(item, bottomPaddingTwips = 0) {
           pointsToTwips(last.after || 0)
             + (groupIndex === groups.length - 1 ? bottomPaddingTwips : 0),
         ),
-        line: Math.max(1, pointsToTwips(lineHeight)),
+        line: group.linePitchTwips,
         lineRule: LineRuleType.EXACT,
       },
       children: runs.length > 0 ? runs : [new TextRun({ text: '' })],

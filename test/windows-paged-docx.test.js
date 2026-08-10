@@ -123,6 +123,60 @@ test('page-locked DOCX contains one native fixed page grid per PDF page and all 
   assert.equal(fontParts.length, 4);
 });
 
+test('page-locked DOCX preserves mixed PDF line pitches without inflating every wrapped Word line', async () => {
+  const mixed = structuredClone(baseModel);
+  mixed.page.header = null;
+  mixed.page.footer = null;
+  const item = structuredClone(mixed.body.items.find((candidate) => candidate.type === 'Textbox'));
+  const valueStyle = { ...item.style, fontSize: 9, fontWeight: 'Normal' };
+  item.top = 0;
+  item.left = 0;
+  item.width = 180;
+  item.height = 18;
+  item.value = 'Division : alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau';
+  item.style = valueStyle;
+  item.paragraphs = [[
+    {
+      value: 'Division : ',
+      evaluationMode: 'Auto',
+      markupType: 'None',
+      style: { ...valueStyle, fontSize: 10, fontWeight: 'Bold' },
+    },
+    {
+      value: 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau',
+      evaluationMode: 'Auto',
+      markupType: 'None',
+      style: valueStyle,
+    },
+  ]];
+  item.paragraphStyles = [{ ...valueStyle, spaceBefore: 0, spaceAfter: 0 }];
+  mixed.body.items = [item];
+
+  const mixedRequest = { outputFileName: 'mixed-word-line-pitch', parameters: {}, datasets: {} };
+  const canonical = await renderPdf(mixed, mixedRequest, config, { captureLayoutTrace: true });
+  const traced = canonical.layoutTrace.pages[0].items.find((candidate) => candidate.text?.startsWith('Division'));
+  assert.ok(traced);
+  assert.ok(traced.lines.length >= 3);
+  const tracedPitches = traced.lines.map((line) => Math.max(1, Math.round(line.contentHeight * 20)));
+  assert.ok(new Set(tracedPitches).size >= 2, 'fixture must contain physically different line pitches');
+
+  const rendered = await renderEditableDocx(mixed, mixedRequest, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+  const textParagraphs = [...documentXml.matchAll(/<w:p(?:\s[^>]*)?>([\s\S]*?)<\/w:p>/g)]
+    .map((match) => match[1])
+    .filter((paragraph) => /<w:t(?:\s[^>]*)?>[^<]+<\/w:t>/.test(paragraph));
+
+  assert.equal(textParagraphs.length, new Set(tracedPitches).size);
+  for (const pitch of new Set(tracedPitches)) {
+    assert.ok(textParagraphs.some((paragraph) => new RegExp(`<w:spacing\\b[^>]*w:line="${pitch}"`).test(paragraph)));
+  }
+  const explicitBoundaries = (textParagraphs.length - 1)
+    + textParagraphs.reduce((total, paragraph) => total + (paragraph.match(/<w:br\/>/g) || []).length, 0);
+  assert.equal(explicitBoundaries, traced.lines.length - 1, 'every canonical wrap point must remain explicit');
+  assert.equal(rendered.pageCount, canonical.pageCount);
+});
+
 test('section anchors and footer terminators cannot snap page-locked geometry to Word’s document grid', async () => {
   const paged = structuredClone(baseModel);
   const secondPage = structuredClone(paged.body.items.find((item) => item.type === 'Textbox'));
