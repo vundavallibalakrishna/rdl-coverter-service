@@ -82,6 +82,40 @@ function rectangleWrappedSymbolRdl() {
   </ReportSection></ReportSections></Report>`;
 }
 
+function nestedGrowingFreeformRdl() {
+  const purpose = 'Purpose content '.repeat(28);
+  const background = 'Background content '.repeat(34);
+  return { purpose, background, rdl: `<?xml version="1.0"?><Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <ReportSections><ReportSection><Body><ReportItems>
+    <Rectangle Name="Outer"><ReportItems>
+      <Textbox Name="Purpose"><CanGrow>true</CanGrow><KeepTogether>true</KeepTogether><Paragraphs><Paragraph><TextRuns><TextRun>
+        <Value>${purpose}</Value><Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize></Style>
+      </TextRun></TextRuns><Style><LineHeight>14pt</LineHeight></Style></Paragraph></Paragraphs>
+        <Top>0in</Top><Left>0in</Left><Height>0.2in</Height><Width>3.5in</Width><Style><PaddingLeft>2pt</PaddingLeft><PaddingRight>2pt</PaddingRight><PaddingTop>2pt</PaddingTop><PaddingBottom>2pt</PaddingBottom></Style>
+      </Textbox>
+      <Rectangle Name="Nested"><ReportItems><Textbox Name="Background"><CanGrow>true</CanGrow><KeepTogether>true</KeepTogether><Paragraphs><Paragraph><TextRuns><TextRun>
+        <Value>${background}</Value><Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize></Style>
+      </TextRun></TextRuns><Style><LineHeight>14pt</LineHeight></Style></Paragraph></Paragraphs>
+        <Top>0in</Top><Left>0in</Left><Height>0.2in</Height><Width>3.5in</Width><Style><PaddingLeft>2pt</PaddingLeft><PaddingRight>2pt</PaddingRight><PaddingTop>2pt</PaddingTop><PaddingBottom>2pt</PaddingBottom></Style>
+      </Textbox></ReportItems><Top>0.3in</Top><Left>0in</Left><Height>0.3in</Height><Width>3.5in</Width><Style/></Rectangle>
+    </ReportItems><Top>0in</Top><Left>0in</Left><Height>0.6in</Height><Width>3.5in</Width><Style/></Rectangle>
+    <Textbox Name="Following"><CanGrow>false</CanGrow><Paragraphs><Paragraph><TextRuns><TextRun><Value>FOLLOWING CONTENT</Value></TextRun></TextRuns></Paragraph></Paragraphs>
+      <Top>0.8in</Top><Left>0in</Left><Height>0.2in</Height><Width>3.5in</Width><Style/>
+    </Textbox>
+    <Rectangle Name="MixedContainer"><ReportItems><Tablix Name="StaticTable"><TablixBody>
+      <TablixColumns><TablixColumn><Width>1in</Width></TablixColumn></TablixColumns>
+      <TablixRows><TablixRow><Height>0.2in</Height><TablixCells><TablixCell><CellContents>
+        <Textbox Name="StaticCell"><Paragraphs><Paragraph><TextRuns><TextRun><Value>STATIC</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style/></Textbox>
+      </CellContents></TablixCell></TablixCells></TablixRow></TablixRows></TablixBody>
+      <TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
+      <TablixRowHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixRowHierarchy>
+      <Top>0in</Top><Left>0in</Left><Height>0.2in</Height><Width>1in</Width><Style/>
+    </Tablix></ReportItems><Top>1.2in</Top><Left>0in</Left><Height>0.2in</Height><Width>1in</Width><Style/></Rectangle>
+  </ReportItems><Height>2in</Height><Style/></Body><Width>3.5in</Width>
+  <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.5in</LeftMargin><RightMargin>0.5in</RightMargin><TopMargin>0.5in</TopMargin><BottomMargin>0.5in</BottomMargin></Page>
+  </ReportSection></ReportSections></Report>` };
+}
+
 function chartReportRdl() {
   const chart = (name, left, title) => `<Chart Name="${name}">
     <ChartCategoryHierarchy><ChartMembers><ChartMember><Group Name="${name}Categories"><GroupExpressions>
@@ -242,6 +276,29 @@ test('REPORT mode honors CanGrow for wrapped cell text and preserves a fixed Can
   assert.ok(fixedCell);
   assert.equal(fixedCell.alignment?.wrapText, true);
   assert.equal(fixedSheet.getRow(fixedCell.row).height, detailRow.height);
+});
+
+test('REPORT mode recursively grows nested free-form textboxes and displaces later same-lane content', async () => {
+  const fixture = nestedGrowingFreeformRdl();
+  const ws = await load((await renderExcel(
+    parseRdl(fixture.rdl),
+    { outputFileName: 'Nested CanGrow', parameters: {}, datasets: {} },
+    config,
+    null,
+  )).buffer);
+  const purpose = findCell(ws, fixture.purpose);
+  const background = findCell(ws, fixture.background);
+  const following = findCell(ws, 'FOLLOWING CONTENT');
+  assert.ok(purpose && background && following);
+  assert.equal(purpose.alignment?.wrapText, true);
+  assert.equal(background.alignment?.wrapText, true);
+  assert.ok(background.row > purpose.row, 'the nested background must follow the grown purpose block');
+  assert.ok(following.row > background.row, 'later same-lane content must follow the grown nested rectangle');
+  assert.ok(
+    Array.from({ length: following.row - purpose.row }, (_, index) => ws.getRow(purpose.row + index).height || 0)
+      .reduce((sum, height) => sum + height, 0) > 150,
+    'the native Excel rows must reserve the measured wrapped height instead of the declared one-line height',
+  );
 });
 
 test('REPORT mode gives long wrapped list text Excel-width and border clearance', async () => {

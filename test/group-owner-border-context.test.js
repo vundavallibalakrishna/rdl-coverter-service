@@ -83,7 +83,7 @@ test('a row-spanned group owner keeps its first-row context for conditional bord
   assert.equal(styleColor(textbox.style.borders.top.color, context), '#123456');
 });
 
-test('matching row-boundary neighbours close a vertically merged owner whose own top is None', async () => {
+test('matching neighbour borders do not override a vertically merged owner whose own top is None', async () => {
   const bridgedRequest = {
     ...request,
     datasets: { D: request.datasets.D.map((row) => ({ ...row, Number: '002' })) },
@@ -92,11 +92,17 @@ test('matching row-boundary neighbours close a vertically merged owner whose own
   const tracedOwner = pdf.layoutTrace.pages[0].items.find((item) => (
     item.kind === 'tablixCell' && item.text === '6' && item.rowSpan === 2
   ));
-  assert.deepEqual(tracedOwner?.borders?.top, { style: 'Solid', width: 1, color: '#000000' });
+  assert.equal(tracedOwner?.borders?.top, null);
 
   const docx = await renderEditableDocx(model, bridgedRequest, config);
   const documentXml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
-  assert.match(documentXml, /<w:top w:val="single" w:color="000000" w:sz="8"\/>/);
+  const ratingTextIndex = documentXml.indexOf('>6</w:t>');
+  assert.ok(ratingTextIndex >= 0);
+  const ratingCellXml = documentXml.slice(
+    documentXml.lastIndexOf('<w:tc>', ratingTextIndex),
+    documentXml.indexOf('</w:tc>', ratingTextIndex) + '</w:tc>'.length,
+  );
+  assert.match(ratingCellXml, /<w:top w:val="none" w:color="auto" w:sz="0"\/>/);
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load((await renderExcel(model, bridgedRequest, config, null)).buffer);
@@ -105,8 +111,7 @@ test('matching row-boundary neighbours close a vertically merged owner whose own
     if ((cell.value === 6 || cell.value === '6') && cell.fill?.fgColor?.argb === 'FFFFFF00') ratingCell = cell;
   }));
   assert.ok(ratingCell);
-  assert.equal(ratingCell.border?.top?.style, 'thin');
-  assert.equal(ratingCell.border?.top?.color?.argb, 'FF000000');
+  assert.equal(ratingCell.border?.top, undefined);
 });
 
 test('PDF, editable DOCX, and XLSX preserve the conditional top border of a grouped owner cell', async () => {

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, matchingMergedRowBoundary, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -831,9 +831,47 @@ async function renderFreeformBand({
   xGrid,
   startRow,
   merges,
+  measureDoc,
 }) {
-  const yGrid = freeformRows(worksheet, items, height, startRow);
-  for (const item of [...items].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
+  const resolved = items.map((item, sourceIndex) => {
+    const layout = resolveExcelFreeformLayout(item, context, config, measureDoc);
+    return {
+      item: layout.item,
+      occupiedHeight: layout.occupiedHeight,
+      sourceIndex,
+      designTop: item.top || 0,
+      designHeight: item.height || 0,
+      resolvedTop: item.top || 0,
+    };
+  });
+  const layoutOrder = [...resolved].sort((left, right) => (
+    left.designTop - right.designTop
+    || (left.item.left || 0) - (right.item.left || 0)
+    || left.sourceIndex - right.sourceIndex
+  ));
+  for (const [index, item] of layoutOrder.entries()) {
+    for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
+      const previous = layoutOrder[previousIndex];
+      const previousDesignBottom = point(previous.designTop + previous.designHeight);
+      if (previousDesignBottom > item.designTop + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      if (!horizontalDesignOverlap(previous.item, item.item)) continue;
+      const originalGap = Math.max(0, item.designTop - previousDesignBottom);
+      item.resolvedTop = Math.max(
+        item.resolvedTop,
+        point(previous.resolvedTop + previous.occupiedHeight + originalGap),
+      );
+    }
+    item.item = { ...item.item, top: item.resolvedTop, height: item.occupiedHeight };
+  }
+  const resolvedItems = resolved
+    .sort((left, right) => left.sourceIndex - right.sourceIndex)
+    .map((entry) => entry.item);
+  const occupiedHeight = Math.max(
+    height,
+    ...resolved.map((entry) => point(entry.resolvedTop + entry.occupiedHeight)),
+  );
+  const yGrid = freeformRows(worksheet, resolvedItems, occupiedHeight, startRow);
+  for (const item of [...resolvedItems].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
     await renderFreeformItem({
       workbook,
       worksheet,
@@ -886,13 +924,6 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
       : undefined);
   const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
     || (above && resolvedOwnerBorder(above, 'bottom'))
-    || matchingMergedRowBoundary(
-      owner,
-      left,
-      right,
-      resolvedOwnerBorder,
-      (border) => `${border.style || ''}|${border.color?.argb || ''}`,
-    )
     || undefined;
   return {
     top,
@@ -1003,6 +1034,68 @@ function excelCanGrowTextboxHeight(measureDoc, config, textbox, context, display
     + styleSize(style?.paddingTop, context, 2)
     + styleSize(style?.paddingBottom, context, 2)
     + borderClearance;
+}
+
+// Free-form report content is frequently nested in one or more borderless rectangles. Excel does not
+// auto-fit merged cells, so measuring only top-level textboxes leaves a nested CanGrow textbox at its
+// small design-time height and clips its wrapped value. Resolve each container recursively: grow textboxes
+// from the shared PDF metrics, displace only later items in the same horizontal lane, and retain the
+// rectangle's declared trailing space. The resulting item tree remains coordinate based and editable.
+function resolveExcelFreeformLayout(item, context, config, measureDoc) {
+  const declaredHeight = Math.max(0, item.height || 0);
+  if (item.type === 'Textbox') {
+    const display = cellString(textForItem(item, context));
+    const occupiedHeight = Math.max(
+      2,
+      declaredHeight || DEFAULT_ROW_POINTS,
+      excelCanGrowTextboxHeight(measureDoc, config, item, context, display, item.width || 0, item.style || {}),
+    );
+    return { item: { ...item, height: occupiedHeight }, occupiedHeight };
+  }
+  if (item.type !== 'Rectangle' || !(item.items || []).length) {
+    return { item, occupiedHeight: Math.max(2, declaredHeight || DEFAULT_ROW_POINTS) };
+  }
+
+  const children = item.items.map((child, sourceIndex) => {
+    const resolved = resolveExcelFreeformLayout(child, context, config, measureDoc);
+    return {
+      ...resolved,
+      sourceIndex,
+      designTop: child.top || 0,
+      designHeight: child.height || 0,
+      resolvedTop: child.top || 0,
+    };
+  });
+  const layoutOrder = [...children].sort((left, right) => (
+    left.designTop - right.designTop
+    || (left.item.left || 0) - (right.item.left || 0)
+    || left.sourceIndex - right.sourceIndex
+  ));
+  for (const [index, child] of layoutOrder.entries()) {
+    for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
+      const previous = layoutOrder[previousIndex];
+      const previousDesignBottom = point(previous.designTop + previous.designHeight);
+      if (previousDesignBottom > child.designTop + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      if (!horizontalDesignOverlap(previous.item, child.item)) continue;
+      const originalGap = Math.max(0, child.designTop - previousDesignBottom);
+      child.resolvedTop = Math.max(
+        child.resolvedTop,
+        point(previous.resolvedTop + previous.occupiedHeight + originalGap),
+      );
+    }
+    child.item = { ...child.item, top: child.resolvedTop, height: child.occupiedHeight };
+  }
+  const designBottom = Math.max(0, ...children.map((child) => child.designTop + child.designHeight));
+  const resolvedBottom = Math.max(0, ...children.map((child) => child.resolvedTop + child.occupiedHeight));
+  const trailingSpace = Math.max(0, declaredHeight - designBottom);
+  const occupiedHeight = Math.max(2, declaredHeight, point(resolvedBottom + trailingSpace));
+  const resolvedBySource = [...children]
+    .sort((left, right) => left.sourceIndex - right.sourceIndex)
+    .map((child) => child.item);
+  return {
+    item: { ...item, items: resolvedBySource, height: occupiedHeight },
+    occupiedHeight,
+  };
 }
 
 function renderReportTablix({ worksheet, model, item, request, globals, config, xGrid, startRow, merges, tablixCache, measureDoc }) {
@@ -1449,14 +1542,12 @@ async function renderCoordinateScheduledSection({
   for (const item of section) {
     const designTop = point((item.top || 0) - sectionOriginTop);
     if (item.type !== 'Tablix') {
-      const display = item.type === 'Textbox' ? cellString(textForItem(item, context)) : '';
-      const grownTextboxHeight = item.type === 'Textbox'
-        ? excelCanGrowTextboxHeight(measureDoc, config, item, context, display, item.width || 0, item.style || {})
-        : 0;
+      const resolved = resolveExcelFreeformLayout(item, context, config, measureDoc);
       plans.push({
-        item,
+        item: resolved.item,
         designTop,
-        occupiedHeight: Math.max(2, item.height || DEFAULT_ROW_POINTS, grownTextboxHeight),
+        designHeight: item.height || 0,
+        occupiedHeight: resolved.occupiedHeight,
         resolvedTop: designTop,
       });
       continue;
@@ -1480,6 +1571,7 @@ async function renderCoordinateScheduledSection({
     plans.push({
       item,
       designTop,
+      designHeight: item.height || 0,
       worksheet: planningSheet,
       region,
       localBoundaries,
@@ -1501,7 +1593,7 @@ async function renderCoordinateScheduledSection({
     const designTop = plan.designTop;
     for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
       const previous = layoutOrder[previousIndex];
-      const previousDesignBottom = point(previous.designTop + (previous.item.height || 0));
+      const previousDesignBottom = point(previous.designTop + previous.designHeight);
       if (previousDesignBottom > designTop + COINCIDENT_EDGE_TOLERANCE_PT) continue;
       if (!horizontalDesignOverlap(previous.item, plan.item)) continue;
       const originalGap = Math.max(0, designTop - previousDesignBottom);
@@ -1538,7 +1630,7 @@ async function renderCoordinateScheduledSection({
       item: {
         ...plan.item,
         top: plan.resolvedTop,
-        height: plan.item.type === 'Textbox' ? plan.occupiedHeight : plan.item.height,
+        height: plan.occupiedHeight,
       },
       context,
       config,
@@ -1679,7 +1771,7 @@ async function renderReportExcel(model, request, config, tempDir) {
     if (model.page.header?.items?.length) {
       headerBandRows = await renderFreeformBand({
         workbook, worksheet, model, items: model.page.header.items, height: model.page.header.height,
-        context: sectionContext, config, tempDir, chartCounter, xGrid, startRow: cursor, merges,
+        context: sectionContext, config, tempDir, chartCounter, xGrid, startRow: cursor, merges, measureDoc,
       });
       cursor += headerBandRows;
     }
@@ -1728,6 +1820,7 @@ async function renderReportExcel(model, request, config, tempDir) {
             xGrid,
             startRow: cursor,
             merges,
+            measureDoc,
           });
           cursor += consumed;
           return;
@@ -1801,6 +1894,7 @@ async function renderReportExcel(model, request, config, tempDir) {
         xGrid,
         startRow: cursor,
         merges,
+        measureDoc,
       });
       cursor += consumed;
     };
@@ -1856,6 +1950,7 @@ async function renderReportExcel(model, request, config, tempDir) {
           xGrid,
           startRow: cursor,
           merges,
+          measureDoc,
         });
         cursor += consumed;
         previousDesignBottom = Math.max(previousDesignBottom ?? 0, peerBottom);
