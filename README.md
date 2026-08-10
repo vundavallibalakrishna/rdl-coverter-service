@@ -402,6 +402,46 @@ Environment variables (see `.env.example`). Library callers can pass the same va
 | `LOG_LEVEL` | `info` | Fastify log level. |
 | `RDL_SAMPLES_DIR` | `<repo>/tmp` | Dev only. Where client samples live for tests and smoke scripts. See [Client samples](#client-samples). |
 
+### Production launchers
+
+The repository includes production launchers with strict fonts, bounded input/XML limits, full console
+telemetry, one concurrent render, a five-minute render deadline, and workload-scaled worker heaps from
+512 MB up to 8192 MB. Both launchers automatically load `.env.production` from the repository root when
+that file exists:
+
+```bash
+./start-production.sh
+```
+
+```bat
+start-production.bat
+```
+
+Create it from the tracked template, then replace the host-specific paths and large-report settings:
+
+```bash
+cp .env.example .env.production
+```
+
+```bat
+copy .env.example .env.production
+```
+
+Configuration precedence is: existing process/service environment, `.env.production`, then launcher
+defaults. Operators can therefore use IIS/systemd/Docker settings as authoritative overrides without
+editing the launcher or environment file. Set `RDL_ENV_FILE` to use a file in another location. On Windows,
+for example:
+
+```bat
+set "RDL_FONT_DIR=C:\rdl-fonts"
+set "RDL_PDFTOPPM_PATH=C:\poppler\Library\bin\pdftoppm.exe"
+set "RDL_WORKER_MEMORY_MAX_MB=12288"
+start-production.bat
+```
+
+The main server intentionally starts without `--max-old-space-size`: every isolated render worker receives
+its own workload-estimated heap bound from `RDL_WORKER_MEMORY_MB` and `RDL_WORKER_MEMORY_MAX_MB`.
+
 ### Render telemetry
 
 At the default `LOG_LEVEL=info`, every render emits bounded JSON phase events to stdout with

@@ -659,6 +659,14 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const layoutItem = item.hasColumnGroups ? { ...item, columns, width: columns.reduce((sum, width) => sum + width, 0) } : item;
   const { columnsPt: columnWidths, totalPt: totalWidth } = resolveGridColumns(layoutItem);
   const headers = rows.filter((row) => row.isHeader);
+  // Initial placement concerns only the leading contiguous header block. Other repeatable rows can be
+  // meaningful to continuation replay in grouped tablixes, so preserve the renderer's established
+  // `headers` set and use this narrower block only for the keep-with-first-body preflight below.
+  const leadingHeaders = [];
+  for (const row of rows) {
+    if (!row.isHeader) break;
+    leadingHeaders.push(row);
+  }
   const placements = computeCellPlacements(rows, columnWidths.length);
   const rowIndexes = new Map(rows.map((row, index) => [row, index]));
   const outerContext = { parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets, fields: {} };
@@ -1323,6 +1331,15 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
   };
 
+  const startFreshTablePage = () => {
+    // No row from this tablix has been drawn yet, so there is no table fragment to close and no header to
+    // replay. This is an initial-placement page move, not a continuation. Leaving `firstFragment` intact
+    // also ensures the outer top border is emitted on the page where the table actually begins.
+    addPage();
+    y = addPage.bodyTop;
+    fragmentStartY = y;
+  };
+
   const drawRow = (row) => {
     // A row-group page break starts the group's first row on a fresh page (unless we're already at the
     // top of a page). Reuses the continuation-page machinery so repeated headers redraw.
@@ -1467,6 +1484,22 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   };
 
   const drawingStartedAt = performance.now();
+  if (leadingHeaders.length > 0 && y > addPage.bodyTop + 0.5) {
+    const headerHeight = leadingHeaders.reduce((total, row) => total + measureRow(row), 0);
+    const firstBodyRow = rows[leadingHeaders.length] || null;
+    const firstBodyHeight = firstBodyRow ? measureRow(firstBodyRow) : 0;
+    const freshPageHeight = pageBottom - addPage.bodyTop;
+    // SSRS keeps a leading header with the first body row when the complete unit can fit on a fresh page.
+    // If the first body row is intrinsically oversized, keep only the header block intact and allow the
+    // existing row-splitting path to handle that body row after it starts.
+    const preferredInitialHeight = headerHeight + firstBodyHeight;
+    const requiredInitialHeight = firstBodyRow && preferredInitialHeight <= freshPageHeight + 0.5
+      ? preferredInitialHeight
+      : headerHeight;
+    if (y + requiredInitialHeight > pageBottom + 0.5 && requiredInitialHeight <= freshPageHeight + 0.5) {
+      startFreshTablePage();
+    }
+  }
   for (const row of rows) drawRow(row);
   for (const span of openSpans) drawSpanSegment(span, y); // flush any spans still open at the tablix end
   openSpans = [];
