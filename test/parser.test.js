@@ -6,7 +6,7 @@ import { materializeTablixRows } from '../src/rdl/validation.js';
 import { computeCellPlacements } from '../src/render/tableGrid.js';
 import { rdl2016SchemaCatalogue } from '../src/rdl/capabilities.js';
 import { evaluateExpression } from '../src/rdl/expression.js';
-import { prepareTablixData, validateRenderInput } from '../src/rdl/validation.js';
+import { prepareTablixData, resolveParameterLabels, validateRenderInput } from '../src/rdl/validation.js';
 import { toPoints } from '../src/units.js';
 import { MISSING_SAMPLES, hasSamples, samplePath } from '../scripts/lib/samples.js';
 
@@ -143,6 +143,20 @@ test('requires rendering datasets and exact data fields but not parameter lookup
   assert.throws(() => validateRenderInput(model, { ...request, datasets: { Sales: [{ Name: 'North' }] } }, { maxRows: 100 }), (error) => error.code === 'FIELD_MISSING');
   const defaults = validateRenderInput(model, { parameters: { Choice: 'A' }, datasets: request.datasets }, { maxRows: 100 });
   assert.equal(defaults.parameters.Title, 'Sales');
+});
+
+test('resolves Parameters!Name.Label from static and dataset-backed valid values', () => {
+  const labels = resolveParameterLabels([
+    { name: 'Division', multiValue: true, lookupDataset: 'Divisions', lookupValueField: 'Id', lookupLabelField: 'Name', staticValidValues: [] },
+    { name: 'Mode', multiValue: false, staticValidValues: [{ value: 'S', label: 'Summary' }] },
+  ], { Division: ['403', '326'], Mode: 'S' }, {
+    Divisions: [{ Id: 403, Name: 'Company Secretariat' }, { Id: 326, Name: 'CoSec' }],
+  });
+  const parameters = { Division: ['403', '326'], Mode: 'S' };
+  Object.defineProperty(parameters, '__rdlParameterLabels', { value: labels, enumerable: false });
+  assert.deepEqual(evaluateExpression('=Parameters!Division.Label', { parameters }), ['Company Secretariat', 'CoSec']);
+  assert.equal(evaluateExpression('=Parameters!Mode.Label', { parameters }), 'Summary');
+  assert.deepEqual(evaluateExpression('=Parameters!Division.Value', { parameters }), ['403', '326']);
 });
 
 test('applies tablix filters and stable multi-column sorting to exact DataField rows', () => {

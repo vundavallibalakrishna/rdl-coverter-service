@@ -206,6 +206,9 @@ export function resolveBundledSubreports(model, request, config) {
         throw new ServiceError('RDL_INVALID', `Dataset rows exceed the ${config.maxRows} row limit`, 413);
       }
       childRequest.parameters = validation.parameters;
+      Object.defineProperty(childRequest.parameters, '__rdlParameterLabels', {
+        value: validation.parameterLabels || {}, enumerable: false, configurable: true,
+      });
       const signature = parameterSignature(child.parameters, childRequest.parameters);
       if (signatures.has(signature)) {
         throw new ServiceError(

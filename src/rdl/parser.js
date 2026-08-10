@@ -462,8 +462,9 @@ function parseItem(type, value, defaultFontFamily) {
 
 function parseParameters(report) {
   return asArray(report.ReportParameters?.ReportParameter).map((parameter) => {
+    const validValuesReference = parameter.ValidValues?.DataSetReference;
     const validReference = firstDefined(
-      parameter.ValidValues?.DataSetReference,
+      validValuesReference,
       parameter.DefaultValue?.DataSetReference,
     );
     return {
@@ -476,6 +477,12 @@ function parseParameters(report) {
       hidden: parseBoolean(parameter.Hidden),
       defaultValues: asArray(parameter.DefaultValue?.Values?.Value).map(textValue),
       lookupDataset: validReference ? textValue(validReference.DataSetName) : null,
+      lookupValueField: validValuesReference ? textValue(validValuesReference.ValueField) : null,
+      lookupLabelField: validValuesReference ? textValue(validValuesReference.LabelField) : null,
+      staticValidValues: asArray(parameter.ValidValues?.ParameterValues?.ParameterValue).map((entry) => ({
+        value: textValue(entry.Value),
+        label: textValue(entry.Label, textValue(entry.Value)),
+      })),
     };
   });
 }

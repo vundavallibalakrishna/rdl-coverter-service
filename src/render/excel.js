@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellText, cellTextbox, color, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -134,7 +134,7 @@ function writeTablix(worksheet, model, item, request, globals, startRow, columnM
       // Conflating the two drops paragraph/run formatting (font, size, colour and alignment) from wrapped
       // symbols and labels even though PDF correctly renders the inner textbox.
       const style = textbox?.style || item.style;
-      const borderStyle = (cell.containerWrapped ? item.style : textbox?.style) || item.style;
+      const borderStyle = cellBorderStyle(cell, item);
       const context = { fields: row.fields, parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets };
       const target = worksheet.getCell(excelRowNumber, columnIndex + 1);
       const { value, numFmt } = excelCellValue(cell, context);
@@ -159,7 +159,7 @@ function writeTablix(worksheet, model, item, request, globals, startRow, columnM
         horizontal: /center/i.test(hAlign) ? 'center' : /right/i.test(hAlign) ? 'right' : /justify/i.test(hAlign) ? 'justify' : 'left',
         wrapText: true,
       };
-      const borders = borderStyle.borders || {};
+      const borders = borderStyle?.borders || {};
       target.border = {
         top: excelBorderSide(borders.top, context),
         bottom: excelBorderSide(borders.bottom, context),
@@ -605,18 +605,45 @@ function applyFillFontAlignment(cell, style, context) {
   };
 }
 
-function applyRegionStyle(worksheet, range, style, context) {
+function applyRegionStyle(worksheet, range, style, context, { includeBorders = true } = {}) {
   const borders = style?.borders || {};
   for (let row = range.startRow; row <= range.endRow; row += 1) {
     for (let column = range.startCol; column <= range.endCol; column += 1) {
       const cell = worksheet.getCell(row, column);
       applyFillFontAlignment(cell, style, context);
+      if (!includeBorders) continue;
       cell.border = {
         top: row === range.startRow ? excelBorderSide(borders.top, context) : undefined,
         bottom: row === range.endRow ? excelBorderSide(borders.bottom, context) : undefined,
         left: column === range.startCol ? excelBorderSide(borders.left, context) : undefined,
         right: column === range.endCol ? excelBorderSide(borders.right, context) : undefined,
       };
+    }
+  }
+}
+
+// Distributes one logical cell's RESOLVED edges around the perimeter of the physical Excel region it
+// occupies. A cell hosting a nested data region cannot be merged (the child grid needs the individual
+// cells to place its own rows), so writing all four sides onto the anchor cell drew the cell's bottom and
+// right rules across its FIRST physical row — a horizontal line through the middle of a tall cell that
+// SSRS closes only at its outer edge. Merged cells keep taking the border from their anchor, which is how
+// Excel renders a merged range.
+function applyRegionBorder(worksheet, range, border = {}) {
+  const onPerimeter = {
+    top: (row) => row === range.startRow,
+    bottom: (row) => row === range.endRow,
+    left: (row, column) => column === range.startCol,
+    right: (row, column) => column === range.endCol,
+  };
+  for (let row = range.startRow; row <= range.endRow; row += 1) {
+    for (let column = range.startCol; column <= range.endCol; column += 1) {
+      const cell = worksheet.getCell(row, column);
+      // Add the enclosing edges; never clear what the child grid already drew in this cell.
+      const merged = { ...(cell.border || {}) };
+      for (const side of ['top', 'bottom', 'left', 'right']) {
+        if (border[side] && onPerimeter[side](row, column)) merged[side] = border[side];
+      }
+      cell.border = merged;
     }
   }
 }
@@ -818,13 +845,15 @@ function cellStyle(item, cell, context) {
   return {
     textbox,
     style: textbox?.style || item.style,
-    borderStyle: (cell.containerWrapped ? item.style : textbox?.style) || item.style,
+    borderStyle: cellBorderStyle(cell, item),
     context,
   };
 }
 
 function resolvedOwnerBorder(owner, side) {
-  const border = (owner.borderStyle || owner.style)?.borders?.[side];
+  // borderStyle is the resolved authority and may be deliberately null when the cell's only content is
+  // hidden. Falling back to the content style there would resurrect the tablix border this resolves away.
+  const border = owner.borderStyle?.borders?.[side];
   if (!border || /^none$/i.test(String(styleValue(border.style, owner.context, 'None')))) return null;
   return excelBorderSide(border, owner.context);
 }
@@ -1222,11 +1251,15 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
       if (numFmt) target.numFmt = numFmt;
       applyFillFontAlignment(target, owner.style || {}, owner.context);
-      target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
       if (hasNested) {
-        applyRegionStyle(worksheet, range, owner.style || {}, owner.context);
-        target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+        applyRegionStyle(worksheet, range, owner.style || {}, owner.context, { includeBorders: false });
         for (const nested of owner.cell.nestedTablixes || []) renderNested(nested, left, rowIndex);
+        // The child grid writes its own cells inside this region, so the enclosing cell's box goes on last
+        // and only on the perimeter: applied first it would be overwritten by the child's first row, and
+        // applied to the anchor cell it would draw this cell's bottom rule across its top physical row.
+        applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
+      } else {
+        target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
       }
       columnIndex += span;
     }
