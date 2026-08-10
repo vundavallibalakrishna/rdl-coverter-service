@@ -19,6 +19,7 @@ const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
 const EXCEL_LAYOUT_DPI = 96;
 const EXCEL_MAX_DIGIT_WIDTH_PX = 7;
 const EXCEL_CELL_PADDING_PX = 5;
+const EXCEL_TEXT_CLEARANCE_PT = 2;
 // OOXML stores column widths in units derived from the workbook's maximum digit width. Excel then rounds
 // those widths again for the active viewer/font metrics. Reserving one standard 7-pixel digit cell during
 // measurement covers that character-unit conversion without changing the RDL column proportions.
@@ -995,33 +996,43 @@ function coalesceBorderlessDuplicateOwners(gridOwners, owners) {
 
 function excelCanGrowTextboxHeight(measureDoc, config, textbox, context, display, width, style) {
   if (!textbox?.canGrow || !display) return 0;
-  const contentHeight = measureTextboxHeight(measureDoc, config, textbox, context, display, width);
-  const firstVisibleCharacter = Array.from(String(display)).find((character) => !/\s/u.test(character)) || 'M';
-  const singleLineHeight = measureTextboxHeight(
-    measureDoc,
-    config,
-    textbox,
-    context,
-    firstVisibleCharacter,
-    width,
-  );
-  // PDF owns exact line breaking, while Excel independently reflows wrapped text using character-based
-  // column widths. A fixed one-line allowance is insufficient for long comma-separated/list content: a
-  // small width difference can accumulate into several additional lines. Measure the same styled content
-  // at an Excel-safe effective width, then retain the historical one-line minimum reserve for ordinary
-  // multi-line cells. The result is still content/font/width driven rather than a row-count approximation.
+  // Excel cells do not implement RDL/PDF paragraph LineHeight, SpaceBefore or SpaceAfter. Reusing the PDF
+  // physical height therefore creates very tall merged cells even though Excel renders the same wrapped
+  // lines at its native font leading. Keep the exact font/run width measurement, but neutralize paragraph
+  // spacing properties Excel cannot represent. Explicit newlines remain in `display` and are still counted.
+  const excelTextbox = {
+    ...textbox,
+    style: { ...(textbox.style || {}), lineHeight: null },
+    paragraphStyles: (textbox.paragraphStyles || []).map((paragraphStyle) => ({
+      ...paragraphStyle,
+      lineHeight: null,
+      spaceBefore: 0,
+      spaceAfter: 0,
+    })),
+    paragraphs: (textbox.paragraphs || []).map((paragraph) => paragraph.map((run) => ({
+      ...run,
+      style: { ...(run.style || {}), lineHeight: null },
+    }))),
+  };
   const excelSafeWidth = Math.max(1, width - EXCEL_MAX_DIGIT_WIDTH_PT);
   const excelSafeContentHeight = measureTextboxHeight(
     measureDoc,
     config,
-    textbox,
+    excelTextbox,
     context,
     display,
     excelSafeWidth,
   );
-  const excelWrapReserve = contentHeight > singleLineHeight + (1 / POINT_PRECISION)
-    ? singleLineHeight
-    : 0;
+  const firstVisibleCharacter = Array.from(String(display)).find((character) => !/\s/u.test(character)) || 'M';
+  const nativeSingleLineHeight = measureTextboxHeight(
+    measureDoc,
+    config,
+    excelTextbox,
+    context,
+    firstVisibleCharacter,
+    excelSafeWidth,
+  );
+  const wrapped = excelSafeContentHeight > nativeSingleLineHeight + (1 / POINT_PRECISION);
   const borderClearance = ['top', 'bottom'].reduce((sum, side) => {
     const border = style?.borders?.[side];
     const borderStyle = String(styleValue(border?.style, context, 'None'));
@@ -1030,9 +1041,12 @@ function excelCanGrowTextboxHeight(measureDoc, config, textbox, context, display
     // cannot visually collide with a horizontal edge at common Excel zoom levels.
     return sum + (Math.max(0, styleSize(border.width, context, 1)) / 2);
   }, 0);
-  return Math.max(contentHeight + excelWrapReserve, excelSafeContentHeight)
+  return excelSafeContentHeight
     + styleSize(style?.paddingTop, context, 2)
     + styleSize(style?.paddingBottom, context, 2)
+    // Excel's glyph descent and character-width rounding are viewer/font dependent. A small once-per-cell
+    // clearance prevents the last baseline touching a border without reserving an entire extra line.
+    + (wrapped ? EXCEL_TEXT_CLEARANCE_PT : 0)
     + borderClearance;
 }
 

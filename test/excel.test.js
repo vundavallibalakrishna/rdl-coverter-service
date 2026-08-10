@@ -251,9 +251,14 @@ test('REPORT mode honors CanGrow for wrapped cell text and preserves a fixed Can
     tablix.columns[0],
   );
   measureDoc.end();
+  const excelHeight = growingSheet.getRow(growingCell.row).height;
   assert.ok(
-    growingSheet.getRow(growingCell.row).height >= pdfContentHeight + 4 + resolvedLineHeight - 0.25,
-    'a wrapped CanGrow row must reserve one resolved font line beyond the exact PDF height for Excel reflow',
+    excelHeight >= pdfContentHeight + 4 - 0.25,
+    'a wrapped CanGrow row must retain its native line height and declared vertical padding',
+  );
+  assert.ok(
+    excelHeight < pdfContentHeight + 4 + resolvedLineHeight,
+    'Excel clearance must not reserve a whole extra line after wrapped content',
   );
 
   const shortSheet = await load((await renderExcel(growingModel, {
