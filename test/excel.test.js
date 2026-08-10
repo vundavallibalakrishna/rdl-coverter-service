@@ -244,6 +244,60 @@ test('REPORT mode honors CanGrow for wrapped cell text and preserves a fixed Can
   assert.equal(fixedSheet.getRow(fixedCell.row).height, detailRow.height);
 });
 
+test('REPORT mode gives long wrapped list text Excel-width and border clearance', async () => {
+  const listModel = structuredClone(model);
+  const tablix = listModel.body.items.find((item) => item.type === 'Tablix');
+  tablix.columns[0] = 45.5;
+  tablix.width = tablix.columns.reduce((sum, width) => sum + width, 0);
+  const textbox = tablix.rows.at(-1).cells[0].items.find((item) => item.type === 'Textbox');
+  textbox.canGrow = true;
+  textbox.style.fontFamily = 'Arial';
+  textbox.style.fontSize = 8;
+  textbox.style.paddingTop = 2;
+  textbox.style.paddingBottom = 2;
+  for (const run of textbox.paragraphs.flat()) {
+    run.style.fontFamily = 'Arial';
+    run.style.fontSize = 8;
+  }
+  const list = Array.from({ length: 80 }, (_, index) => String(index + 1)).join(', ');
+  const listRequest = {
+    ...request,
+    datasets: { ...request.datasets, Sales: [{ Name: list, Amount: 1 }] },
+  };
+  const sheet = await load((await renderExcel(listModel, listRequest, config, null)).buffer);
+  const cell = findCell(sheet, list);
+  assert.ok(cell);
+
+  const measureDoc = new PDFDocument({ autoFirstPage: false });
+  measureDoc.addPage({ size: [1000, 1000], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
+  const measurementContext = {
+    parameters: listRequest.parameters,
+    globals: { PageNumber: 1, TotalPages: 1, ExecutionTime: new Date(), variables: {} },
+    fields: listRequest.datasets.Sales[0],
+    dataset: listRequest.datasets.Sales,
+    datasets: listRequest.datasets,
+  };
+  // Excel column widths are character based. The renderer measures one 7-pixel maximum-digit unit
+  // narrower (5.25pt at 96 DPI), then adds the declared 4pt vertical padding and the two half-border
+  // strokes (1pt total) so a final line cannot sit under a horizontal edge.
+  const excelSafeContentHeight = measureTextboxHeight(
+    measureDoc,
+    config,
+    textbox,
+    measurementContext,
+    list,
+    tablix.columns[0] - 5.25,
+  );
+  measureDoc.end();
+  assert.ok(
+    sheet.getRow(cell.row).height >= excelSafeContentHeight + 5 - 0.25,
+    'long wrapped list text must retain Excel-width reflow and horizontal-border clearance',
+  );
+  assert.equal(cell.alignment?.wrapText, true);
+  assert.equal(cell.border?.top?.style, 'thin');
+  assert.equal(cell.border?.bottom?.style, 'thin');
+});
+
 test('REPORT mode splits a CanGrow cell beyond Excel row-height limits without losing editability', async () => {
   const tallModel = structuredClone(model);
   const tablix = tallModel.body.items.find((item) => item.type === 'Tablix');

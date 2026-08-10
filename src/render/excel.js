@@ -16,6 +16,13 @@ import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './exce
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
 const DEFAULT_ROW_POINTS = 15;
 const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
+const EXCEL_LAYOUT_DPI = 96;
+const EXCEL_MAX_DIGIT_WIDTH_PX = 7;
+const EXCEL_CELL_PADDING_PX = 5;
+// OOXML stores column widths in units derived from the workbook's maximum digit width. Excel then rounds
+// those widths again for the active viewer/font metrics. Reserving one standard 7-pixel digit cell during
+// measurement covers that character-unit conversion without changing the RDL column proportions.
+const EXCEL_MAX_DIGIT_WIDTH_PT = EXCEL_MAX_DIGIT_WIDTH_PX * (72 / EXCEL_LAYOUT_DPI);
 
 function sheetName(name, fallback) {
   const cleaned = String(name || fallback).replace(SHEET_NAME_FORBIDDEN, ' ').trim().slice(0, 31);
@@ -448,8 +455,13 @@ function firstVisibleText(items, model, request, globals) {
 }
 
 function excelWidthFromPoints(points) {
-  const pixels = Math.max(1, points * (96 / 72));
-  return Math.max(0.2, pixels <= 12 ? pixels / 12 : (pixels - 5) / 7);
+  const pixels = Math.max(1, points * (EXCEL_LAYOUT_DPI / 72));
+  return Math.max(
+    0.2,
+    pixels <= 12
+      ? pixels / 12
+      : (pixels - EXCEL_CELL_PADDING_PX) / EXCEL_MAX_DIGIT_WIDTH_PX,
+  );
 }
 
 function tablixLayout(item, request, globals, model, cache) {
@@ -923,18 +935,35 @@ function excelCanGrowTextboxHeight(measureDoc, config, textbox, context, display
     firstVisibleCharacter,
     width,
   );
-  // PDF owns exact line breaking, while Excel independently reflows wrapped text using its workbook font
-  // and column-width engine. A multi-line CanGrow cell whose native row is set to the exact PDF height has
-  // no room when Excel produces one additional final line. Reserve one line derived from the cell's actual
-  // resolved font metrics only for genuinely multi-line content; single-line and CanGrow=false cells keep
-  // their declared compact geometry.
+  // PDF owns exact line breaking, while Excel independently reflows wrapped text using character-based
+  // column widths. A fixed one-line allowance is insufficient for long comma-separated/list content: a
+  // small width difference can accumulate into several additional lines. Measure the same styled content
+  // at an Excel-safe effective width, then retain the historical one-line minimum reserve for ordinary
+  // multi-line cells. The result is still content/font/width driven rather than a row-count approximation.
+  const excelSafeWidth = Math.max(1, width - EXCEL_MAX_DIGIT_WIDTH_PT);
+  const excelSafeContentHeight = measureTextboxHeight(
+    measureDoc,
+    config,
+    textbox,
+    context,
+    display,
+    excelSafeWidth,
+  );
   const excelWrapReserve = contentHeight > singleLineHeight + (1 / POINT_PRECISION)
     ? singleLineHeight
     : 0;
-  return contentHeight
+  const borderClearance = ['top', 'bottom'].reduce((sum, side) => {
+    const border = style?.borders?.[side];
+    const borderStyle = String(styleValue(border?.style, context, 'None'));
+    if (!border || /^none$/i.test(borderStyle)) return sum;
+    // Half of each border is painted inside the cell display area. Include it so the last glyph baseline
+    // cannot visually collide with a horizontal edge at common Excel zoom levels.
+    return sum + (Math.max(0, styleSize(border.width, context, 1)) / 2);
+  }, 0);
+  return Math.max(contentHeight + excelWrapReserve, excelSafeContentHeight)
     + styleSize(style?.paddingTop, context, 2)
     + styleSize(style?.paddingBottom, context, 2)
-    + excelWrapReserve;
+    + borderClearance;
 }
 
 function renderReportTablix({ worksheet, model, item, request, globals, config, xGrid, startRow, merges, tablixCache, measureDoc }) {
