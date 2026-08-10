@@ -289,6 +289,20 @@ function evaluateFunction(name, args, context) {
     return (index >= 0 ? index : rows.length - 1) + 1;
   }
   if (normalized === 'previous') {
+    // SSRS defines Previous(expression, scope) as "the value of expression for the PREVIOUS INSTANCE of
+    // that scope", returning Nothing for the first instance. The instance sequence is a rendering concept
+    // the aggregate row set cannot express: in a group scope the previous instance is the previous GROUP,
+    // and the current instance's representative row is always row 0 of its own rows, so stepping back one
+    // row inside `scopeRows` resolved to Nothing on every instance (turning a conditional group-boundary
+    // border into a rule on every row). Materialization records the sequence it emitted; use it whenever
+    // present and keep the positional walk for direct evaluator use outside a data region.
+    const scopeName = args[1] ? evaluateArgument(args[1], context) : null;
+    const recorded = scopeName ? context.previousInstances?.[scopeName] : context.previousInstance;
+    if (recorded !== undefined) {
+      return recorded
+        ? evaluateArgument(args[0], { ...context, fields: recorded.fields, dataset: recorded.dataset })
+        : null;
+    }
     const rows = scopeRows(args[1], context);
     const index = context.fields ? rows.indexOf(context.fields) : rows.length - 1;
     return index > 0 ? evaluateArgument(args[0], { ...context, fields: rows[index - 1] }) : null;
@@ -585,7 +599,8 @@ export function evaluateExpression(input, context = {}) {
       if (property === 'count') return Array.isArray(raw) ? raw.length : (raw == null ? 0 : 1);
       if (property === 'ismultivalue') return Array.isArray(raw);
       if (index !== null) return Array.isArray(raw) ? (raw[index] ?? null) : (index === 0 ? (raw ?? null) : null);
-      return raw ?? null; // Value (default) or Label (no separate label store)
+      if (property === 'label') return context.parameters?.__rdlParameterLabels?.[itemName] ?? raw ?? null;
+      return raw ?? null;
     }
     return raw ?? null; // globals, user, reportitems
   }

@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -766,7 +766,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // absent or resolves to None so the caller can fall back to the neighbouring cell's opposite side.
   const resolveSide = (owner, side) => {
     if (!owner) return null;
-    const cellStyle = owner.cell.containerWrapped ? item.style : (cellTextbox(owner.cell)?.style || item.style);
+    const cellStyle = cellBorderStyle(owner.cell, item);
     const border = cellStyle?.borders?.[side];
     if (!border) return null;
     const context = contextForCell(owner.rowIndex, owner.cell);
@@ -926,7 +926,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           dataset: nestedDatasets[nested.item.datasetName] || [],
           datasets: nestedDatasets,
         });
-        const style = (cell.containerWrapped ? nested.item.style : textbox?.style) || nested.item.style || {};
+        const style = textbox?.style || nested.item.style || {};
+        const borderStyle = cellBorderStyle(cell, nested.item) || {};
         const background = styleColor(style.backgroundColor, context, null);
         if (background) doc.save().rect(x, cellY, width, height).fill(background).restore();
         if (textbox && !cell.hidden) {
@@ -937,7 +938,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
             skipBorder: true,
             traceEdges: Object.fromEntries(
               ['top', 'right', 'bottom', 'left'].map((side) => {
-                const border = style.borders?.[side];
+                const border = borderStyle.borders?.[side];
                 return [side, border && !/^none$/i.test(String(styleValue(border.style, context, 'None')))
                   ? { border, context }
                   : null];
@@ -976,10 +977,10 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
             verticalAlign: 'top',
             padding: { top: 0, right: 0, bottom: 0, left: 0 },
             backgroundColor: background,
-            borders: resolvedTraceBorders(style, context),
+            borders: resolvedTraceBorders(borderStyle, context),
           });
         }
-        const borders = style.borders || {};
+        const borders = borderStyle.borders || {};
         drawEdges(x, cellY, width, height, Object.fromEntries(
           ['top', 'right', 'bottom', 'left'].map((side) => {
             const border = borders[side];
@@ -1256,7 +1257,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           },
         });
       } else {
-        const style = (cell.containerWrapped ? item.style : textbox?.style) || item.style || {};
+        const style = textbox?.style || item.style || {};
+        const borderStyle = cellBorderStyle(cell, item) || {};
         recordLayoutItem(doc, {
           kind: 'tablixCell',
           itemName: null,
@@ -1277,7 +1279,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           verticalAlign: 'top',
           padding: { top: 0, right: 0, bottom: 0, left: 0 },
           backgroundColor: styleColor(style.backgroundColor, cellContext, null),
-          borders: resolvedTraceBorders(style, cellContext, edges),
+          borders: resolvedTraceBorders(borderStyle, cellContext, edges),
         });
       }
       for (const nested of cell.nestedTablixes || []) drawNestedTablix(nested, x, y, width);

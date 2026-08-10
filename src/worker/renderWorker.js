@@ -64,6 +64,9 @@ process.on('message', async (message) => {
       throw new ServiceError('RDL_INVALID', `Dataset rows exceed the ${config.maxRows} row limit`, 413);
     }
     request.parameters = validation.parameters;
+    Object.defineProperty(request.parameters, '__rdlParameterLabels', {
+      value: validation.parameterLabels || {}, enumerable: false, configurable: true,
+    });
     telemetry.mark('input-validated', 'completed', {
       totalRows: validation.totalRows + subreports.bundledRows,
       maxRows: config.maxRows,

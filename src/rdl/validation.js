@@ -34,6 +34,32 @@ export function resolveParameterValues(definitions, parameters = {}) {
   return resolved;
 }
 
+export function resolveParameterLabels(definitions, parameters = {}, datasets = {}) {
+  const labels = {};
+  for (const parameter of definitions || []) {
+    const selected = parameters[parameter.name];
+    if (selected === undefined || selected === null) continue;
+    const values = Array.isArray(selected) ? selected : [selected];
+    const staticValues = parameter.staticValidValues || [];
+    const lookupRows = parameter.lookupDataset && Array.isArray(datasets[parameter.lookupDataset])
+      ? datasets[parameter.lookupDataset] : [];
+    const labelFor = (value) => {
+      const staticMatch = staticValues.find((entry) => String(entry.value) === String(value));
+      if (staticMatch) return staticMatch.label;
+      if (parameter.lookupValueField && parameter.lookupLabelField) {
+        const row = lookupRows.find((candidate) => String(candidate?.[parameter.lookupValueField]) === String(value));
+        if (row && row[parameter.lookupLabelField] !== undefined && row[parameter.lookupLabelField] !== null) {
+          return row[parameter.lookupLabelField];
+        }
+      }
+      return value;
+    };
+    const resolved = values.map(labelFor);
+    labels[parameter.name] = Array.isArray(selected) ? resolved : resolved[0];
+  }
+  return labels;
+}
+
 function canonicalParameterValue(parameter, value) {
   if (parameter.multiValue) return (value || []).map((entry) => canonicalParameterValue({ ...parameter, multiValue: false }, entry));
   if (value === null || value === undefined) return null;
@@ -93,7 +119,11 @@ export function validateRenderInput(model, request, limits) {
       }
     }
   }
-  return { totalRows, parameters: resolvedParameters };
+  return {
+    totalRows,
+    parameters: resolvedParameters,
+    parameterLabels: resolveParameterLabels(model.parameters, resolvedParameters, datasets),
+  };
 }
 
 // Kept as a thin alias so both call sites in this module read as before; the shared implementation lives
@@ -177,6 +207,45 @@ function dataRegionScopes(tablix, rows) {
   if (tablix.datasetName) scopes[tablix.datasetName] = rows;
   if (tablix.name) scopes[tablix.name] = rows;
   return scopes;
+}
+
+// Records the ordered sequence of scope INSTANCES a materializer emits so Previous() can resolve SSRS's
+// "previous instance of the scope". `key` separates independent emission sequences (one per row template /
+// leaf member), `token` is the identity of the current innermost instance (the instance's row array for a
+// group scope, the row object itself for a detail scope), and `scopes` supplies the named group instances
+// active for this emission. Every payload is `{ fields, dataset }` for the PREVIOUS distinct instance, or
+// null at the first instance — exactly the Nothing SSRS returns there.
+function createScopeSequence() {
+  const sequences = new Map();
+  const payloadOf = (rows) => ({ fields: rows[0] || {}, dataset: rows });
+  return {
+    advance(key, token, fields, dataset, scopes) {
+      let sequence = sequences.get(key);
+      if (!sequence) {
+        sequence = { innermost: null, named: new Map() };
+        sequences.set(key, sequence);
+      }
+      if (!sequence.innermost) sequence.innermost = { token, current: { fields, dataset }, previous: null };
+      else if (sequence.innermost.token !== token) {
+        sequence.innermost.previous = sequence.innermost.current;
+        sequence.innermost.token = token;
+        sequence.innermost.current = { fields, dataset };
+      }
+      const previousInstances = {};
+      for (const [name, rows] of Object.entries(scopes || {})) {
+        let entry = sequence.named.get(name);
+        if (!entry) {
+          entry = { current: rows, previous: null };
+          sequence.named.set(name, entry);
+        } else if (entry.current !== rows) {
+          entry.previous = payloadOf(entry.current);
+          entry.current = rows;
+        }
+        previousInstances[name] = entry.previous;
+      }
+      return { previousInstance: sequence.innermost.previous, previousInstances };
+    },
+  };
 }
 
 function groupValue(group, fields, parameters, globals, dataset, datasets, rowIndex) {
@@ -299,6 +368,10 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     throw new ServiceError('UNSUPPORTED_FEATURE', `Tablix cell content is not supported: ${unrenderable.type}`);
   }
   const duplicateItems = new Array(cell.items.length).fill(null);
+  const itemHidden = cell.items.map((item) => {
+    const result = evaluateExpression(item.hidden, context);
+    return result === true || String(result).toLowerCase() === 'true';
+  });
   const values = cell.items.map((item, itemIndex) => {
     if (item.type === 'Tablix' || item.type === 'Subreport') return '';
     const value = itemValue(item, context);
@@ -402,10 +475,20 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     fields: context.fields || {},
     scopeDataset: context.dataset || [],
     scopes: context.scopes || {},
-    hidden: cell.items.some((item) => {
-      const result = evaluateExpression(item.hidden, context);
-      return result === true || String(result).toLowerCase() === 'true';
-    }),
+    // Renderers re-evaluate expression-backed styles (borders, fills, fonts) long after materialization,
+    // so the cell must carry every part of the scope its VALUE was evaluated in. Without the data-region
+    // rows and the data-region scope names, RowNumber(Nothing)/RunningValue(..., Nothing) silently
+    // collapsed to the innermost group at render time and returned 1 for every row.
+    regionDataset: context.outermostDataset || context.dataset || [],
+    tablixDatasetName: context.tablixDatasetName ?? null,
+    tablixName: context.tablixName ?? null,
+    previousInstance: context.previousInstance,
+    previousInstances: context.previousInstances,
+    // Per-item visibility, not just the cell roll-up. A cell whose only content is a hidden report item
+    // draws nothing at all in SSRS — including its border — so the border resolver needs to tell which
+    // content item is actually rendering, not merely that something in the cell is hidden.
+    itemHidden,
+    hidden: itemHidden.some(Boolean),
   };
 }
 
@@ -524,6 +607,7 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
   const repeatingHeaderCount = firstDynamic > 0 ? firstDynamic : 0;
   const output = [];
   const duplicateState = new Map();
+  const scopeSequence = createScopeSequence();
   for (const [index, row] of tablix.rows.entries()) {
     const path = memberPaths[index] || [];
     const descriptors = headerDescriptors(path);
@@ -537,6 +621,13 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
       const { scopes, dataset, nestedDataset } = dynamic
         ? scopeContext(path, fields, rowIndex)
         : { scopes: dataRegionScopes(tablix, sourceRows), dataset: sourceRows, nestedDataset: sourceRows };
+      // The innermost scope of this template row decides what Previous() steps back through: a leaf
+      // GROUP member advances once per group instance, while a detail (or ungrouped) leaf advances once
+      // per row. Each template row keeps its own sequence because the flat materializer re-walks every
+      // source row for each template row.
+      const leafGroup = path[path.length - 1]?.group;
+      const instanceToken = leafGroup?.expressions?.length ? dataset : fields;
+      const { previousInstance, previousInstances } = scopeSequence.advance(index, instanceToken, fields, dataset, scopes);
       const context = {
         fields,
         parameters,
@@ -546,6 +637,8 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
         nestedDataset,
         datasets,
         scopes,
+        previousInstance,
+        previousInstances,
         tablixDatasetName: tablix.datasetName,
         tablixName: tablix.name,
         nestedTablixDepth: globals.__nestedTablixDepth || 0,
@@ -593,6 +686,12 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
         pageBreakBefore,
         fields,
         scopeDataset: dataset,
+        scopes,
+        regionDataset: sourceRows,
+        tablixDatasetName: tablix.datasetName,
+        tablixName: tablix.name,
+        previousInstance,
+        previousInstances,
         height: row.height,
         keepTogether: path.some((member) => member.keepTogether) || row.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
         cells: [
@@ -754,9 +853,17 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
   const units = [];
   const lastBreakKey = new Map();
+  const scopeSequence = createScopeSequence();
   let pendingPageBreak = false;
   const emit = (leaf, path, fields, dataset, scopes, role, indentLevel, nestedDataset = dataset) => {
-    units.push({ templateIndex: templateIndexOf.get(leaf) ?? 0, path, fields, dataset, nestedDataset, scopes, role, indentLevel, pageBreakBefore: pendingPageBreak, emitIndex: units.length });
+    // Each leaf template emits one unit per instance of its innermost scope, in render order: a detail
+    // leaf advances per row, a group leaf per group instance, and a static group header/footer leaf once
+    // per instance of the group that contains it. That emission order IS the instance sequence SSRS
+    // Previous() walks, so record it here rather than inferring it from aggregate rows later.
+    const leafGroup = leaf?.group;
+    const instanceToken = leafGroup && !leafGroup.expressions?.length ? fields : dataset;
+    const { previousInstance, previousInstances } = scopeSequence.advance(leaf, instanceToken, fields, dataset, scopes);
+    units.push({ templateIndex: templateIndexOf.get(leaf) ?? 0, path, fields, dataset, nestedDataset, scopes, previousInstance, previousInstances, role, indentLevel, pageBreakBefore: pendingPageBreak, emitIndex: units.length });
     pendingPageBreak = false;
   };
 
@@ -847,6 +954,8 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       nestedDataset: unit.nestedDataset,
       datasets,
       scopes: unit.scopes,
+      previousInstance: unit.previousInstance,
+      previousInstances: unit.previousInstances,
       tablixDatasetName: tablix.datasetName,
       tablixName: tablix.name,
       nestedTablixDepth: globals.__nestedTablixDepth || 0,
@@ -876,6 +985,8 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       outermostDataset: sourceRows,
       datasets,
       scopes: unit.scopes,
+      previousInstance: unit.previousInstance,
+      previousInstances: unit.previousInstances,
       tablixDatasetName: tablix.datasetName,
       tablixName: tablix.name,
     };
@@ -927,6 +1038,8 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           nestedDataset: intersection,
           datasets,
           scopes: { ...unit.scopes, ...column.scopes },
+          previousInstance: unit.previousInstance,
+          previousInstances: unit.previousInstances,
           tablixDatasetName: tablix.datasetName,
           tablixName: tablix.name,
           nestedTablixDepth: globals.__nestedTablixDepth || 0,
@@ -956,6 +1069,12 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       pageBreakBefore: unit.pageBreakBefore || false,
       fields: unit.fields,
       scopeDataset: unit.dataset,
+      scopes: unit.scopes,
+      regionDataset: sourceRows,
+      tablixDatasetName: tablix.datasetName,
+      tablixName: tablix.name,
+      previousInstance: unit.previousInstance,
+      previousInstances: unit.previousInstances,
       height: template.height,
       keepTogether: unit.path.some((member) => member.keepTogether) || template.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
       cells: [...rowHeaders, ...bodyCells],
@@ -1020,6 +1139,9 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
         pageBreakBefore: false,
         fields: {},
         scopeDataset: sourceRows,
+        regionDataset: sourceRows,
+        tablixDatasetName: tablix.datasetName,
+        tablixName: tablix.name,
         height: tablix.rows[0]?.height || 18,
         keepTogether: false,
         cells,

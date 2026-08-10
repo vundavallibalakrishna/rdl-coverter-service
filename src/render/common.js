@@ -185,13 +185,24 @@ export function normalizeDatasets(model, request) {
 export function materializedCellContext(cell, row, {
   parameters = {}, globals = {}, dataset = [], datasets = {},
 } = {}) {
+  // A row-scope function is only meaningful against the scope the cell was materialized in, so carry the
+  // recorded scope forward whole. Dropping the data-region rows/names made RowNumber(Nothing) and
+  // RunningValue(..., Nothing) fall back to the innermost group at render time (returning 1 for every
+  // row), and dropping the instance sequence made Previous() return Nothing everywhere — both of which
+  // silently flipped conditional group-boundary borders on for every row.
+  const owner = cell && 'fields' in cell ? cell : row;
   return {
     fields: cell?.fields ?? row?.fields ?? {},
     parameters,
     globals,
     dataset: cell?.scopeDataset ?? row?.scopeDataset ?? dataset,
+    outermostDataset: cell?.regionDataset ?? row?.regionDataset ?? undefined,
     datasets,
     scopes: cell?.scopes ?? row?.scopes ?? {},
+    tablixDatasetName: cell?.tablixDatasetName ?? row?.tablixDatasetName ?? undefined,
+    tablixName: cell?.tablixName ?? row?.tablixName ?? undefined,
+    previousInstance: owner?.previousInstance,
+    previousInstances: owner?.previousInstances,
   };
 }
 
@@ -273,6 +284,35 @@ export function cellTextbox(cell) {
   const produced = items.findIndex((item, index) => item.type === 'Textbox' && String(values[index] ?? '').length > 0);
   if (produced >= 0) return items[produced];
   return items.find((item) => item.type === 'Textbox');
+}
+
+// The border authority for a tablix cell. RDL puts the cell's edges on the report item inside its
+// CellContents; Tablix/Style/Border is the DATA REGION's outer rectangle, which both renderers already
+// draw separately around the whole table. Treating the tablix style as a per-cell default therefore
+// repainted the region border into every interior cell that holds something other than a textbox — a
+// subreport, image, or chart — producing a full grid where SSRS draws none.
+//
+// Resolution order: a Rectangle-only wrapper keeps the tablix as the authority (its own container style
+// is flattened away during materialization); otherwise the cell's textbox wins, then the first VISIBLE
+// non-Rectangle content item. A cell whose content is entirely hidden contributes no border of its own,
+// leaving the neighbouring cells' shared edges to define the grid there, exactly as SSRS renders it.
+// Only a cell with no content at all falls back to the tablix style, which keeps synthesized blank grid
+// cells closed.
+export function cellBorderStyle(cell, tablix) {
+  const tablixStyle = tablix?.style;
+  if (!cell) return tablixStyle;
+  if (cell.containerWrapped) return tablixStyle;
+  const textbox = cellTextbox(cell);
+  if (textbox) return textbox.style;
+  const items = cell.items || [];
+  // A nested Tablix is skipped: it is a data region that draws its own outer border on its own rect, so
+  // also lending it to the enclosing cell would stroke the same edge twice at two different rectangles.
+  // A Subreport, Image, or Chart has no such second pass — the cell is where its declared border lives.
+  const content = items.find((item, index) => (
+    item.type !== 'Rectangle' && item.type !== 'Tablix' && !cell.itemHidden?.[index]
+  ));
+  if (content) return content.style;
+  return items.length > 0 ? null : tablixStyle;
 }
 
 // Assembles a cell's display text from its materialized per-item values. Empty values
