@@ -375,6 +375,12 @@ function closesAtEnd(value, openIndex) {
 }
 
 // VB `Like` pattern → RegExp: * = any run, ? = one char, # = one digit, [list]/[!list] = char class.
+function isVbNumericEqualityValue(value) {
+  return typeof value !== 'boolean'
+    && !(typeof value === 'string' && value.trim() === '')
+    && Number.isFinite(Number(value));
+}
+
 // VB equality, which is NOT JavaScript equality where Nothing is involved. VB coerces Nothing to the other
 // operand's default value, so `Nothing = 0` and `Nothing = ""` are both True — SSRS reports rely on this to
 // drive conditional borders from a NULL row-number field (e.g. Combined Assurance draws its group-boundary
@@ -392,6 +398,14 @@ function vbEqual(left, right) {
     if (typeof other === 'string') return other === '';
     if (typeof other === 'boolean') return other === false;
     return false;
+  }
+  // Dataset values can arrive through JSON as text even when the RDL field/query type is numeric. VB/SSRS
+  // coerces that text when the other operand is numeric, so zero-padded row numbers such as "001" must
+  // satisfy `Fields!Number.Value = 1`. Keep string-to-string equality lexical: only a genuinely numeric
+  // operand opts the comparison into numeric coercion, and blank/non-numeric text is never coerced.
+  const oneOperandIsNumeric = typeof left === 'number' || typeof right === 'number';
+  if (oneOperandIsNumeric && isVbNumericEqualityValue(left) && isVbNumericEqualityValue(right)) {
+    return Number(left) === Number(right);
   }
   return left === right || String(left) === String(right);
 }

@@ -58,6 +58,12 @@ test('<> is the exact negation of =, including for Nothing', () => {
 
 test('numeric text still compares equal to its number, and equality stays reflexive', () => {
   assert.equal(ev('=Fields!x.Value = 0', { x: '0' }), true);
+  assert.equal(ev('=Fields!x.Value = 1', { x: '001' }), true);
+  assert.equal(ev('=1 = Fields!x.Value', { x: '001' }), true);
+  assert.equal(ev('=Fields!x.Value = 1', { x: '001A' }), false);
+  assert.equal(ev('=Fields!x.Value = 0', { x: '' }), false);
+  // Both operands are strings, so VB keeps a lexical string comparison.
+  assert.equal(ev('=Fields!x.Value = "1"', { x: '001' }), false);
   assert.equal(ev('=Fields!x.Value = "A"', { x: 'A' }), true);
   assert.equal(ev('=Fields!x.Value = Fields!x.Value', { x: null }), true);
   assert.equal(ev('=1 = 1'), true);

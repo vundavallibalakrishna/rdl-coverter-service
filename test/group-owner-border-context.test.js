@@ -59,8 +59,8 @@ const request = {
   outputFileName: 'group-owner-border-context',
   parameters: {},
   datasets: { D: [
-    { Risk: 'R1', Number: 1, Rating: 6, Detail: 'First action' },
-    { Risk: 'R1', Number: 2, Rating: 6, Detail: 'Second action' },
+    { Risk: 'R1', Number: '001', Rating: 6, Detail: 'First action' },
+    { Risk: 'R1', Number: '002', Rating: 6, Detail: 'Second action' },
   ] },
 };
 
@@ -71,7 +71,7 @@ test('a row-spanned group owner keeps its first-row context for conditional bord
   const textbox = owner.items[0];
   const context = { fields: owner.fields, dataset: owner.scopeDataset, scopes: owner.scopes };
   assert.equal(owner.rowSpan, 2);
-  assert.equal(owner.fields.Number, 1);
+  assert.equal(owner.fields.Number, '001');
   assert.equal(styleValue(textbox.style.borders.top.style, context), 'Solid');
   assert.equal(styleColor(textbox.style.borders.top.color, context), '#123456');
 });
