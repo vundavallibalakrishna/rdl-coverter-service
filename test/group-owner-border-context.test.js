@@ -36,17 +36,24 @@ const model = parseRdl(`<?xml version="1.0"?>
       <TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
       <TablixRowHierarchy><TablixMembers><TablixMember>
         <Group Name="RiskGroup"><GroupExpressions><GroupExpression>=Fields!Risk.Value</GroupExpression></GroupExpressions></Group>
-        <TablixHeader><Size>1in</Size><CellContents><Textbox Name="RatingOwner"><CanGrow>true</CanGrow>
-          <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Rating.Value</Value><Style><FontFamily>Arial</FontFamily></Style></TextRun></TextRuns></Paragraph></Paragraphs>
-          <Style>
-            <Border><Style>None</Style></Border>
-            <TopBorder><Style>=IIF(Fields!Number.Value = 1, "Solid", "None")</Style><Color>=IIF(Fields!Number.Value = 1, "#123456", "None")</Color><Width>2pt</Width></TopBorder>
-            <LeftBorder><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></LeftBorder>
-            <RightBorder><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></RightBorder>
-            <BackgroundColor>Yellow</BackgroundColor>
-          </Style>
+        <TablixHeader><Size>1in</Size><CellContents><Textbox Name="RiskOwner"><CanGrow>true</CanGrow>
+          <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Risk.Value</Value><Style><FontFamily>Arial</FontFamily></Style></TextRun></TextRuns></Paragraph></Paragraphs>
+          <Style><Border><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></Border></Style>
         </Textbox></CellContents></TablixHeader>
-        <TablixMembers><TablixMember><Group Name="Details"/></TablixMember></TablixMembers>
+        <TablixMembers><TablixMember>
+          <Group Name="RatingGroup"><GroupExpressions><GroupExpression>=Fields!Rating.Value</GroupExpression></GroupExpressions></Group>
+          <TablixHeader><Size>1in</Size><CellContents><Textbox Name="RatingOwner"><CanGrow>true</CanGrow>
+            <Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!Rating.Value</Value><Style><FontFamily>Arial</FontFamily></Style></TextRun></TextRuns></Paragraph></Paragraphs>
+            <Style>
+              <Border><Style>None</Style></Border>
+              <TopBorder><Style>=IIF(Fields!Number.Value = 1, "Solid", "None")</Style><Color>=IIF(Fields!Number.Value = 1, "#123456", "None")</Color><Width>2pt</Width></TopBorder>
+              <LeftBorder><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></LeftBorder>
+              <RightBorder><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></RightBorder>
+              <BackgroundColor>Yellow</BackgroundColor>
+            </Style>
+          </Textbox></CellContents></TablixHeader>
+          <TablixMembers><TablixMember><Group Name="Details"/></TablixMember></TablixMembers>
+        </TablixMember></TablixMembers>
       </TablixMember></TablixMembers></TablixRowHierarchy>
       <DataSetName>D</DataSetName><Top>0.2in</Top><Left>0.2in</Left><Width>3in</Width><Height>0.7in</Height><Style/>
     </Tablix>
@@ -67,13 +74,39 @@ const request = {
 test('a row-spanned group owner keeps its first-row context for conditional borders', () => {
   const tablix = model.body.items.find((item) => item.name === 'GroupedRisk');
   const rows = tablixRows(tablix, request, {}, model).rows;
-  const owner = rows[0].cells[0];
+  const owner = rows[0].cells[1];
   const textbox = owner.items[0];
   const context = { fields: owner.fields, dataset: owner.scopeDataset, scopes: owner.scopes };
   assert.equal(owner.rowSpan, 2);
   assert.equal(owner.fields.Number, '001');
   assert.equal(styleValue(textbox.style.borders.top.style, context), 'Solid');
   assert.equal(styleColor(textbox.style.borders.top.color, context), '#123456');
+});
+
+test('matching row-boundary neighbours close a vertically merged owner whose own top is None', async () => {
+  const bridgedRequest = {
+    ...request,
+    datasets: { D: request.datasets.D.map((row) => ({ ...row, Number: '002' })) },
+  };
+  const pdf = await renderPdf(model, bridgedRequest, config, { captureLayoutTrace: true });
+  const tracedOwner = pdf.layoutTrace.pages[0].items.find((item) => (
+    item.kind === 'tablixCell' && item.text === '6' && item.rowSpan === 2
+  ));
+  assert.deepEqual(tracedOwner?.borders?.top, { style: 'Solid', width: 1, color: '#000000' });
+
+  const docx = await renderEditableDocx(model, bridgedRequest, config);
+  const documentXml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
+  assert.match(documentXml, /<w:top w:val="single" w:color="000000" w:sz="8"\/>/);
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load((await renderExcel(model, bridgedRequest, config, null)).buffer);
+  let ratingCell = null;
+  workbook.worksheets[0].eachRow((row) => row.eachCell((cell) => {
+    if ((cell.value === 6 || cell.value === '6') && cell.fill?.fgColor?.argb === 'FFFFFF00') ratingCell = cell;
+  }));
+  assert.ok(ratingCell);
+  assert.equal(ratingCell.border?.top?.style, 'thin');
+  assert.equal(ratingCell.border?.top?.color?.argb, 'FF000000');
 });
 
 test('PDF, editable DOCX, and XLSX preserve the conditional top border of a grouped owner cell', async () => {

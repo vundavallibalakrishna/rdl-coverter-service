@@ -206,6 +206,19 @@ export function materializedCellContext(cell, row, {
   };
 }
 
+// SSRS collapses a logical tablix row boundary across a vertically merged group owner when the owner omits
+// that side but the cells immediately on both sides start on the same row and declare the same edge. This
+// is deliberately narrower than inventing a generic table grid: exterior cells, ordinary one-row cells,
+// continuation cells, and mismatched neighbour styles remain exactly as declared by the RDL.
+export function matchingMergedRowBoundary(owner, left, right, resolveBorder, borderSignature) {
+  if ((owner?.cell?.rowSpan || 1) <= 1) return null;
+  if (!left || !right || left.rowIndex !== owner.rowIndex || right.rowIndex !== owner.rowIndex) return null;
+  const leftBorder = resolveBorder(left, 'top');
+  const rightBorder = resolveBorder(right, 'top');
+  if (!leftBorder || !rightBorder) return null;
+  return borderSignature(leftBorder) === borderSignature(rightBorder) ? leftBorder : null;
+}
+
 // Returns the materialized rows AND the grid column widths. For static-column tablixes `columns`
 // is identically `item.columns`; for a matrix (dynamic column groups) it is the expanded
 // rowHeader + keys×body column array, so both renderers build the same expanded grid.

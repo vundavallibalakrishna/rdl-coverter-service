@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, matchingMergedRowBoundary, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -884,8 +884,18 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
     || (enforceBottomClosure && endRow === gridOwners.length - 1
       ? excelBorderSide(enforcedBottomBorder(itemStyle), owner.context)
       : undefined);
+  const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
+    || (above && resolvedOwnerBorder(above, 'bottom'))
+    || matchingMergedRowBoundary(
+      owner,
+      left,
+      right,
+      resolvedOwnerBorder,
+      (border) => `${border.style || ''}|${border.color?.argb || ''}`,
+    )
+    || undefined;
   return {
-    top: above === owner ? undefined : resolvedOwnerBorder(owner, 'top') || (above && resolvedOwnerBorder(above, 'bottom')) || undefined,
+    top,
     bottom,
     left: resolvedOwnerBorder(owner, 'left') || (left && resolvedOwnerBorder(left, 'right')) || undefined,
     right: resolvedOwnerBorder(owner, 'right') || (right && resolvedOwnerBorder(right, 'left')) || undefined,
