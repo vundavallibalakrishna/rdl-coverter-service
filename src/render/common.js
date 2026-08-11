@@ -214,6 +214,39 @@ export function materializedCellContext(cell, row, {
   };
 }
 
+// SSRS visually closes a row boundary through a vertically merged owner when the owner changes at that
+// boundary and the cells immediately on both sides declare the same top edge. Do not bridge an unchanged
+// merged value: those separate physical owners are commonly used to continue one logical coloured/grouped
+// region without an internal rule. HideDuplicates is presentation-only, so compare its recorded semantic
+// value rather than the suppressed display text.
+export function materializedCellVisualSignature(cell, style, context) {
+  const values = (cell?.values || []).map((value, index) => (
+    cell?.duplicateItems?.[index]?.value ?? value ?? ''
+  ));
+  return JSON.stringify({
+    values: values.map(String),
+    backgroundColor: styleColor(style?.backgroundColor, context, null),
+  });
+}
+
+export function matchingChangedMergedRowBoundary(
+  owner,
+  above,
+  left,
+  right,
+  resolveBorder,
+  borderSignature,
+  visualSignature,
+) {
+  if ((owner?.cell?.rowSpan || 1) <= 1 || !above || above === owner) return null;
+  if (!left || !right || left.rowIndex !== owner.rowIndex || right.rowIndex !== owner.rowIndex) return null;
+  if (visualSignature(owner) === visualSignature(above)) return null;
+  const leftBorder = resolveBorder(left, 'top');
+  const rightBorder = resolveBorder(right, 'top');
+  if (!leftBorder || !rightBorder) return null;
+  return borderSignature(leftBorder) === borderSignature(rightBorder) ? leftBorder : null;
+}
+
 // Returns the materialized rows AND the grid column widths. For static-column tablixes `columns`
 // is identically `item.columns`; for a matrix (dynamic column groups) it is the expanded
 // rowHeader + keys×body column array, so both renderers build the same expanded grid.

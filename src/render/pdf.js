@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, matchingChangedMergedRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -799,7 +799,19 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const below = rowIndex + rowSpan < rows.length ? gridOwners[rowIndex + rowSpan][start] : null;
     const left = start > 0 ? gridOwners[rowIndex][start - 1] : null;
     const right = start + span < columnWidths.length ? gridOwners[rowIndex][start + span] : null;
-    const top = resolveSide(owner, 'top') || resolveSide(above, 'bottom');
+    const top = resolveSide(owner, 'top') || resolveSide(above, 'bottom') || matchingChangedMergedRowBoundary(
+      owner,
+      above,
+      left,
+      right,
+      resolveSide,
+      ({ border, context }) => `${styleValue(border.style, context, 'None')}|${styleColor(border.color, context, null)}|${styleSize(border.width, context, 1)}`,
+      (candidate) => {
+        const context = contextForCell(candidate.rowIndex, candidate.cell);
+        const style = cellTextbox(candidate.cell)?.style || item.style;
+        return materializedCellVisualSignature(candidate.cell, style, context);
+      },
+    );
     return {
       top,
       bottom: resolveSide(owner, 'bottom') || resolveSide(below, 'top'),

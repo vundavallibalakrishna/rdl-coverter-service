@@ -83,7 +83,7 @@ test('a row-spanned group owner keeps its first-row context for conditional bord
   assert.equal(styleColor(textbox.style.borders.top.color, context), '#123456');
 });
 
-test('matching neighbour borders do not override a vertically merged owner whose own top is None', async () => {
+test('an omitted merged-owner top remains absent without a prior visual owner', async () => {
   const bridgedRequest = {
     ...request,
     datasets: { D: request.datasets.D.map((row) => ({ ...row, Number: '002' })) },
@@ -112,6 +112,58 @@ test('matching neighbour borders do not override a vertically merged owner whose
   }));
   assert.ok(ratingCell);
   assert.equal(ratingCell.border?.top, undefined);
+});
+
+test('an unchanged merged owner does not gain an internal row boundary', async () => {
+  const unchangedRequest = {
+    ...request,
+    datasets: { D: [
+      { Risk: 'R1', Number: '002', Rating: 6, Detail: 'Previous group' },
+      { Risk: 'R2', Number: '002', Rating: 6, Detail: 'First action' },
+      { Risk: 'R2', Number: '003', Rating: 6, Detail: 'Second action' },
+    ] },
+  };
+  const pdf = await renderPdf(model, unchangedRequest, config, { captureLayoutTrace: true });
+  const tracedOwner = pdf.layoutTrace.pages[0].items.find((item) => (
+    item.kind === 'tablixCell' && item.text === '6' && item.rowSpan === 2
+  ));
+  assert.equal(tracedOwner?.borders?.top, null);
+});
+
+test('PDF, editable DOCX, and XLSX bridge a changed merged owner across a matching row boundary', async () => {
+  const changedRequest = {
+    ...request,
+    datasets: { D: [
+      { Risk: 'R1', Number: '002', Rating: 'Not Assessed', Detail: 'Previous group' },
+      { Risk: 'R2', Number: '002', Rating: 6, Detail: 'First action' },
+      { Risk: 'R2', Number: '003', Rating: 6, Detail: 'Second action' },
+    ] },
+  };
+  const pdf = await renderPdf(model, changedRequest, config, { captureLayoutTrace: true });
+  const tracedOwner = pdf.layoutTrace.pages[0].items.find((item) => (
+    item.kind === 'tablixCell' && item.text === '6' && item.rowSpan === 2
+  ));
+  assert.deepEqual(tracedOwner?.borders?.top, { style: 'Solid', width: 1, color: '#000000' });
+
+  const docx = await renderEditableDocx(model, changedRequest, config);
+  const documentXml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
+  const ratingTextIndex = documentXml.indexOf('>6</w:t>');
+  assert.ok(ratingTextIndex >= 0);
+  const ratingCellXml = documentXml.slice(
+    documentXml.lastIndexOf('<w:tc>', ratingTextIndex),
+    documentXml.indexOf('</w:tc>', ratingTextIndex) + '</w:tc>'.length,
+  );
+  assert.match(ratingCellXml, /<w:top w:val="single" w:color="000000" w:sz="8"\/>/);
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load((await renderExcel(model, changedRequest, config, null)).buffer);
+  let ratingCell = null;
+  workbook.worksheets[0].eachRow((row) => row.eachCell((cell) => {
+    if ((cell.value === 6 || cell.value === '6') && cell.fill?.fgColor?.argb === 'FFFFFF00') ratingCell = cell;
+  }));
+  assert.ok(ratingCell);
+  assert.equal(ratingCell.border?.top?.style, 'thin');
+  assert.equal(ratingCell.border?.top?.color?.argb, 'FF000000');
 });
 
 test('PDF, editable DOCX, and XLSX preserve the conditional top border of a grouped owner cell', async () => {

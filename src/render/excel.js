@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression } from '../rdl/expression.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, materializedCellContext, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, matchingChangedMergedRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -925,6 +925,15 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
       : undefined);
   const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
     || (above && resolvedOwnerBorder(above, 'bottom'))
+    || matchingChangedMergedRowBoundary(
+      owner,
+      above,
+      left,
+      right,
+      resolvedOwnerBorder,
+      (border) => `${border.style || ''}|${border.color?.argb || ''}`,
+      (candidate) => materializedCellVisualSignature(candidate.cell, candidate.style, candidate.context),
+    )
     || undefined;
   return {
     top,
