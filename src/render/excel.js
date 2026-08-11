@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import ExcelRange from 'exceljs/lib/doc/range.js';
 import PDFDocument from 'pdfkit';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -24,6 +25,10 @@ const EXCEL_TEXT_CLEARANCE_PT = 2;
 // those widths again for the active viewer/font metrics. Reserving one standard 7-pixel digit cell during
 // measurement covers that character-unit conversion without changing the RDL column proportions.
 const EXCEL_MAX_DIGIT_WIDTH_PT = EXCEL_MAX_DIGIT_WIDTH_PX * (72 / EXCEL_LAYOUT_DPI);
+// Merge overlap checks are spatially bucketed by column and row interval. ExcelJS otherwise compares every
+// new merge with every existing merge, which makes large grouped REPORT workbooks quadratic in the number
+// of native merges. Sixty-four rows keeps each lookup bounded without depending on any report geometry.
+const MERGE_ROW_BUCKET_SIZE = 64;
 
 function sheetName(name, fallback) {
   const cleaned = String(name || fallback).replace(SHEET_NAME_FORBIDDEN, ' ').trim().slice(0, 31);
@@ -666,17 +671,79 @@ function rangesOverlap(left, right) {
     && left.startCol <= right.endCol && right.startCol <= left.endCol;
 }
 
-function mergeSafe(worksheet, range, merges, owner = null) {
+function mergeBucket(row) {
+  return Math.floor((row - 1) / MERGE_ROW_BUCKET_SIZE);
+}
+
+function createMergeIndex() {
+  return { bucketsByColumn: new Map() };
+}
+
+function mergeIndexBuckets(index, range, create = false) {
+  const buckets = [];
+  const firstBucket = mergeBucket(range.startRow);
+  const lastBucket = mergeBucket(range.endRow);
+  for (let column = range.startCol; column <= range.endCol; column += 1) {
+    let columnBuckets = index.bucketsByColumn.get(column);
+    if (!columnBuckets && create) {
+      columnBuckets = new Map();
+      index.bucketsByColumn.set(column, columnBuckets);
+    }
+    if (!columnBuckets) continue;
+    for (let bucket = firstBucket; bucket <= lastBucket; bucket += 1) {
+      let candidates = columnBuckets.get(bucket);
+      if (!candidates && create) {
+        candidates = new Set();
+        columnBuckets.set(bucket, candidates);
+      }
+      if (candidates) buckets.push(candidates);
+    }
+  }
+  return buckets;
+}
+
+function findIndexedMergeOverlap(index, range) {
+  for (const candidates of mergeIndexBuckets(index, range)) {
+    for (const candidate of candidates) {
+      if (rangesOverlap(candidate, range)) return candidate;
+    }
+  }
+  return null;
+}
+
+function indexMerge(index, range) {
+  for (const candidates of mergeIndexBuckets(index, range, true)) candidates.add(range);
+}
+
+// The range has already passed our overlap check. Reproduce ExcelJS's merge operation without calling its
+// public mergeCells(), whose implementation redundantly scans the complete worksheet merge collection for
+// every insertion. Keep this small adapter aligned with the pinned ExcelJS operation: followers reference
+// the master and inherit its style, while the Range remains in _merges for normal OOXML serialization.
+function applyPrevalidatedMerge(worksheet, range) {
+  if (!worksheet?._merges || typeof worksheet.getCell !== 'function') {
+    throw new ServiceError('RENDER_FAILED', 'Excel worksheet merge support is unavailable');
+  }
+  const dimensions = new ExcelRange(range.startRow, range.startCol, range.endRow, range.endCol);
+  const master = worksheet.getCell(dimensions.top, dimensions.left);
+  for (let row = dimensions.top; row <= dimensions.bottom; row += 1) {
+    for (let column = dimensions.left; column <= dimensions.right; column += 1) {
+      if (row !== dimensions.top || column !== dimensions.left) worksheet.getCell(row, column).merge(master);
+    }
+  }
+  worksheet._merges[master.address] = dimensions;
+}
+
+function mergeSafe(worksheet, range, mergeIndex, owner = null) {
   if (range.startRow === range.endRow && range.startCol === range.endCol) return;
-  const existing = merges.find((candidate) => rangesOverlap(candidate, range));
+  const existing = findIndexedMergeOverlap(mergeIndex, range);
   if (existing) {
     throw new ServiceError(
       'RDL_INVALID',
       `RDL produced overlapping Excel merged-cell ranges${owner ? ` for ${owner}` : ''} (${existing.startRow},${existing.startCol}:${existing.endRow},${existing.endCol} and ${range.startRow},${range.startCol}:${range.endRow},${range.endCol})`,
     );
   }
-  worksheet.mergeCells(range.startRow, range.startCol, range.endRow, range.endCol);
-  merges.push(range);
+  applyPrevalidatedMerge(worksheet, range);
+  indexMerge(mergeIndex, range);
 }
 
 function splitTallRowIntervals(boundaries) {
@@ -1586,7 +1653,7 @@ async function renderCoordinateScheduledSection({
       config,
       xGrid,
       startRow: 1,
-      merges: [],
+      merges: createMergeIndex(),
       tablixCache,
       measureDoc,
     });
@@ -1788,7 +1855,7 @@ async function renderReportExcel(model, request, config, tempDir) {
     for (let column = 0; column < xGrid.length - 1; column += 1) {
       worksheet.getColumn(column + 1).width = excelWidthFromPoints(xGrid[column + 1] - xGrid[column]);
     }
-    const merges = [];
+    const merges = createMergeIndex();
     let cursor = 1;
     let headerBandRows = 0;
     if (model.page.header?.items?.length) {

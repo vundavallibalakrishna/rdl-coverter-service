@@ -685,6 +685,41 @@ test('REPORT mode preserves vertical group spans as native merges and closes the
   assert.ok((ws.views.find((view) => view.state === 'frozen')?.xSplit || 0) > 0);
 });
 
+test('REPORT mode applies thousands of prevalidated merges without ExcelJS quadratic overlap scans', async () => {
+  const grouped = parseRdl(groupedRdl());
+  const rows = Array.from({ length: 1_200 }, (_, index) => ({
+    Region: `Region ${Math.floor(index / 2)}`,
+    Name: `Item ${index}`,
+    Amount: index,
+  }));
+  // ExcelJS mergeCells() checks a new range against every merge already in the worksheet. REPORT mode has
+  // already validated the complete native merge plan, so calling that public path would reintroduce the
+  // O(M^2) behavior that made large grouped/subreport workbooks exceed the Windows caller timeout.
+  const probe = new ExcelJS.Workbook().addWorksheet('Probe');
+  const worksheetPrototype = Object.getPrototypeOf(probe);
+  const originalMergeCells = worksheetPrototype.mergeCells;
+  worksheetPrototype.mergeCells = () => {
+    throw new Error('REPORT mode used ExcelJS quadratic merge insertion');
+  };
+  const started = performance.now();
+  let result;
+  try {
+    result = await renderExcel(grouped, {
+      outputFileName: 'Large grouped merge plan',
+      parameters: {},
+      datasets: { D: rows },
+      excel: { layoutMode: 'REPORT' },
+    }, config, null);
+  } finally {
+    worksheetPrototype.mergeCells = originalMergeCells;
+  }
+  assert.ok(performance.now() - started < 10_000, 'indexed REPORT merge insertion must remain bounded');
+  const zip = await JSZip.loadAsync(result.buffer);
+  const sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+  const mergeCount = (sheetXml.match(/<mergeCell ref=/g) || []).length;
+  assert.ok(mergeCount >= 600, `expected at least one native group merge per pair, got ${mergeCount}`);
+});
+
 test('REPORT mode coalesces only borderless HideDuplicates runs and never resurrects suppressed typed values', async () => {
   const hiddenDuplicates = parseRdl(hideDuplicatesRdl());
   const result = await renderExcel(hiddenDuplicates, {
