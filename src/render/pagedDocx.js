@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   AlignmentType,
   BorderStyle,
+  BuilderElement,
   Document,
   Footer,
   HeightRule,
@@ -470,7 +471,7 @@ function strongerBorder(left, right) {
   return rightWidth >= leftWidth ? right : left;
 }
 
-function linesForParagraphs(item, bottomPaddingTwips = 0) {
+function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null) {
   const source = item.lines || [];
   if (source.length === 0) return [new Paragraph({
     spacing: {
@@ -525,9 +526,21 @@ function linesForParagraphs(item, bottomPaddingTwips = 0) {
     const runs = [];
     group.lines.forEach((line, lineIndex) => {
       const lineRuns = line.runs?.length ? line.runs : [{ text: '', font: {} }];
+      // PDFKit and Microsoft Word can produce slightly different glyph advances for the same embedded
+      // font. The canonical trace has already selected the physical line and measured its exact width;
+      // leaving Word to measure that text again can make a nearly-full line wrap a few words early and
+      // then clip inside the trace-locked row height. WordprocessingML fitText is the native mechanism for
+      // assigning a manual width to one or more contiguous runs. Give every run on the physical PDF line
+      // the same id and width so mixed formatting remains editable while Word cannot choose a new wrap.
+      const tracedLineWidthTwips = Number.isFinite(Number(line.width)) && Number(line.width) > 0
+        ? Math.max(1, pointsToTwips(Number(line.width)))
+        : null;
+      const fitTextId = tracedLineWidthTwips !== null && fitTextCounter
+        ? fitTextCounter.value++
+        : null;
       lineRuns.forEach((run, runIndex) => {
         const font = run.font || {};
-        runs.push(new TextRun({
+        const textRun = new TextRun({
           text: String(run.text ?? ''),
           break: lineIndex > 0 && runIndex === 0 ? 1 : undefined,
           font: font.family || 'Arial',
@@ -538,7 +551,17 @@ function linesForParagraphs(item, bottomPaddingTwips = 0) {
           strike: Boolean(font.strike),
           color: cleanColor(font.color),
           characterSpacing: 0,
-        }));
+        });
+        if (fitTextId !== null) {
+          textRun.root[0].root.push(new BuilderElement({
+            name: 'w:fitText',
+            attributes: {
+              id: { key: 'w:id', value: fitTextId },
+              val: { key: 'w:val', value: tracedLineWidthTwips },
+            },
+          }));
+        }
+        runs.push(textRun);
       });
     });
     return new Paragraph({
@@ -1095,6 +1118,7 @@ async function nativePageFooter(
   config,
   tempDir,
   chartCounter,
+  fitTextCounter,
 ) {
   const layout = footerLayout(page);
   if (!layout) return null;
@@ -1124,6 +1148,7 @@ async function nativePageFooter(
         config,
         tempDir,
         chartCounter,
+        fitTextCounter,
       ),
       emptyFooterParagraph(),
     ],
@@ -1154,7 +1179,19 @@ function cellMargins(item) {
   };
 }
 
-async function tableCellFor(grid, row, column, placement, resources, model, request, config, tempDir, chartCounter) {
+async function tableCellFor(
+  grid,
+  row,
+  column,
+  placement,
+  resources,
+  model,
+  request,
+  config,
+  tempDir,
+  chartCounter,
+  fitTextCounter,
+) {
   const rowSpan = placement ? placement.endRow - placement.startRow : 1;
   const columnSpan = placement ? placement.endColumn - placement.startColumn : 1;
   const owner = placement?.item || null;
@@ -1184,7 +1221,7 @@ async function tableCellFor(grid, row, column, placement, resources, model, requ
       bottomPaddingTwips,
     )];
   } else {
-    children = owner ? linesForParagraphs(owner, bottomPaddingTwips) : [new Paragraph({
+    children = owner ? linesForParagraphs(owner, bottomPaddingTwips, fitTextCounter) : [new Paragraph({
       spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
       children: [new TextRun({ text: '' })],
     })];
@@ -1210,7 +1247,16 @@ async function tableCellFor(grid, row, column, placement, resources, model, requ
   });
 }
 
-async function pageTable(grid, resources, model, request, config, tempDir, chartCounter) {
+async function pageTable(
+  grid,
+  resources,
+  model,
+  request,
+  config,
+  tempDir,
+  chartCounter,
+  fitTextCounter,
+) {
   const rows = [];
   for (let row = 0; row < grid.yBoundaries.length - 1; row += 1) {
     const children = [];
@@ -1238,6 +1284,7 @@ async function pageTable(grid, resources, model, request, config, tempDir, chart
           config,
           tempDir,
           chartCounter,
+          fitTextCounter,
         );
         children.push(cell);
         column = placement.endColumn;
@@ -1253,6 +1300,7 @@ async function pageTable(grid, resources, model, request, config, tempDir, chart
           config,
           tempDir,
           chartCounter,
+          fitTextCounter,
         );
         children.push(cell);
         column += 1;
@@ -1531,6 +1579,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
     const resources = modelResources(model);
     const canonicalRequest = { ...request, __canonicalPageCount: canonical.pageCount };
     const chartCounter = { value: 0 };
+    const fitTextCounter = { value: 1 };
     const sections = [];
     for (const [index, page] of trace.pages.entries()) {
       // Footer items must not participate in body flow. Word always inserts a terminal paragraph after
@@ -1547,6 +1596,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
         config,
         workingTempDir,
         chartCounter,
+        fitTextCounter,
       );
       sections.push({
         properties: pageProperties(page, index),
@@ -1559,6 +1609,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
           config,
           workingTempDir,
           chartCounter,
+          fitTextCounter,
         )],
       });
       if ((index + 1) % 25 === 0 || index + 1 === trace.pages.length) {

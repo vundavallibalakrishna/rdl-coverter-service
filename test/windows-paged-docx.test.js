@@ -174,6 +174,16 @@ test('page-locked DOCX preserves mixed PDF line pitches without inflating every 
   const explicitBoundaries = (textParagraphs.length - 1)
     + textParagraphs.reduce((total, paragraph) => total + (paragraph.match(/<w:br\/>/g) || []).length, 0);
   assert.equal(explicitBoundaries, traced.lines.length - 1, 'every canonical wrap point must remain explicit');
+  const fitTextElements = documentXml.match(/<w:fitText\b[^>]*\/>/g) || [];
+  const fitTextIds = new Set(fitTextElements.map((element) => element.match(/w:id="(\d+)"/)?.[1]).filter(Boolean));
+  assert.equal(fitTextIds.size, traced.lines.length, 'each physical PDF line must own one manual Word width');
+  for (const line of traced.lines) {
+    const expectedWidth = Math.max(1, Math.round(line.width * 20));
+    assert.ok(
+      fitTextElements.some((element) => new RegExp(`w:val="${expectedWidth}"`).test(element)),
+      `missing manual Word width for traced ${expectedWidth}-twip line`,
+    );
+  }
   assert.equal(rendered.pageCount, canonical.pageCount);
 });
 
