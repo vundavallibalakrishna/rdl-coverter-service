@@ -386,6 +386,56 @@ function visiblePageBreak(item, context) {
   return String(item.pageBreak.location || 'None');
 }
 
+function declaresNestedPageBreak(item, context) {
+  return (item.items || []).some((child) => (
+    !/^None$/i.test(visiblePageBreak(child, context))
+    || declaresNestedPageBreak(child, context)
+  ));
+}
+
+function paintsOwnExtent(style, context) {
+  if (styleColor(style?.backgroundColor, context, null)) return true;
+  return ['top', 'right', 'bottom', 'left'].some((side) => {
+    const border = style?.borders?.[side] || style?.border;
+    return border && !/^none$/i.test(String(styleValue(border.style, context, 'None')));
+  });
+}
+
+// PageBreak is a property of every RDL report item, not only of a direct Body child. A rectangle is a
+// coordinate container rather than a page unit, so a break declared on one of its children splits the report
+// flow *inside* it. REPORT worksheets are partitioned at breaks, so such a container is expanded into its
+// children at absolute body coordinates and the partition falls between them. Containers without a nested
+// break keep the existing container path untouched.
+//
+// A container that paints its own fill or border cannot be expanded without losing that paint. That is the
+// same construct the PDF renderer refuses to fragment, so it fails closed with the same code rather than
+// producing a silently different worksheet.
+function expandBreakBearingContainers(items, context, offsetLeft = 0, offsetTop = 0) {
+  const expanded = [];
+  for (const item of items) {
+    if (isHidden(item.hidden, context)) continue;
+    // Copy only when a container above actually moved this item, so a report without nested breaks keeps
+    // the identical item objects (and therefore the identical tablix layout cache keys) it had before.
+    const shifted = offsetLeft || offsetTop
+      ? { ...item, left: (item.left || 0) + offsetLeft, top: (item.top || 0) + offsetTop }
+      : item;
+    if (item.type !== 'Rectangle' || !declaresNestedPageBreak(item, context)) {
+      expanded.push(shifted);
+      continue;
+    }
+    if (paintsOwnExtent(item.style, context)) {
+      throw new ServiceError(
+        'UNSUPPORTED_FEATURE',
+        'A page-spanning rectangle with a visible fill or border cannot be safely fragmented',
+        422,
+        { item: item.name || null },
+      );
+    }
+    expanded.push(...expandBreakBearingContainers(item.items || [], context, shifted.left, shifted.top));
+  }
+  return expanded;
+}
+
 export { resolveExcelLayoutMode };
 
 function uniqueSheetName(workbook, requested, fallback) {
@@ -401,8 +451,7 @@ function uniqueSheetName(workbook, requested, fallback) {
 }
 
 function partitionReportSections(model, context) {
-  const items = [...(model.body.items || [])]
-    .filter((item) => !isHidden(item.hidden, context))
+  const items = expandBreakBearingContainers(model.body.items || [], context)
     .sort((left, right) => left.top - right.top || left.left - right.left || left.zIndex - right.zIndex);
   const sections = [];
   let current = [];

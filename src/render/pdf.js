@@ -20,8 +20,36 @@ import {
 // 1pt hairlines render at a crisp, uniform weight instead of rounding unevenly across screen zoom levels.
 let borderWidthFloor = 0;
 const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
+// Minimum number of text lines a growable textbox fragment must be able to carry before the block is
+// allowed to start on the current page. A break that strands fewer lines than this reads as a
+// typesetting error rather than as flow, so the block moves to the next page instead. This is the
+// standard typographic orphan minimum and matches Word's default widow/orphan control.
+const MINIMUM_FLOWED_TEXT_LINES = 2;
 
-function containerLayoutBands(items) {
+// PageBreak is a property of EVERY RDL report item, not only of a direct <Body> child: a rectangle nested
+// inside another rectangle, or a tablix inside one, carries the same property with the same meaning. RDL
+// makes BreakLocation a plain enum while Disabled is expression-capable, so only Disabled resolves through
+// the style helpers.
+function activeBreakLocation(item, context) {
+  if (!item?.pageBreak || isHidden(item.pageBreak.disabled, context)) return 'None';
+  return String(item.pageBreak.location || 'None');
+}
+
+const breaksBeforeItem = (location) => /^(Start|StartAndEnd)$/i.test(location);
+const breaksAfterItem = (location) => /^(End|StartAndEnd)$/i.test(location);
+
+// Structural (context-free) question: can this subtree move the page cursor by itself? A declared break
+// makes the item a flow participant rather than a fixed-coordinate one, exactly like a tablix or a growable
+// textbox. Disabled is per-row, so this deliberately over-approximates: a disabled break costs the item its
+// fixed-coordinate fast path, never a wrong page.
+function declaresPageBreak(item) {
+  if (item?.pageBreak && !/^None$/i.test(String(item.pageBreak.location || 'None'))) return true;
+  return (item?.items || []).some(declaresPageBreak);
+}
+
+// `isolate` marks an item that must not share a layout band with its neighbours. A break-carrying item is
+// its own flow unit: banding it with a coordinate peer would render the peer before the break is applied.
+function containerLayoutBands(items, isolate = () => false) {
   const ordered = [...items].sort((left, right) => (
     (left.top || 0) - (right.top || 0)
     || (left.left || 0) - (right.left || 0)
@@ -32,12 +60,13 @@ function containerLayoutBands(items) {
     const top = item.top || 0;
     const bottom = top + (item.height || 0);
     const band = bands[bands.length - 1];
+    const isolated = Boolean(isolate(item));
     const coincidentTop = band
       && Math.abs(top - band.top) <= COINCIDENT_EDGE_TOLERANCE_PT;
     const overlapsBand = band
       && top < band.designBottom - COINCIDENT_EDGE_TOLERANCE_PT;
-    if (!band || (!coincidentTop && !overlapsBand)) {
-      bands.push({ top, designBottom: bottom, items: [item] });
+    if (!band || isolated || band.isolated || (!coincidentTop && !overlapsBand)) {
+      bands.push({ top, designBottom: bottom, items: [item], isolated });
       continue;
     }
     band.designBottom = Math.max(band.designBottom, bottom);
@@ -1615,7 +1644,18 @@ export async function renderPdf(model, request, config, options = {}) {
       let firstSegment = true;
       const verticalPadding = styleSize(item.style?.paddingTop, context, 2)
         + styleSize(item.style?.paddingBottom, context, 2);
-      const freshCapacity = Math.max(1, pageBottom - bodyTop);
+      // A growable textbox whose *text* outgrows the page remainder is a flowing block, not an atomic unit
+      // like a tablix row: it can be most of a page tall. Deferring such a block whenever it merely fits on
+      // an empty page discards the entire remainder, so a block one line too tall leaves a blank band its
+      // own height. It instead fills the remainder and continues on the next page, which is what
+      // splitTextForHeight below already implements, unless the remainder is below the orphan minimum.
+      //
+      // The RDL KeepTogether flag is deliberately not a veto here. It is defined as best-effort ("keep on
+      // one page if possible"), and designers emit it on essentially every textbox, so honouring it
+      // absolutely would stop any long textbox in any report from ever crossing a page boundary. Atomic
+      // keep-together remains enforced where the unit really is indivisible: tablix rows.
+      const orphanHeight = verticalPadding
+        + MINIMUM_FLOWED_TEXT_LINES * lineHeightForStyle(doc, config, item.style, context);
       while (true) {
         const measured = measureTextboxHeight(doc, config, item, context, remaining, item.width)
           + verticalPadding;
@@ -1629,16 +1669,16 @@ export async function renderPdf(model, request, config, options = {}) {
           });
           return { height: currentY + desiredHeight - y, endY: currentY + desiredHeight };
         }
-        // Keep the complete textbox together when it fits on a fresh page. This mirrors the existing
-        // tablix-row policy and avoids creating a short first-page fragment solely because earlier
-        // coordinate-flow content consumed the remainder.
-        if (desiredHeight <= freshCapacity && currentY > bodyTop + 0.5) {
+        // Only the declared height overflows: the text itself still fits. The declared height is a minimum
+        // reservation rather than content, so there is nothing to flow — splitting here would silently
+        // squash the box into the remainder. Move the reserved block to a fresh page as a unit instead.
+        if (measured <= available + 0.5 && currentY > bodyTop + 0.5) {
           pageAdvance();
           currentY = bodyTop;
           firstSegment = false;
           continue;
         }
-        if (available <= Math.max(10, styleSize(item.style?.fontSize, context, 10) || 10)) {
+        if (available < orphanHeight && currentY > bodyTop + 0.5) {
           pageAdvance();
           currentY = bodyTop;
           firstSegment = false;
@@ -1687,16 +1727,43 @@ export async function renderPdf(model, request, config, options = {}) {
       if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
       drawBorder(doc, x, y, item.width, item.height, item.style, context);
       const visibleChildren = (item.items || []).filter((child) => !isHidden(child.hidden, context));
-      const bands = containerLayoutBands(visibleChildren);
+      const bands = containerLayoutBands(
+        visibleChildren,
+        (child) => !/^None$/i.test(activeBreakLocation(child, context)),
+      );
+      // Fragmenting the container is only safe when nothing paints its extent: a fill or border would be
+      // drawn once, at the design height, on the page the container started on. The same guard already
+      // covers content-driven fragmentation below; a declared break reaches it through this helper.
+      const refuseFragmentationWithVisibleExtent = () => {
+        const hasVisibleBorder = Object.values(resolvedTraceBorders(item.style, context)).some(Boolean);
+        if (!backgroundColor && !hasVisibleBorder) return;
+        throw new ServiceError(
+          'UNSUPPORTED_FEATURE',
+          'A page-spanning rectangle with a visible fill or border cannot be safely fragmented',
+          422,
+          { item: item.name || null },
+        );
+      };
       let endY = y;
       let previousDesignBottom = 0;
       let hasRenderedBand = false;
+      // Carried across bands, and out of this container, exactly like the body-level flow: an End break is
+      // owned by the item that declares it but is spent on whatever comes next, which may be a later band,
+      // a following sibling, or a sibling of an ancestor.
+      let pendingBreak = false;
       for (const band of bands) {
+        const bandBreak = band.isolated ? activeBreakLocation(band.items[0], context) : 'None';
         const gap = hasRenderedBand ? Math.max(0, band.top - previousDesignBottom) : band.top;
         let bandY = endY + gap;
         const bandHeight = band.designBottom - band.top;
         const fixedBand = band.items.every(isFixedCoordinateItem);
-        if (bandY >= pageBottom || (
+        const atPageTop = bandY <= bodyTop + COINCIDENT_EDGE_TOLERANCE_PT;
+        if (pendingBreak || (breaksBeforeItem(bandBreak) && !atPageTop)) {
+          refuseFragmentationWithVisibleExtent();
+          pageAdvance();
+          bandY = bodyTop;
+          pendingBreak = false;
+        } else if (bandY >= pageBottom || (
           fixedBand
           && bandY + bandHeight > pageBottom
           && endY > bodyTop + COINCIDENT_EDGE_TOLERANCE_PT
@@ -1705,6 +1772,9 @@ export async function renderPdf(model, request, config, options = {}) {
           bandY = bodyTop;
         }
         let bandEndY = bandY;
+        // A child container can end with a break of its own; the break belongs to the enclosing flow, so it
+        // surfaces here and is spent on the next band or handed further out.
+        let bandPropagatedBreak = false;
         const orderedBandItems = [...band.items].sort((left, right) => (
           (left.zIndex || 0) - (right.zIndex || 0)
           || (left.top || 0) - (right.top || 0)
@@ -1735,23 +1805,13 @@ export async function renderPdf(model, request, config, options = {}) {
               { addPage: synchronizedAdvance },
             );
             state.lastPage = Math.max(state.lastPage, globals.PageNumber);
+            bandPropagatedBreak = bandPropagatedBreak || Boolean(rendered.pageBreakAfter);
             childEnds.push({
               page: globals.PageNumber,
               endY: rendered.endY ?? childY,
             });
           }
-          if (state.lastPage > startPage) {
-            const hasVisibleBorder = Object.values(resolvedTraceBorders(item.style, context))
-              .some(Boolean);
-            if (backgroundColor || hasVisibleBorder) {
-              throw new ServiceError(
-                'UNSUPPORTED_FEATURE',
-                'A page-spanning rectangle with a visible fill or border cannot be safely fragmented',
-                422,
-                { item: item.name || null },
-              );
-            }
-          }
+          if (state.lastPage > startPage) refuseFragmentationWithVisibleExtent();
           switchBufferedPage(state.lastPage);
           bandEndY = Math.max(
             bandY,
@@ -1771,6 +1831,7 @@ export async function renderPdf(model, request, config, options = {}) {
               { addPage: pageAdvance },
             );
             const renderedEndY = rendered.endY ?? childY;
+            bandPropagatedBreak = bandPropagatedBreak || Boolean(rendered.pageBreakAfter);
             // Y coordinates are page-local. Once a single-child band advances to another page, its
             // final-page endpoint replaces the prior-page band coordinate; comparing the two with
             // Math.max would retain a stale Y and can push otherwise fitting later bands forward.
@@ -1782,6 +1843,7 @@ export async function renderPdf(model, request, config, options = {}) {
         endY = bandEndY;
         previousDesignBottom = band.designBottom;
         hasRenderedBand = true;
+        if (breaksAfterItem(bandBreak) || bandPropagatedBreak) pendingBreak = true;
       }
       if (hasRenderedBand) {
         endY += Math.max(0, item.height - previousDesignBottom);
@@ -1789,6 +1851,7 @@ export async function renderPdf(model, request, config, options = {}) {
       return {
         height: Math.max(item.height, endY - y),
         endY: hasRenderedBand ? endY : y + item.height,
+        pageBreakAfter: pendingBreak,
       };
     }
     drawSimpleItem(doc, config, model, item, x, y, context);
@@ -1801,6 +1864,10 @@ export async function renderPdf(model, request, config, options = {}) {
   // fragments, while fixed items can safely share their declared page-relative Y coordinate.
   const isFixedCoordinateItem = (item) => {
     if (item.type === 'Tablix' || (item.type === 'Textbox' && item.canGrow)) return false;
+    // A declared break makes the item move the page cursor, so it is a flow participant however simple its
+    // own content is. Without this a break nested in a textbox-only rectangle keeps the fixed-coordinate
+    // fast path and its page advance is measured against a stale band origin.
+    if (declaresPageBreak(item)) return false;
     if (item.type === 'Rectangle') return (item.items || []).every(isFixedCoordinateItem);
     return true;
   };
@@ -1809,10 +1876,11 @@ export async function renderPdf(model, request, config, options = {}) {
     (left.left || 0) + (left.width || 0) <= (right.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
     || (right.left || 0) + (right.width || 0) <= (left.left || 0) + COINCIDENT_EDGE_TOLERANCE_PT
   );
-  const activeBreakLocation = (item, context) => {
-    const disabled = item.pageBreak ? isHidden(item.pageBreak.disabled, context) : true;
-    return disabled ? 'None' : String(item.pageBreak?.location || 'None');
-  };
+  // A subtree that declares a break anywhere is its own flow unit at body level too: it must not be banded
+  // with a coordinate peer, because the peer would be drawn before the nested break moved the page.
+  const carriesPageBreak = (item, context) => (
+    !/^None$/i.test(activeBreakLocation(item, context)) || declaresPageBreak(item)
+  );
   let cursorY = bodyTop;
   let previousDesignBottom = 0;
   let pageHasContent = false;
@@ -1826,7 +1894,7 @@ export async function renderPdf(model, request, config, options = {}) {
     }
     const breakLocation = activeBreakLocation(item, context);
     let band = [item];
-    if (/^None$/i.test(breakLocation)) {
+    if (!carriesPageBreak(item, context)) {
       let nextIndex = itemIndex + 1;
       let designBottom = (item.top || 0) + (item.height || 0);
       while (nextIndex < items.length) {
@@ -1835,7 +1903,7 @@ export async function renderPdf(model, request, config, options = {}) {
           nextIndex += 1;
           continue;
         }
-        if (!/^None$/i.test(activeBreakLocation(candidate, context))) break;
+        if (carriesPageBreak(candidate, context)) break;
         const coincidentTop = sameDesignTop(item, candidate);
         const overlapsVertically = (candidate.top || 0) < designBottom - COINCIDENT_EDGE_TOLERANCE_PT;
         // Different horizontal lanes are coordinate peers while their declared vertical intervals
@@ -1851,7 +1919,7 @@ export async function renderPdf(model, request, config, options = {}) {
     } else {
       itemIndex += 1;
     }
-    if (forcePageBreak || (/^(Start|StartAndEnd)$/i.test(breakLocation) && pageHasContent)) {
+    if (forcePageBreak || (breaksBeforeItem(breakLocation) && pageHasContent)) {
       addPage();
       cursorY = bodyTop;
       pageHasContent = false;
@@ -1872,6 +1940,9 @@ export async function renderPdf(model, request, config, options = {}) {
       pageHasContent = false;
     }
     let bandEndY = y;
+    // A break declared on the last child of a container is owned by the enclosing flow: the container
+    // reports it here and the next body band spends it.
+    let propagatedBreak = false;
     const fixedBand = band.every(isFixedCoordinateItem);
     if (band.length > 1 && !fixedBand) {
       const startPage = globals.PageNumber;
@@ -1899,6 +1970,7 @@ export async function renderPdf(model, request, config, options = {}) {
           addPage: synchronizedAdvance,
         });
         state.lastPage = Math.max(state.lastPage, globals.PageNumber);
+        propagatedBreak = propagatedBreak || Boolean(rendered.pageBreakAfter);
         childEnds.push({
           page: globals.PageNumber,
           endY: rendered.endY ?? candidateY,
@@ -1916,6 +1988,7 @@ export async function renderPdf(model, request, config, options = {}) {
         const candidateY = y + candidate.top - item.top;
         const x = page.marginLeft + candidate.left;
         const rendered = renderBodyItem(candidate, x, candidateY, context);
+        propagatedBreak = propagatedBreak || Boolean(rendered.pageBreakAfter);
         bandEndY = Math.max(bandEndY, rendered.endY);
       }
     }
@@ -1925,7 +1998,7 @@ export async function renderPdf(model, request, config, options = {}) {
     );
     cursorY = bandEndY;
     pageHasContent = true;
-    if (/^(End|StartAndEnd)$/i.test(breakLocation)) {
+    if (breaksAfterItem(breakLocation) || propagatedBreak) {
       forcePageBreak = true;
     }
   }
