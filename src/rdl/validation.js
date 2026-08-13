@@ -677,6 +677,7 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
           lastBreakKey.set(group, groupKey);
         }
       }
+      const memberKeepTogether = path.some((member) => member.keepTogether);
       output.push({
         sourceIndex: index,
         isHeader: index < repeatingHeaderCount,
@@ -693,7 +694,10 @@ export function materializeTablixRows(tablix, rows, parameters, globals = {}, da
         previousInstance,
         previousInstances,
         height: row.height,
-        keepTogether: path.some((member) => member.keepTogether) || row.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
+        // A textbox/item KeepTogether applies to this physical row's content. Only a tablix member
+        // KeepTogether may reserve the complete row-group/vertical-merge span during pagination.
+        keepTogether: memberKeepTogether || row.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
+        keepSpanTogether: memberKeepTogether,
         cells: [
           ...rowHeaders,
           ...row.cells.map((cell, cellIndex) => materializedCell(cell, context, duplicateState, `body:${index}:${cellIndex}`, resolveScope)),
@@ -1060,6 +1064,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       bodyCells = template.cells.map((cell, cellIndex) => materializedCell(cell, context, duplicateState, `body:${unit.templateIndex}:${cellIndex}`, resolveScope));
     }
 
+    const memberKeepTogether = unit.path.some((member) => member.keepTogether);
     output.push({
       sourceIndex: unit.templateIndex,
       isHeader: index < repeatingHeaderCount,
@@ -1076,7 +1081,10 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       previousInstance: unit.previousInstance,
       previousInstances: unit.previousInstances,
       height: template.height,
-      keepTogether: unit.path.some((member) => member.keepTogether) || template.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
+      // Keep the physical-row and row-group semantics distinct. Item KeepTogether must not promote a
+      // vertically merged group into an indivisible page unit.
+      keepTogether: memberKeepTogether || template.cells.some((cell) => cell.items.some((item) => item.keepTogether)),
+      keepSpanTogether: memberKeepTogether,
       cells: [...rowHeaders, ...bodyCells],
     });
   }
@@ -1144,6 +1152,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
         tablixName: tablix.name,
         height: tablix.rows[0]?.height || 18,
         keepTogether: false,
+        keepSpanTogether: false,
         cells,
       });
     });

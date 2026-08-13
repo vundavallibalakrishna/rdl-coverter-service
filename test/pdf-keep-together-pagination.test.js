@@ -4,9 +4,15 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { loadConfig } from '../src/config.js';
 import { parseRdl } from '../src/rdl/parser.js';
+import { materializeTablixRows } from '../src/rdl/validation.js';
+import { renderEditableDocx } from '../src/render/docx.js';
+import { renderExcel } from '../src/render/excel.js';
 import { renderPdf } from '../src/render/pdf.js';
+import { renderVisualDocx } from '../src/render/visualDocx.js';
 
 const execFileAsync = promisify(execFile);
 const fixture = await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url));
@@ -90,6 +96,22 @@ function keepTogetherScenario(lines, withLeadingItem) {
   return { model, request };
 }
 
+function verticalMergeScenario(memberKeepTogether = false) {
+  const scenario = keepTogetherScenario(0, true);
+  const tablix = scenario.model.body.items.find((item) => item.type === 'Tablix');
+  const dynamicMember = tablix.rowMembers[1];
+  dynamicMember.keepTogether = memberKeepTogether;
+  tablix.rowMemberPaths[1] = [dynamicMember];
+  tablix.rows[1].height = 30;
+  scenario.request.outputFileName = memberKeepTogether ? 'kept-vertical-merge' : 'splittable-vertical-merge';
+  scenario.request.datasets.Sales = Array.from({ length: 4 }, (_, index) => ({
+    Name: `SPAN_ROW_${index + 1}`,
+    Amount: index + 1,
+    Group: 'SPLITTABLE_GROUP',
+  }));
+  return scenario;
+}
+
 async function renderAndExtract(context, scenario, name) {
   await fs.mkdir(tmpRoot, { recursive: true });
   const pdfPath = path.join(tmpRoot, `${name}-${process.pid}.pdf`);
@@ -125,6 +147,71 @@ test('splits an oversized keep-together row when it already starts on a fresh pa
     const marker = `KEEP_LINE_${String(index).padStart(3, '0')}`;
     assert.equal((rendered.text.match(new RegExp(marker, 'g')) || []).length, 1);
   }
+});
+
+test('fills the current page through a vertical merge unless its member declares KeepTogether', async (context) => {
+  const splittable = verticalMergeScenario(false);
+  const tablix = splittable.model.body.items.find((item) => item.type === 'Tablix');
+  const materialized = materializeTablixRows(
+    tablix,
+    splittable.request.datasets.Sales,
+    splittable.request.parameters,
+    {},
+    splittable.request.datasets,
+  );
+  const firstDetail = materialized.find((row) => !row.isHeader);
+  assert.equal(firstDetail.keepTogether, true, 'textbox KeepTogether still applies to the physical row');
+  assert.equal(firstDetail.keepSpanTogether, false, 'textbox KeepTogether does not promote the vertical merge');
+  assert.equal(Math.max(...firstDetail.cells.map((cell) => cell.rowSpan || 1)), 4);
+
+  const splitPdf = await renderAndExtract(context, splittable, 'splittable-vertical-merge');
+  const splitFirstPage = await execFileAsync('pdftotext', ['-f', '1', '-l', '1', '-layout', splitPdf.pdfPath, '-']);
+  const splitSecondPage = await execFileAsync('pdftotext', ['-f', '2', '-l', '2', '-layout', splitPdf.pdfPath, '-']);
+  assert.match(splitFirstPage.stdout, /SPAN_ROW_1/,
+    'the merge starts in the available space instead of being reserved as one indivisible block');
+  assert.match(splitSecondPage.stdout, /SPAN_ROW_4/);
+
+  const kept = verticalMergeScenario(true);
+  const keptPdf = await renderAndExtract(context, kept, 'kept-vertical-merge');
+  const keptFirstPage = await execFileAsync('pdftotext', ['-f', '1', '-l', '1', '-layout', keptPdf.pdfPath, '-']);
+  const keptSecondPage = await execFileAsync('pdftotext', ['-f', '2', '-l', '2', '-layout', keptPdf.pdfPath, '-']);
+  assert.doesNotMatch(keptFirstPage.stdout, /SPAN_ROW_1/,
+    'an explicit tablix-member KeepTogether continues to reserve the complete merge');
+  assert.match(keptSecondPage.stdout, /SPAN_ROW_1/);
+});
+
+test('PDF-guided DOCX outputs and XLSX preserve a splittable vertical merge generically', async (context) => {
+  const scenario = verticalMergeScenario(false);
+  const canonical = await renderPdf(scenario.model, scenario.request, config, { captureLayoutTrace: true });
+
+  const editable = await renderEditableDocx(scenario.model, scenario.request, config);
+  assert.equal(editable.pageCount, canonical.pageCount);
+  const editableZip = await JSZip.loadAsync(editable.buffer);
+  const documentXml = await editableZip.file('word/document.xml').async('string');
+  assert.match(documentXml, /<w:vMerge w:val="restart"\/>/);
+  assert.match(documentXml, /<w:t[^>]*>SPAN_ROW_1<\/w:t>/);
+  assert.match(documentXml, /<w:t[^>]*>SPAN_ROW_4<\/w:t>/);
+
+  const excel = await renderExcel(scenario.model, scenario.request, config, null);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(excel.buffer);
+  const worksheet = workbook.worksheets[0];
+  const groupMerge = worksheet.model.merges.find((range) => (
+    worksheet.getCell(range.split(':')[0]).value === 'SPLITTABLE_GROUP'
+  ));
+  assert.ok(groupMerge, 'XLSX REPORT retains the logical vertical merge; pagination is not applicable');
+  const [mergeStart, mergeEnd] = groupMerge.split(':');
+  assert.equal(worksheet.getCell(mergeEnd).row - worksheet.getCell(mergeStart).row + 1, 4);
+
+  const visualTemp = await fs.mkdtemp(path.join(tmpRoot, 'vertical-merge-visual-'));
+  context.after(() => fs.rm(visualTemp, { recursive: true, force: true }));
+  const visual = await renderVisualDocx(scenario.model, scenario.request, config, visualTemp);
+  const visualZip = await JSZip.loadAsync(visual.buffer);
+  assert.equal(visual.pageCount, canonical.pageCount);
+  assert.equal(
+    Object.keys(visualZip.files).filter((name) => /^word\/media\/.+\.png$/.test(name)).length,
+    canonical.pageCount,
+  );
 });
 
 test('moves a multi-row repeatable header with its first data row instead of replaying part of it', async (context) => {

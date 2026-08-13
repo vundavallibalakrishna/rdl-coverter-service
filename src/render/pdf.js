@@ -1476,25 +1476,31 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       startContinuationPage();
       measured = measureRow(row, remainingTexts);
     }
-    const rowIndex = rowIndexes.get(row);
-    let protectedHeight;
-    if (config.pdfLayoutOptimizations === false) {
-      protectedHeight = row.cells.reduce((maximum, cell) => Math.max(
-        maximum,
-        measuredHeights.slice(rowIndex, rowIndex + Math.max(1, cell.rowSpan || 1)).reduce((sum, value) => sum + value, 0),
-      ), measured);
-      statistics.rowSpanHeightCalculations += row.cells.length;
-    } else {
-      const maximumRowSpan = row.cells.reduce((maximum, cell) => Math.max(maximum, Math.max(1, cell.rowSpan || 1)), 1);
-      // Row heights are non-negative. Therefore the longest declared span always has the largest protected
-      // height. Sum that range once in the same top-to-bottom order as the previous per-cell reductions.
-      let spannedHeight = 0;
-      const spanEnd = Math.min(measuredHeights.length, rowIndex + maximumRowSpan);
-      for (let spanIndex = rowIndex; spanIndex < spanEnd; spanIndex += 1) spannedHeight += measuredHeights[spanIndex];
-      statistics.rowSpanHeightCalculations += 1;
-      protectedHeight = Math.max(measured, spannedHeight);
+    // A vertical merge is not inherently KeepTogether. When its member allows splitting, activeSpans closes
+    // the merge at the body boundary and redraws/reopens it after the repeated header on the next page. This
+    // matches SSRS and lets the current page consume every physical row that fits. Reserving the complete
+    // span is appropriate only when the owning tablix member explicitly declares KeepTogether.
+    if (row.keepSpanTogether) {
+      const rowIndex = rowIndexes.get(row);
+      let protectedHeight;
+      if (config.pdfLayoutOptimizations === false) {
+        protectedHeight = row.cells.reduce((maximum, cell) => Math.max(
+          maximum,
+          measuredHeights.slice(rowIndex, rowIndex + Math.max(1, cell.rowSpan || 1)).reduce((sum, value) => sum + value, 0),
+        ), measured);
+        statistics.rowSpanHeightCalculations += row.cells.length;
+      } else {
+        const maximumRowSpan = row.cells.reduce((maximum, cell) => Math.max(maximum, Math.max(1, cell.rowSpan || 1)), 1);
+        // Row heights are non-negative. Therefore the longest declared span always has the largest protected
+        // height. Sum that range once in the same top-to-bottom order as the previous per-cell reductions.
+        let spannedHeight = 0;
+        const spanEnd = Math.min(measuredHeights.length, rowIndex + maximumRowSpan);
+        for (let spanIndex = rowIndex; spanIndex < spanEnd; spanIndex += 1) spannedHeight += measuredHeights[spanIndex];
+        statistics.rowSpanHeightCalculations += 1;
+        protectedHeight = Math.max(measured, spannedHeight);
+      }
+      if (y + protectedHeight > pageBottom && protectedHeight <= freshPageCapacity) startContinuationPage();
     }
-    if (y + protectedHeight > pageBottom && protectedHeight <= freshPageCapacity) startContinuationPage();
     measured = measureRow(row, remainingTexts);
     if (y + measured <= pageBottom) {
       drawRowContent(row, measured, remainingTexts);
