@@ -318,6 +318,16 @@ async function renderDataExcel(model, request, config, tempDir) {
 
 const POINT_PRECISION = 4; // quarter-point geometry, matching the PDF shared-edge coordinate key
 const MAX_EXCEL_ROW_HEIGHT = 409;
+// Excel reserves a fixed horizontal inset inside every cell — the same 5 device pixels excelWidthFromPoints
+// adds back when converting a point width into a column width — so the width available to wrapped text is
+// narrower than the column the item was given.
+const EXCEL_CELL_TEXT_INSET_PT = 5 * (72 / 96);
+// How much narrower a box is re-flowed at before its content counts as sitting on the wrap point. PDF
+// measurement uses the font file's fractional glyph advances; Excel lays the same string out with
+// integer-pixel advances at display resolution, and those roundings accumulate over a long line. This only
+// decides whether to reserve one line of slack in a merged cell that cannot overflow — it never shrinks
+// anything — so it is set well clear of the disagreement rather than tuned to one string.
+const EXCEL_WRAP_SAFETY_FRACTION = 0.1;
 
 function point(value) {
   return Math.round(Number(value || 0) * POINT_PRECISION) / POINT_PRECISION;
@@ -758,6 +768,64 @@ function freeformRows(worksheet, items, height, startRow) {
   return values;
 }
 
+// A free-form CanGrow textbox is laid out from its declared RDL height alone, but the worksheet re-wraps
+// its text with Excel's engine inside a narrower usable width. When Excel produces more lines than the
+// declared box holds, the overflow is simply not displayed — the row does not grow, and the cell is merged
+// so it cannot spill sideways either. Raise the row band to what the text needs. Returns whether it grew.
+function growFreeformRows(worksheet, range, requiredHeight) {
+  if (!(requiredHeight > 0)) return false;
+  const rows = [];
+  let allocated = 0;
+  for (let row = range.startRow; row <= range.endRow; row += 1) {
+    const target = worksheet.getRow(row);
+    rows.push(target);
+    allocated += target.height || 0;
+  }
+  let deficit = point(requiredHeight - allocated);
+  if (deficit <= 1 / POINT_PRECISION) return false;
+  // Excel caps a single row at 409 points, so the extra height is absorbed across the band the item already
+  // occupies, last row first — that band is this item's own geometry, so nothing else is displaced. A block
+  // needing more than the band can hold even at the cap keeps every point the cap allows: the rows were
+  // sized from the declared RDL height, so this can only ever reveal more text than before, never less.
+  for (let index = rows.length - 1; index >= 0 && deficit > 1 / POINT_PRECISION; index -= 1) {
+    const current = rows[index].height || 0;
+    const room = MAX_EXCEL_ROW_HEIGHT - current;
+    if (room <= 0) continue;
+    const applied = Math.min(room, deficit);
+    rows[index].height = point(current + applied);
+    deficit = point(deficit - applied);
+  }
+  return true;
+}
+
+// Height a free-form CanGrow textbox needs in a worksheet, as opposed to on a PDF page.
+//
+// excelCanGrowTextboxHeight already reserves one line for the "PDF breaks into N lines, Excel breaks into
+// N+1" disagreement, but only once the content is already multi-line. A single line that fills its box is
+// exposed to exactly the same disagreement and is the more damaging case, because the whole second line
+// then falls outside a one-line row. Detect it by re-flowing against a slightly narrower box rather than by
+// assuming anything about Excel's font metrics: if a small loss of width adds a line, the two engines can
+// disagree here. This lives at the free-form call site so tablix cell geometry is untouched.
+function excelFreeformTextMetrics(measureDoc, config, item, context, display, mergedWidth) {
+  const usable = Math.max(1, mergedWidth - EXCEL_CELL_TEXT_INSET_PT);
+  const required = excelCanGrowTextboxHeight(measureDoc, config, item, context, display, usable, item.style || {});
+  if (!required) return { required: 0, multiLine: false };
+  const single = measureTextboxHeight(measureDoc, config, item, context, 'M', usable);
+  const content = measureTextboxHeight(measureDoc, config, item, context, display, usable);
+  // Already multi-line: excelCanGrowTextboxHeight has applied its own reserve.
+  if (content > single + (1 / POINT_PRECISION)) return { required, multiLine: true };
+  const narrowed = measureTextboxHeight(
+    measureDoc,
+    config,
+    item,
+    context,
+    display,
+    Math.max(1, usable * (1 - EXCEL_WRAP_SAFETY_FRACTION)),
+  );
+  const nearWrap = narrowed > content + (1 / POINT_PRECISION);
+  return { required: nearWrap ? required + single : required, multiLine: nearWrap };
+}
+
 function rowRange(boundaries, startRow, top, height) {
   const from = boundaryIndex(boundaries, top);
   const to = boundaryIndex(boundaries, top + height);
@@ -790,6 +858,7 @@ async function renderFreeformItem({
   yGrid,
   startRow,
   merges,
+  measureDoc,
   parentLeft = 0,
   parentTop = 0,
 }) {
@@ -831,6 +900,23 @@ async function renderFreeformItem({
     const target = worksheet.getCell(range.startRow, range.startCol);
     target.value = richTextValue(item, context, text) || text;
     applyFillFontAlignment(target, item.style || {}, context);
+    // Measure against the width the worksheet actually gives the cell, not the declared RDL width: the
+    // merged range is snapped to the section's shared column grid, so the two differ whenever another
+    // item's edge falls inside this one, and Excel wraps to the range it has.
+    const metrics = measureDoc
+      ? excelFreeformTextMetrics(measureDoc, config, item, context, text, xGrid[range.endCol] - xGrid[range.startCol - 1])
+      : { required: 0, multiLine: false };
+    const grown = growFreeformRows(worksheet, range, metrics.required);
+    // `multiLine` covers the callers that already sized this item's band to its grown content height, where
+    // the growth is real but invisible to growFreeformRows.
+    if (grown || metrics.multiLine) {
+      // The band is taller than the RDL box, and the extra height exists only to hold lines Excel wrapped
+      // past that box. RDL VerticalAlign describes the declared box, where a grown box is exactly its own
+      // text and Middle and Top coincide; keeping Middle against the enlarged band instead splits the
+      // surplus symmetrically, which reads as a blank gap above the text. Anchor to the top so any surplus
+      // trails below. A cell that did not grow keeps the alignment the RDL declared.
+      target.alignment = { ...(target.alignment || {}), vertical: 'top' };
+    }
     return;
   }
   if (item.type === 'Rectangle') {
@@ -848,6 +934,7 @@ async function renderFreeformItem({
         yGrid,
         startRow,
         merges,
+        measureDoc,
         parentLeft: left,
         parentTop: top,
       });
@@ -868,6 +955,7 @@ async function renderFreeformBand({
   xGrid,
   startRow,
   merges,
+  measureDoc,
 }) {
   const yGrid = freeformRows(worksheet, items, height, startRow);
   for (const item of [...items].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
@@ -884,6 +972,7 @@ async function renderFreeformBand({
       yGrid,
       startRow,
       merges,
+      measureDoc,
     });
   }
   return yGrid.length - 1;
@@ -1558,6 +1647,7 @@ async function renderCoordinateScheduledSection({
       yGrid,
       startRow,
       merges,
+      measureDoc,
     });
   }
   return { rowsConsumed: Math.max(1, yGrid.length - 1), detailRegions };
@@ -1689,7 +1779,7 @@ async function renderReportExcel(model, request, config, tempDir) {
     if (model.page.header?.items?.length) {
       headerBandRows = await renderFreeformBand({
         workbook, worksheet, model, items: model.page.header.items, height: model.page.header.height,
-        context: sectionContext, config, tempDir, chartCounter, xGrid, startRow: cursor, merges,
+        context: sectionContext, config, tempDir, chartCounter, xGrid, startRow: cursor, merges, measureDoc,
       });
       cursor += headerBandRows;
     }
@@ -1738,6 +1828,7 @@ async function renderReportExcel(model, request, config, tempDir) {
             xGrid,
             startRow: cursor,
             merges,
+            measureDoc,
           });
           cursor += consumed;
           return;
@@ -1768,12 +1859,20 @@ async function renderReportExcel(model, request, config, tempDir) {
             if (fill && !target.fill?.type && (target.value === null || target.value === undefined)) {
               target.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
             }
+            // A container's declared border ADDS an edge on its own perimeter; it never removes one. The
+            // children already wrote their resolved edges into these cells, and a container edge resolving
+            // to None must leave them alone. Assigning the resolved side unconditionally erased them: a
+            // Rectangle with Border/Style=None wrapping a tablix wiped the tablix's own outer rule wherever
+            // the two perimeters coincide — visibly, the closing bottom rule of the table's last row.
+            const containerEdge = (side, onEdge) => (
+              (onEdge ? excelBorderSide(borders[side], sectionContext) : undefined) || target.border?.[side]
+            );
             target.border = {
               ...(target.border || {}),
-              top: row === range.startRow ? excelBorderSide(borders.top, sectionContext) : target.border?.top,
-              bottom: row === range.endRow ? excelBorderSide(borders.bottom, sectionContext) : target.border?.bottom,
-              left: column === range.startCol ? excelBorderSide(borders.left, sectionContext) : target.border?.left,
-              right: column === range.endCol ? excelBorderSide(borders.right, sectionContext) : target.border?.right,
+              top: containerEdge('top', row === range.startRow),
+              bottom: containerEdge('bottom', row === range.endRow),
+              left: containerEdge('left', column === range.startCol),
+              right: containerEdge('right', column === range.endCol),
             };
           }
         }
@@ -1811,6 +1910,7 @@ async function renderReportExcel(model, request, config, tempDir) {
         xGrid,
         startRow: cursor,
         merges,
+        measureDoc,
       });
       cursor += consumed;
     };
@@ -1866,6 +1966,7 @@ async function renderReportExcel(model, request, config, tempDir) {
           xGrid,
           startRow: cursor,
           merges,
+          measureDoc,
         });
         cursor += consumed;
         previousDesignBottom = Math.max(previousDesignBottom ?? 0, peerBottom);
