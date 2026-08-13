@@ -88,16 +88,14 @@ export function formatValue(value, format) {
       if (pattern === 'd') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'short', timeZone: 'UTC' }).format(date);
       if (pattern === 'D') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeZone: 'UTC' }).format(date);
       if (pattern === 'g' || pattern === 'G') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'short', timeStyle: pattern === 'G' ? 'medium' : 'short', timeZone: 'UTC' }).format(date);
-      const tokens = {
-        yyyy: String(date.getUTCFullYear()).padStart(4, '0'),
-        MMM: new Intl.DateTimeFormat('en-GB', { month: 'short', timeZone: 'UTC' }).format(date),
-        MM: String(date.getUTCMonth() + 1).padStart(2, '0'),
-        dd: String(date.getUTCDate()).padStart(2, '0'),
-        HH: String(date.getUTCHours()).padStart(2, '0'),
-        mm: String(date.getUTCMinutes()).padStart(2, '0'),
-        ss: String(date.getUTCSeconds()).padStart(2, '0'),
-      };
-      return pattern.replace(/yyyy|MMM|MM|dd|HH|mm|ss/g, (token) => tokens[token]);
+      // Custom date/time patterns resolve through the complete .NET format engine. The local token table
+      // this replaced covered only {yyyy, MMM, MM, dd, HH, mm, ss} and substituted them with a single
+      // first-match-wins alternation, so any longer token was cut short and its remainder emitted as a
+      // literal: "MMMM yyyy" produced "AugM 2026" because MMM consumed three of the four Ms. The same
+      // truncation hit dddd/ddd, and the single-character forms M/d/y/h/s plus tt were not tokens at all
+      // and survived verbatim. Both engines resolve custom patterns in UTC, so every token that already
+      // worked is unchanged.
+      return formatNet(date, pattern);
     }
   }
   // Fall back to the full .NET format-string engine for everything the branches above don't handle
