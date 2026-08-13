@@ -214,23 +214,31 @@ export function materializedCellContext(cell, row, {
   };
 }
 
-// SSRS visually closes a row boundary through a row-group header when the owner changes at that boundary
-// and the cells immediately on both sides declare the same top edge. The group owner can span one or many
-// physical rows; restricting this rule to merged cells leaves the same gap when consecutive groups each
-// materialize as a single row. Never apply the inference to ordinary detail cells, and do not bridge an
-// unchanged header value: separate physical owners are commonly used to continue one logical coloured/
-// grouped region without an internal rule. HideDuplicates is presentation-only, so compare its recorded
-// semantic value rather than the suppressed display text.
+// A group header's visible value alone cannot identify its logical owner. HideDuplicates deliberately
+// produces separate physical cells for one visual region, while resetting the same value in a different
+// group instance creates a real new owner. Include the materializer's exact duplicate key/scope metadata in
+// the signature, but exclude `suppressed`: the first visible cell and its suppressed continuations must
+// compare equal. Ordinary cells retain the established value/background signature.
 export function materializedCellVisualSignature(cell, style, context) {
   const values = (cell?.values || []).map((value, index) => (
     cell?.duplicateItems?.[index]?.value ?? value ?? ''
   ));
+  const duplicateOwners = (cell?.duplicateItems || []).map((entry) => (entry ? {
+    key: entry.key,
+    scope: entry.scope,
+    scopeName: entry.scopeName,
+    value: entry.value,
+  } : null));
   return JSON.stringify({
     values: values.map(String),
+    duplicateOwners,
     backgroundColor: styleColor(style?.backgroundColor, context, null),
   });
 }
 
+// SSRS visually closes a row boundary through a row-group header when the logical owner changes at that
+// boundary and the cells immediately on both sides declare the same top edge. A true row-span continuation
+// retains the same occupancy owner; a HideDuplicates continuation has the same semantic signature.
 export function matchingChangedGroupOwnerRowBoundary(
   owner,
   above,

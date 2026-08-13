@@ -4,7 +4,7 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { loadConfig } from '../src/config.js';
 import { parseRdl } from '../src/rdl/parser.js';
-import { matchingChangedGroupOwnerRowBoundary, styleColor, styleValue, tablixRows } from '../src/render/common.js';
+import { matchingChangedGroupOwnerRowBoundary, materializedCellVisualSignature, styleColor, styleValue, tablixRows } from '../src/render/common.js';
 import { renderEditableDocx } from '../src/render/docx.js';
 import { renderExcel } from '../src/render/excel.js';
 import { renderPdf } from '../src/render/pdf.js';
@@ -62,6 +62,12 @@ const model = parseRdl(`<?xml version="1.0"?>
   </ReportSection></ReportSections>
 </Report>`);
 
+const duplicateScopedModel = structuredClone(model);
+const ratingMember = duplicateScopedModel.body.items
+  .find((item) => item.name === 'GroupedRisk')
+  .rowMembers[0].children[0];
+ratingMember.header.cell.items.find((item) => item.name === 'RatingOwner').hideDuplicates = 'RiskGroup';
+
 const request = {
   outputFileName: 'group-owner-border-context',
   parameters: {},
@@ -71,15 +77,18 @@ const request = {
   ] },
 };
 
-function tracedRatingCell(pdf, text, rowSpan) {
-  return pdf.layoutTrace.pages[0].items.find((item) => (
+function tracedRatingCell(pdf, text, rowSpan, fromEnd = false) {
+  const matches = pdf.layoutTrace.pages[0].items.filter((item) => (
     item.kind === 'tablixCell' && item.text === String(text) && item.rowSpan === rowSpan
   ));
+  return fromEnd ? matches.at(-1) : matches[0];
 }
 
-async function docxCellXml(docxBuffer, text) {
+async function docxCellXml(docxBuffer, text, fromEnd = false) {
   const documentXml = await (await JSZip.loadAsync(docxBuffer)).file('word/document.xml').async('string');
-  const textIndex = documentXml.indexOf(`>${text}</w:t>`);
+  const textIndex = fromEnd
+    ? documentXml.lastIndexOf(`>${text}</w:t>`)
+    : documentXml.indexOf(`>${text}</w:t>`);
   assert.ok(textIndex >= 0, `expected ${text} in editable DOCX`);
   return documentXml.slice(
     documentXml.lastIndexOf('<w:tc>', textIndex),
@@ -211,7 +220,7 @@ test('PDF, editable DOCX, and XLSX bridge every changed group-owner span transit
   for (const scenario of cases) {
     const changedRequest = { ...request, datasets: { D: scenario.rows } };
     const pdf = await renderPdf(model, changedRequest, config, { captureLayoutTrace: true });
-    const tracedOwner = tracedRatingCell(pdf, scenario.target, scenario.rowSpan);
+    const tracedOwner = tracedRatingCell(pdf, scenario.target, scenario.rowSpan, scenario.fromEnd);
     assert.deepEqual(
       tracedOwner?.borders?.top,
       { style: 'Solid', width: 1, color: '#000000' },
@@ -220,7 +229,7 @@ test('PDF, editable DOCX, and XLSX bridge every changed group-owner span transit
 
     const docx = await renderEditableDocx(model, changedRequest, config);
     assert.match(
-      await docxCellXml(docx.buffer, scenario.target),
+      await docxCellXml(docx.buffer, scenario.target, scenario.fromEnd),
       /<w:top w:val="single" w:color="000000" w:sz="8"\/>/,
       `${scenario.name} editable DOCX boundary`,
     );
@@ -234,7 +243,45 @@ test('PDF, editable DOCX, and XLSX bridge every changed group-owner span transit
   }
 });
 
-test('boundary inference rejects detail cells and mismatched neighbouring edges', () => {
+test('HideDuplicates scope distinguishes a merged continuation from the same value in a new group', async () => {
+  const scopedRequest = {
+    ...request,
+    datasets: { D: [
+      { Risk: 'R1', Number: '002', Rating: 6, Detail: 'Previous group' },
+      { Risk: 'R2', Number: '002', Rating: 6, Detail: 'Current group' },
+    ] },
+  };
+  const rows = tablixRows(
+    duplicateScopedModel.body.items.find((item) => item.name === 'GroupedRisk'),
+    scopedRequest,
+    {},
+    duplicateScopedModel,
+  ).rows;
+  const first = rows[0].cells[1];
+  const second = rows[1].cells[1];
+  const style = first.items[0].style;
+  const context = (cell) => ({ fields: cell.fields, dataset: cell.scopeDataset, scopes: cell.scopes });
+  assert.notEqual(
+    materializedCellVisualSignature(first, style, context(first)),
+    materializedCellVisualSignature(second, style, context(second)),
+    'the same displayed value in a different HideDuplicates scope is a new logical owner',
+  );
+
+  const pdf = await renderPdf(duplicateScopedModel, scopedRequest, config, { captureLayoutTrace: true });
+  assert.deepEqual(
+    tracedRatingCell(pdf, 6, 1, true)?.borders?.top,
+    { style: 'Solid', width: 1, color: '#000000' },
+  );
+  const docx = await renderEditableDocx(duplicateScopedModel, scopedRequest, config);
+  assert.match(await docxCellXml(docx.buffer, 6, true), /<w:top w:val="single" w:color="000000" w:sz="8"\/>/);
+  const ratingCell = await excelRatingCell(
+    (await renderExcel(duplicateScopedModel, scopedRequest, config, null)).buffer,
+    6,
+  );
+  assert.equal(ratingCell.border?.top?.style, 'thin');
+});
+
+test('boundary inference rejects detail cells, logical continuations, and mismatched neighbouring edges', () => {
   const header = (rowIndex, visual, border = null) => ({
     rowIndex,
     cell: { isRowHeader: true },
@@ -262,6 +309,8 @@ test('boundary inference rejects detail cells and mismatched neighbouring edges'
   assert.equal(infer(detail(1, 'new'), header(0, 'old'), black, black), null);
   assert.equal(infer(header(1, 'new'), detail(0, 'old'), black, black), null);
   assert.equal(infer(header(1, 'new'), header(0, 'old'), black, red), null);
+  const mergedOwner = header(0, 'same');
+  assert.equal(infer(mergedOwner, mergedOwner, black, black), null);
   assert.equal(infer(header(1, 'same'), header(0, 'same'), black, black), null);
   assert.equal(infer(header(1, 'new'), header(0, 'old'), black, black), black);
 });

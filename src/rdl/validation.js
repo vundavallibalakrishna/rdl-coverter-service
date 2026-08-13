@@ -194,6 +194,35 @@ function collectMemberSorts(members, target = []) {
   return target;
 }
 
+function sortRows(rows, sorts, parameters, globals, datasets, outermostDataset = rows) {
+  if (!sorts?.length) return rows;
+  return rows.map((fields, index) => ({ fields, index })).sort((left, right) => {
+    for (const sort of sorts) {
+      const leftValue = expressionValue(sort.value, {
+        fields: left.fields,
+        parameters,
+        globals,
+        dataset: rows,
+        outermostDataset,
+        datasets,
+      });
+      const rightValue = expressionValue(sort.value, {
+        fields: right.fields,
+        parameters,
+        globals,
+        dataset: rows,
+        outermostDataset,
+        datasets,
+      });
+      const compared = typeof leftValue === 'string' || typeof rightValue === 'string'
+        ? String(leftValue ?? '').localeCompare(String(rightValue ?? ''))
+        : Number(leftValue ?? 0) - Number(rightValue ?? 0);
+      if (compared !== 0) return /^desc/i.test(sort.direction) ? -compared : compared;
+    }
+    return left.index - right.index;
+  }).map(({ fields }) => fields);
+}
+
 function memberGroupsByName(members, target = new Map()) {
   for (const member of members || []) {
     if (member.group?.name) target.set(member.group.name, member.group);
@@ -498,19 +527,11 @@ export function prepareTablixData(tablix, rows, parameters, globals = {}, datase
   // outside the group, e.g. a series/category exclusion).
   const activeFilters = [...(tablix.filters || []), ...collectMemberGroupFilters(tablix.rowMembers)];
   const filtered = normalized.filter((fields) => activeFilters.every((filter) => filterMatches(filter, fields, parameters, globals, normalized, datasets)));
-  const sorts = [...(tablix.sortExpressions || []), ...collectMemberSorts(tablix.rowMembers)];
-  if (sorts.length === 0) return filtered;
-  return filtered.map((fields, index) => ({ fields, index })).sort((left, right) => {
-    for (const sort of sorts) {
-      const leftValue = expressionValue(sort.value, { fields: left.fields, parameters, globals, dataset: filtered, datasets });
-      const rightValue = expressionValue(sort.value, { fields: right.fields, parameters, globals, dataset: filtered, datasets });
-      const compared = typeof leftValue === 'string' || typeof rightValue === 'string'
-        ? String(leftValue ?? '').localeCompare(String(rightValue ?? ''))
-        : Number(leftValue ?? 0) - Number(rightValue ?? 0);
-      if (compared !== 0) return /^desc/i.test(sort.direction) ? -compared : compared;
-    }
-    return left.index - right.index;
-  }).map(({ fields }) => fields);
+  // Only data-region sorts are global. A TablixMember sort belongs to that member's group scope and must
+  // be applied while walking group instances. Flattening every nested member sort into one row comparator
+  // can split a parent group (for example, moving all child Number=1 rows ahead of Number=2), which then
+  // breaks row spans, HideDuplicates, aggregates, and expression-backed shared borders.
+  return sortRows(filtered, tablix.sortExpressions || [], parameters, globals, datasets, filtered);
 }
 
 // Precomputes, for every named/expression row group, a map from group-key -> the rows in that group
@@ -539,6 +560,9 @@ function buildGroupInstances(members, sourceRows, parameters, globals, datasets,
 // does NOT use these constructs keeps taking the unchanged flat path and materializes byte-identically.
 export function needsAdvancedMaterialization(tablix) {
   if (tablix.hasColumnGroups) return true;
+  // Member-scoped ordering requires the recursive group walk. The flat path sees only a row stream and
+  // cannot keep a parent instance contiguous while independently sorting its descendants.
+  if (collectMemberSorts(tablix.rowMembers).length > 0) return true;
   const hasParent = (members) => (members || []).some((member) => member.group?.parent || hasParent(member.children));
   if (hasParent(tablix.rowMembers)) return true;
   // A group header/footer row is a STATIC leaf member (no Group element) nested inside an ancestor
@@ -929,7 +953,15 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           else emit(member, path, instance.rows[0] || {}, instance.rows, childScopes, 'group', indentLevel);
         }
       } else if (group) {
-        for (const row of incomingRows) {
+        const orderedRows = sortRows(
+          incomingRows,
+          member.sortExpressions || [],
+          parameters,
+          globals,
+          datasets,
+          sourceRows,
+        );
+        for (const row of orderedRows) {
           if (member.children?.length) walkMembers(member.children, [row], scopes, path, indentLevel);
           else emit(member, path, row, incomingRows, scopes, 'detail', indentLevel, [row]);
         }
