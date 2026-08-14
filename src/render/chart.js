@@ -179,6 +179,22 @@ function titleHeight(chart, context) {
     + styleSize(style.paddingTop, context, 2) + styleSize(style.paddingBottom, context, 2));
 }
 
+function titleWidth(doc, config, chart, context, maximum) {
+  const caption = String(evaluateExpression(chart.title.caption, context) ?? '').trim();
+  const style = chart.title.style || {};
+  styleFont(doc, config, style, context, 9);
+  const paddingLeft = styleSize(style.paddingLeft, context, 2);
+  const paddingRight = styleSize(style.paddingRight, context, 2);
+  const widestLine = Math.max(0, ...caption.split(/\r?\n/).map((line) => doc.widthOfString(line)));
+  return Math.min(maximum, Math.max(1, widestLine + paddingLeft + paddingRight));
+}
+
+function anchoredStart(start, end, size, alignment) {
+  if (/^(?:left|top)$/i.test(alignment)) return start;
+  if (/^(?:right|bottom)$/i.test(alignment)) return end - size;
+  return start + (end - start - size) / 2;
+}
+
 function drawTitle(doc, config, chart, x, y, width, height, context) {
   const caption = String(evaluateExpression(chart.title.caption, context) ?? '').trim();
   const style = chart.title.style || {};
@@ -464,12 +480,29 @@ export function drawChart(doc, config, chart, data, x, y, width, height, context
   const titleVisible = chart.title && !isHidden(chart.title.hidden, context);
   if (titleVisible) {
     const measuredHeight = titleHeight(chart, context);
-    const titlePosition = String(styleValue(chart.title.position, context, 'TopCenter')).toLowerCase();
+    const titlePosition = String(styleValue(chart.title.position, context, 'TopCenter'))
+      .replace(/\s+/g, '')
+      .toLowerCase();
+    const measuredWidth = titleWidth(doc, config, chart, context, content.right - content.left);
     if (titlePosition.startsWith('bottom')) {
-      drawTitle(doc, config, chart, content.left, content.bottom - measuredHeight, content.right - content.left, measuredHeight, context);
+      const alignment = titlePosition.slice('bottom'.length) || 'center';
+      const titleX = anchoredStart(content.left, content.right, measuredWidth, alignment);
+      drawTitle(doc, config, chart, titleX, content.bottom - measuredHeight, measuredWidth, measuredHeight, context);
       content.bottom -= measuredHeight + 6;
+    } else if (titlePosition.startsWith('left') || titlePosition.startsWith('right')) {
+      const side = titlePosition.startsWith('left') ? 'left' : 'right';
+      const alignment = titlePosition.slice(side.length) || 'center';
+      const titleY = anchoredStart(content.top, content.bottom, measuredHeight, alignment);
+      const titleX = side === 'left' ? content.left : content.right - measuredWidth;
+      drawTitle(doc, config, chart, titleX, titleY, measuredWidth, measuredHeight, context);
+      if (side === 'left') content.left += measuredWidth + 6;
+      else content.right -= measuredWidth + 6;
     } else {
-      drawTitle(doc, config, chart, content.left, content.top, content.right - content.left, measuredHeight, context);
+      const alignment = titlePosition.startsWith('top')
+        ? titlePosition.slice('top'.length) || 'center'
+        : 'center';
+      const titleX = anchoredStart(content.left, content.right, measuredWidth, alignment);
+      drawTitle(doc, config, chart, titleX, content.top, measuredWidth, measuredHeight, context);
       content.top += measuredHeight + 6;
     }
   }
