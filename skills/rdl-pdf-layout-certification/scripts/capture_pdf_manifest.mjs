@@ -30,14 +30,20 @@ const [{ stdout: fontsText }, { stdout: bboxText }] = await Promise.all([
 
 const fontLines = fontsText.split(/\r?\n/).slice(2).filter((line) => line.trim());
 const fonts = fontLines.map((line) => {
-  const parts = line.trim().split(/\s+/);
+  // Poppler separates the variable-width name/type/encoding columns with at least two spaces, while
+  // a type such as "CID TrueType" itself contains a space. Token splitting shifts the yes/no columns
+  // and falsely reports every CID font as unembedded. Parse the fixed tail first and preserve the type.
+  const match = line.match(
+    /^(.*?)\s{2,}(.+?)\s{2,}(\S+)\s+(yes|no)\s+(yes|no)\s+(yes|no)\s+\d+\s+\d+\s*$/i,
+  );
+  if (!match) throw new Error(`Unrecognized pdffonts row: ${line}`);
   return {
-    name: parts[0] || '',
-    type: parts[1] || '',
-    encoding: parts[2] || '',
-    embedded: parts[3] === 'yes',
-    subset: parts[4] === 'yes',
-    unicode: parts[5] === 'yes',
+    name: match[1].trim(),
+    type: match[2].trim(),
+    encoding: match[3],
+    embedded: match[4].toLowerCase() === 'yes',
+    subset: match[5].toLowerCase() === 'yes',
+    unicode: match[6].toLowerCase() === 'yes',
   };
 });
 const words = [...bboxText.matchAll(/<word xMin="([^"]+)" yMin="([^"]+)" xMax="([^"]+)" yMax="([^"]+)">([\s\S]*?)<\/word>/g)]
