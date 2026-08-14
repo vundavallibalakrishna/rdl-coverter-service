@@ -1757,14 +1757,15 @@ async function renderCoordinateScheduledSection({
   merges,
   tablixCache,
   measureDoc,
+  preserveLeadingBodyGap,
 }) {
   // Report body coordinates remain absolute even after an explicit page break starts a new logical Excel
   // section. Each worksheet has its own local origin, matching the legacy section renderer and SSRS's
   // page-local placement semantics; carrying the global body Top into the new sheet creates a giant blank
   // row containing the height of every earlier section.
-  const sectionOriginTop = section.length
-    ? Math.min(...section.map((item) => point(item.top || 0)))
-    : 0;
+  const sectionOriginTop = preserveLeadingBodyGap || !section.length
+    ? 0
+    : Math.min(...section.map((item) => point(item.top || 0)));
   const plans = [];
   for (const item of section) {
     const designTop = point((item.top || 0) - sectionOriginTop);
@@ -1985,6 +1986,13 @@ async function renderReportExcel(model, request, config, tempDir) {
     // Page 1 of 1 hides constructs intended for interior sections while still reserving their band height.
     const sectionGlobals = { ...globals, PageNumber: index + 1, TotalPages: sections.length };
     const sectionContext = { ...context, globals: sectionGlobals };
+    const firstSectionItem = section[0];
+    // REPORT worksheets mirror body coordinate semantics without pretending that each worksheet is a PDF
+    // page. Only the first report section preserves the body's leading Top. Sections created by an explicit
+    // Start break keep their established local origin, matching PDF page-start and continuation behavior.
+    const preserveLeadingBodyGap = index === 0
+      && firstSectionItem
+      && !/^(Start|StartAndEnd)$/i.test(visiblePageBreak(firstSectionItem, sectionContext));
     const title = declaredSectionName(section, sectionContext)
       || firstVisibleText(section, model, request, sectionGlobals);
     const name = uniqueSheetName(workbook, title, `Section ${index + 1}`);
@@ -2024,6 +2032,7 @@ async function renderReportExcel(model, request, config, tempDir) {
         merges,
         tablixCache,
         measureDoc,
+        preserveLeadingBodyGap,
       });
       cursor += scheduled.rowsConsumed;
       detailRegions.push(...scheduled.detailRegions);
@@ -2171,7 +2180,9 @@ async function renderReportExcel(model, request, config, tempDir) {
       }
       if (peerBand.length > 1) {
         const bandTop = item.top || 0;
-        const gap = previousDesignBottom === null ? 0 : Math.max(0, bandTop - previousDesignBottom);
+        const gap = previousDesignBottom === null
+          ? (preserveLeadingBodyGap ? Math.max(0, bandTop) : 0)
+          : Math.max(0, bandTop - previousDesignBottom);
         cursor += addGapRows(worksheet, cursor, gap);
         const consumed = await renderFreeformBand({
           workbook,
@@ -2193,7 +2204,9 @@ async function renderReportExcel(model, request, config, tempDir) {
         itemIndex += peerBand.length - 1;
         continue;
       }
-      const gap = previousDesignBottom === null ? 0 : Math.max(0, (item.top || 0) - previousDesignBottom);
+      const gap = previousDesignBottom === null
+        ? (preserveLeadingBodyGap ? Math.max(0, item.top || 0) : 0)
+        : Math.max(0, (item.top || 0) - previousDesignBottom);
       cursor += addGapRows(worksheet, cursor, gap);
       await renderSectionItem({ ...item, top: 0 });
       previousDesignBottom = Math.max(previousDesignBottom ?? 0, (item.top || 0) + (item.height || 0));

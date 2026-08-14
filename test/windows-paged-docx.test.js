@@ -822,7 +822,8 @@ test('page-locked DOCX accepts line endpoints that meet editable content without
   const canonical = await renderPdf(endpointModel, request, config, { captureLayoutTrace: true });
   const title = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'TitleBox');
   const endpoint = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'EndpointLine');
-  assert.equal(endpoint.y, title.y + title.height, 'the line must begin exactly at the textbox endpoint');
+  assert.ok(Math.abs(endpoint.y - (title.y + title.height)) <= 0.001,
+    'the line must begin exactly at the textbox endpoint within trace precision');
   const rendered = await renderEditableDocx(endpointModel, request, config);
   const zip = await JSZip.loadAsync(rendered.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
@@ -832,8 +833,12 @@ test('page-locked DOCX accepts line endpoints that meet editable content without
 test('page-locked DOCX coalesces a trace-rounded tablix fragment closure with its cell edge', async () => {
   const fragmentFixture = Buffer.from(fixture.toString('utf8')
     .replace(
+      '<Top>0.1in</Top><Left>0.1in</Left><Height>0.3in</Height>',
+      '<Top>0in</Top><Left>0.1in</Left><Height>0.3in</Height>',
+    )
+    .replace(
       '<DataSetName>Sales</DataSetName><Top>0.6in</Top>',
-      '<DataSetName>Sales</DataSetName><Top>0.482274in</Top>',
+      '<DataSetName>Sales</DataSetName><Top>0.382274in</Top>',
     )
     .replace(
       '<TablixRow><Height>0.25in</Height>',

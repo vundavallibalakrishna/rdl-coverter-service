@@ -1931,7 +1931,18 @@ export async function renderPdf(model, request, config, options = {}) {
       pageHasContent = false;
       forcePageBreak = false;
     }
-    const gap = pageHasContent ? Math.max(0, item.top - previousDesignBottom) : 0;
+    // Body coordinates are relative to the body's printable origin. Preserve the first visible band's
+    // declared Top on the initial report page so a designed spacer between the page header and body is not
+    // collapsed. A page break at Start deliberately establishes a new page-local origin, and continuation
+    // or overflow pages also resume at bodyTop, so neither consumes the report's absolute leading offset.
+    const initialBodyGap = globals.PageNumber === 1
+      && !pageHasContent
+      && !breaksBeforeItem(breakLocation)
+      ? Math.max(0, item.top || 0)
+      : 0;
+    const gap = pageHasContent
+      ? Math.max(0, item.top - previousDesignBottom)
+      : initialBodyGap;
     let y = cursorY + gap;
     const bandBottomOffset = Math.max(...band.map((candidate) => (
       candidate.top - item.top + candidate.height
