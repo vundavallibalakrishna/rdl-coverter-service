@@ -133,9 +133,10 @@ function normalizeFields(row, definitions = [], context = {}) {
 }
 
 function evaluateItemText(item, context) {
+  const culture = context?.globals?.culture ?? null;
   if (!item.paragraphs) {
     const value = evaluateExpression(item.value, context);
-    return item.style?.format ? formatValue(value, item.style.format) : value;
+    return item.style?.format ? formatValue(value, item.style.format, culture) : value;
   }
   return normalizeDisplayText(item.paragraphs.map((runs) => runs.map((run) => {
     const definition = run && typeof run === 'object' ? run : { value: run, markupType: 'None' };
@@ -144,7 +145,7 @@ function evaluateItemText(item, context) {
       : evaluateExpression(definition.value, context);
     if (value === null || value === undefined) return '';
     const format = expressionValue(definition.style?.format ?? item.style?.format, context);
-    const formatted = format ? String(formatValue(value, format)) : String(value);
+    const formatted = format ? String(formatValue(value, format, culture)) : String(value);
     return renderMarkupText(formatted, definition.markupType);
   }).join('')).join('\n'));
 }
@@ -402,7 +403,9 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     return result === true || String(result).toLowerCase() === 'true';
   });
   const values = cell.items.map((item, itemIndex) => {
-    if (item.type === 'Tablix' || item.type === 'Subreport') return '';
+    // Non-text canvas items (a List's Line/Chart/Image inside a Rectangle cell) carry no text value; the
+    // renderer draws them directly from the item definition, so they must not be evaluated as an expression.
+    if (['Tablix', 'Subreport', 'Chart', 'Line', 'Image'].includes(item.type)) return '';
     const value = itemValue(item, context);
     if (item.type !== 'Textbox' || !item.hideDuplicates) return value;
     const key = `${duplicatePrefix}:${item.name || itemIndex}`;

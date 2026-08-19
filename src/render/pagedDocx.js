@@ -34,6 +34,7 @@ import { loadConfig } from '../config.js';
 import { ServiceError } from '../errors.js';
 import { pointsToTwips } from '../units.js';
 import { normalizeDatasets } from './common.js';
+import { resolveReportCulture } from '../rdl/expression.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { editableFontEmbeddingPermission, resolveFontFile } from './fonts.js';
@@ -727,6 +728,7 @@ async function pictureForItem(
       TotalPages: item.totalPages || 1,
       ExecutionTime: new Date(),
       variables: model.variables || {},
+      culture: resolveReportCulture(model, { parameters: request.parameters || {} }),
     };
     const chartData = materializeChart(chart, datasets, request.parameters || {}, globals);
     const rendered = await renderChartPng(

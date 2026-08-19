@@ -36,20 +36,29 @@ test('a cell wrapping its textbox in a container Rectangle renders the textbox, 
   assert.deepEqual(rows.map((row) => row.cells.map((cell) => (cell.values || []).join(''))), [['value']]);
 });
 
-test('cell content the renderer cannot draw fails closed instead of rendering blank', () => {
+test('a List / canvas cell (line, image drawn item-by-item) is supported, not refused', () => {
+  // A Rectangle-flattened free-form cell draws its positioned items directly. Line and Image are rendered
+  // in place, so a cell containing them is compatible and materializes without throwing.
   for (const [type, inner] of [
     ['Image', '<Image Name="i"><Source>Embedded</Source><Value>L</Value><Sizing>Fit</Sizing><Style/></Image>'],
     ['Line', '<Line Name="ln"><Style/></Line>'],
   ]) {
     const analysis = analyzeRdl(reportWithCell(inner));
-    assert.equal(analysis.compatible, false, `${type} in a cell must not be reported compatible`);
-    assert.equal(analysis.blockingErrors.some(({ feature }) => feature === `TablixCellContent:${type}`), true);
-    // Defence in depth: reaching materialization anyway must throw rather than yield an empty cell.
-    assert.throws(
-      () => materializeTablixRows(tablixOf(reportWithCell(inner)), [{ N: 'v' }], {}, {}, {}),
-      /Tablix cell content is not supported/,
-    );
+    assert.equal(analysis.compatible, true, `${type} in a cell must now be supported`);
+    assert.equal(analysis.blockingErrors.some(({ feature }) => feature === `TablixCellContent:${type}`), false);
+    assert.doesNotThrow(() => materializeTablixRows(tablixOf(reportWithCell(inner)), [{ N: 'v' }], {}, {}, {}));
   }
+});
+
+test('genuinely unsupported cell content still fails closed instead of rendering blank', () => {
+  const inner = '<GaugePanel Name="g"><Style/></GaugePanel>';
+  const analysis = analyzeRdl(reportWithCell(inner));
+  assert.equal(analysis.compatible, false, 'a GaugePanel in a cell must not be reported compatible');
+  // Defence in depth: reaching materialization anyway must throw rather than yield an empty cell.
+  assert.throws(
+    () => materializeTablixRows(tablixOf(reportWithCell(inner)), [{ N: 'v' }], {}, {}, {}),
+    /Tablix cell content is not supported/,
+  );
 });
 
 test('a plain textbox cell stays compatible', () => {

@@ -5,14 +5,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
-import { evaluateExpression } from '../rdl/expression.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { evaluateExpression, resolveReportCulture } from '../rdl/expression.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { measureTextboxHeight } from './pdf.js';
-import { DEFAULT_EXCEL_DATE_FORMAT, DEFAULT_EXCEL_DATETIME_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
+import { DEFAULT_EXCEL_DATETIME_FORMAT, excelDateFormat, excelNumberFormat, cellString } from './excelFormat.js';
 
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
 const DEFAULT_ROW_POINTS = 15;
@@ -113,10 +113,17 @@ function excelCellValue(cell, context) {
   if (typeof raw === 'number' && Number.isFinite(raw)) {
     return { value: raw, numFmt: excelNumberFormat(format) || undefined };
   }
-  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    // No format resolves to general date/time (date and time) to match SSRS and the PDF/DOCX text default;
-    // an explicit-but-untranslatable format keeps the date-only fallback.
-    return { value: raw, numFmt: format ? DEFAULT_EXCEL_DATE_FORMAT : DEFAULT_EXCEL_DATETIME_FORMAT };
+  // A DateTime value (a Date, or an ISO-8601 string from parameter/field coercion) becomes a live typed
+  // Excel date so the workbook carries a real date, matching the PDF/DOCX text treatment of the same value.
+  const asDate = raw instanceof Date ? raw : (isDateLikeValue(raw) ? new Date(raw) : null);
+  if (asDate && !Number.isNaN(asDate.getTime())) {
+    // No format resolves to general date/time (date and time) to match SSRS and the PDF/DOCX text default.
+    if (!format) return { value: asDate, numFmt: DEFAULT_EXCEL_DATETIME_FORMAT };
+    // An explicit format is translated to a live Excel number format so the cell stays a typed date and
+    // still displays what the author asked for; an untranslatable format writes the exact formatted string.
+    const excelFmt = excelDateFormat(format);
+    if (excelFmt) return { value: asDate, numFmt: excelFmt };
+    return { value: cellString(display) };
   }
   return { value: cellString(display) };
 }
@@ -291,7 +298,7 @@ async function renderDataExcel(model, request, config, tempDir) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'RDL Converter Service';
   workbook.title = request.outputFileName || model.name || 'Report';
-  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
+  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {}, culture: resolveReportCulture(model, { parameters: request.parameters || {} }) };
   const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets: normalizeDatasets(model, request) };
   const chartCounter = { value: 0 };
 
@@ -1968,7 +1975,7 @@ async function renderReportExcel(model, request, config, tempDir) {
   workbook.creator = 'RDL Converter Service';
   workbook.title = request.outputFileName || model.name || 'Report';
   workbook.calcProperties.fullCalcOnLoad = true;
-  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
+  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {}, culture: resolveReportCulture(model, { parameters: request.parameters || {} }) };
   const datasets = normalizeDatasets(model, request);
   const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets };
   const sections = partitionReportSections(model, context);

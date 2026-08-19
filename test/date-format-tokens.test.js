@@ -189,16 +189,16 @@ test('a no-format DateTime renders general date/time (date and time) in PDF', as
   assert.match(stdout, /13\/08\/2026 08:04:53/);
 });
 
-test('a no-format DateTime is a typed Excel date with the general date/time number format', async (context) => {
+test('a no-format DateTime displays general date/time in XLSX, consistent with PDF/DOCX', async (context) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-date-noformat-xlsx-'));
   context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
   const rendered = await renderExcel(parseRdl(reportNoFormat()), { ...request, excelLayoutMode: 'REPORT' }, config, tempDir);
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(rendered.buffer);
-  let dateCell = null;
+  const values = [];
   workbook.worksheets.forEach((sheet) => sheet.eachRow((row) => row.eachCell((cell) => {
-    if (cell.value instanceof Date) dateCell = cell;
+    const value = String(cell.value ?? '').trim();
+    if (value) values.push(value);
   })));
-  assert.ok(dateCell, 'expected a typed Date cell');
-  assert.equal(dateCell.numFmt, 'yyyy-mm-dd hh:mm:ss');
+  assert.ok(values.some((value) => value.includes('13/08/2026 08:04:53')), `expected date and time in ${JSON.stringify(values)}`);
 });

@@ -15,6 +15,20 @@ export function continuationMarkersEnabled(request) {
   return request?.pagination?.continuationMarkers === true;
 }
 
+// A value that must format as a DateTime when no explicit Format is present. Mirrors the date branch of
+// `formatValue` (Date object, or an ISO-8601-leading string) so the no-format path and the explicit-format
+// path agree on what is a date. DateTime parameters/fields commonly arrive as ISO strings (see
+// validation.js parameter coercion), so an `instanceof Date` check alone would miss them.
+export function isDateLikeValue(value) {
+  return value instanceof Date || /^\d{4}-\d{2}-\d{2}/.test(String(value));
+}
+
+// The resolved report culture carried on globals, or null when the report declares no Language (the
+// formatter then keeps its legacy defaults).
+export function cultureFor(context) {
+  return context?.globals?.culture ?? null;
+}
+
 export function isHidden(expression, context) {
   const result = evaluateExpression(expression, context);
   return result === true || String(result).toLowerCase() === 'true';
@@ -51,8 +65,9 @@ export function styledTextForItem(item, context) {
       // pattern), not JS String(Date) — the latter emits the verbose "Tue Aug 18 2026 14:27:38 GMT+0530
       // (India Standard Time)" toString, which wraps to a second line and is cropped inside a fixed-height
       // band (e.g. =Globals!ExecutionTime in a page footer).
-      const formatted = format ? String(formatValue(value, format))
-        : value instanceof Date ? String(formatValue(value, null))
+      const culture = cultureFor(context);
+      const formatted = format ? String(formatValue(value, format, culture))
+        : isDateLikeValue(value) ? String(formatValue(value, null, culture))
           : String(value);
       return {
         text: normalizeDisplayText(renderMarkupText(formatted, definition.markupType)),
@@ -125,9 +140,10 @@ export function textForItem(item, context) {
   if (value === null || value === undefined) return '';
   // See styledTextForItem: a no-format Date routes through formatValue so it is not stringified with the
   // verbose JS Date.toString(); non-dates keep raw String(value).
+  const culture = cultureFor(context);
   return normalizeDisplayText(item.style?.format
-    ? String(formatValue(value, styleValue(item.style.format, context)))
-    : value instanceof Date ? String(formatValue(value, null))
+    ? String(formatValue(value, styleValue(item.style.format, context), culture))
+    : isDateLikeValue(value) ? String(formatValue(value, null, culture))
       : String(value));
 }
 

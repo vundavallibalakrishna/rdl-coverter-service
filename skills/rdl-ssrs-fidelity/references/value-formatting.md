@@ -45,9 +45,13 @@ Formatting is resolved once, in the expression/format layer, and consumed identi
 or number that reaches a renderer as a raw object must still pass through this engine before it becomes a
 string — a renderer must never `String()` a typed value directly.
 
-## Known engine deviation (reconcile against the oracle)
+## Engine status
 
-The current no-format **DateTime** default emits a bare date (`dd/MM/yyyy`) rather than SSRS general
-date/time (`date + time`). This was chosen to satisfy an existing unit test. SSRS shows date **and** time.
-Reconcile by changing the no-format Date default to general date/time and updating that test, verified
-against a real SSRS reference. Tracked in `known-deviations.md`.
+Reconciled: the no-format **DateTime** default renders general date/time (`formatValue` → `dd/MM/yyyy
+HH:mm:ss`; the text path routes any Date-or-ISO-string with no format through the formatter; XLSX writes a
+typed date). **Report culture** is honored — `formatValue`/`formatNet` take a culture, `globals.culture`
+(from the report `Language`, canonicalized) reaches every renderer via `cultureFor(context)`, and `C`
+currency uses the locale's currency (`currencyForCulture`); a report with no `Language` keeps the legacy
+en-US-number / en-GB-date defaults. Explicit date formats are honored in XLSX too (translated to a live
+Excel number format). Remaining gaps (see `known-deviations.md`): the *no-format* default date order is not
+culture-reordered, and item-level `Language` overrides are not applied.

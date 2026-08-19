@@ -49,3 +49,39 @@ export const DEFAULT_EXCEL_DATE_FORMAT = 'yyyy-mm-dd';
 // The Excel display for a DateTime with NO format: general date/time (date and time), matching .NET/SSRS
 // default DateTime rendering so Excel stays consistent with the PDF/DOCX text renderers.
 export const DEFAULT_EXCEL_DATETIME_FORMAT = 'yyyy-mm-dd hh:mm:ss';
+
+// Standard single-letter .NET date specifiers mapped to an Excel number format that matches what the text
+// renderer (formatValue) produces for the same specifier. Only the specifiers formatValue special-cases
+// are mapped; anything else returns null and the caller writes the already-formatted string instead.
+const STANDARD_DATE_NUMFMT = {
+  y: 'mmmm yyyy', Y: 'mmmm yyyy', d: 'dd/mm/yyyy', D: 'd mmmm yyyy',
+  g: 'dd/mm/yyyy hh:mm', G: 'dd/mm/yyyy hh:mm:ss',
+};
+
+// .NET custom date tokens → Excel number-format tokens. Month (`M`) and minute (`m`) both become `m`/`mm`
+// in Excel, which disambiguates by position (an `mm` following `h`/`hh` is minutes). Longest-first.
+const DATE_TOKEN_TRANSLATION = {
+  yyyy: 'yyyy', yyy: 'yyyy', yy: 'yy', y: 'yy',
+  MMMM: 'mmmm', MMM: 'mmm', MM: 'mm', M: 'm',
+  dddd: 'dddd', ddd: 'ddd', dd: 'dd', d: 'd',
+  HH: 'hh', H: 'h', hh: 'hh', h: 'h',
+  mm: 'mm', m: 'm', ss: 'ss', s: 's', tt: 'AM/PM',
+};
+const DATE_TOKEN_RE = /(yyyy|yyy|yy|y|MMMM|MMM|MM|M|dddd|ddd|dd|d|HH|H|hh|h|mm|m|ss|s|tt)/g;
+
+// Translate an RDL/.NET date `Format` into an Excel number format so an explicitly-formatted date stays a
+// live typed Excel date that displays the same as the PDF/DOCX text. Returns null when the format is a
+// specifier we do not map or carries quoted literals — the caller then writes the exact formatted string.
+export function excelDateFormat(format) {
+  const value = String(format || '').trim();
+  if (!value) return null;
+  if (value.length === 1) return STANDARD_DATE_NUMFMT[value] ?? null;
+  if (/['"\\]/.test(value)) return null;
+  if (!/[yMdHhst]/.test(value)) return null;
+  let matched = false;
+  const translated = value.replace(DATE_TOKEN_RE, (token) => {
+    matched = true;
+    return DATE_TOKEN_TRANSLATION[token];
+  });
+  return matched ? translated : null;
+}

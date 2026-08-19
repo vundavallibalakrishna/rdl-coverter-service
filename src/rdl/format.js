@@ -11,6 +11,8 @@
 // - Dates are formatted in UTC so output is deterministic regardless of host
 //   timezone.
 
+import { currencyForCulture } from './culture.js';
+
 const DATE_TOKEN_RE = /(yyyy|yyy|yy|y|MMMM|MMM|MM|M|dddd|ddd|dd|d|HH|H|hh|h|mm|m|ss|s|tt)/;
 const NUMERIC_HINT_RE = /[#0]|^[CcNnPpFfDdEeGgRrXx]\d*$/;
 
@@ -122,7 +124,7 @@ function tryStandardNumeric(value, format, culture) {
       const digits = precision ?? 2;
       return new Intl.NumberFormat(culture, {
         style: 'currency',
-        currency: 'USD',
+        currency: currencyForCulture(culture),
         minimumFractionDigits: digits,
         maximumFractionDigits: digits,
       }).format(value);
