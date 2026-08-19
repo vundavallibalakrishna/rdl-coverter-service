@@ -174,6 +174,27 @@ test('a dynamic borderless narrative tablix honors Border=None instead of receiv
   assert.doesNotMatch(xml, /<w:bottom w:val="single"/);
 });
 
+test('a bordered nested child does not create an outer border for a borderless dynamic tablix', () => {
+  const none = { style: 'None', color: '#000000', width: 1 };
+  const borderedChild = {
+    type: 'Textbox',
+    style: { borders: { top: { style: 'Solid', color: '#000000', width: 1 }, right: { ...none }, bottom: { ...none }, left: { ...none } } },
+  };
+  const nestedContainer = {
+    type: 'Rectangle',
+    style: { borders: { top: { ...none }, right: { ...none }, bottom: { ...none }, left: { ...none } } },
+    items: [borderedChild],
+  };
+  const nestedTablix = {
+    type: 'Tablix',
+    style: { borders: { top: { style: 'Solid', color: '#000000', width: 1 }, right: { ...none }, bottom: { ...none }, left: { ...none } } },
+  };
+  const rows = [{ isStatic: false, cells: [{ items: [nestedContainer, nestedTablix], values: [] }] }];
+  const tablix = { style: { borders: { top: { ...none }, right: { ...none }, bottom: { ...none }, left: { ...none } } } };
+
+  assert.equal(shouldEnforceTablixBottom(rows, tablix), false);
+});
+
 test('a trailing static matrix axis row does not receive a synthetic bottom rule', () => {
   const bordered = {
     items: [{
