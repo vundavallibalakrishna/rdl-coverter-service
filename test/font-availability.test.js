@@ -45,6 +45,23 @@ async function withEnv(name, value, fn) {
   }
 }
 
+// Run fn() with the machine's own font stores hidden behind an empty directory. Without this, a developer
+// workstation that happens to have Segoe UI Emoji or Noto Emoji installed silently satisfies the very
+// resolution these tests are asserting cannot happen, and they pass or fail on what the host has rather
+// than on the resolver's behaviour.
+async function withIsolatedSystemFonts(fn) {
+  const empty = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-no-system-fonts-'));
+  try {
+    return await withEnv('SystemRoot', empty, () => withEnv('LOCALAPPDATA', empty, fn));
+  } finally {
+    await fs.rm(empty, { recursive: true, force: true });
+  }
+}
+
+// Extended_Pictographic and reserved for a future emoji, so no shipping font covers it on any platform.
+// Using a real emoji instead makes "nothing here can draw this" depend on the host's installed faces.
+const UNCOVERED_PICTOGRAPH = '\u{1FAFF}';
+
 const ALL_VARIANTS = ['bold', 'bolditalic', 'italic', 'regular'];
 
 test('font coverage ignores layout controls while retaining every visible glyph', () => {
@@ -86,56 +103,94 @@ test('fontAvailability marks a fully-mounted family available with no missing va
 
 test('emoji never falls through to Helvetica when no embedded font covers the glyph', async () => {
   const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-empty-fonts-'));
-  const config = loadConfig({
-    ...process.env,
-    RDL_FONT_DIR: fontDir,
-    RDL_STRICT_FONTS: 'false',
-    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+  await withIsolatedSystemFonts(() => {
+    const config = loadConfig({
+      ...process.env,
+      RDL_FONT_DIR: fontDir,
+      RDL_STRICT_FONTS: 'false',
+      RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+    });
+    assert.throws(
+      () => pdfFont(config, 'Segoe UI Emoji', false, false, UNCOVERED_PICTOGRAPH),
+      (error) => error?.code === 'FONT_MISSING' && /emoji/i.test(error.message),
+    );
   });
-  assert.throws(
-    () => pdfFont(config, 'Segoe UI Emoji', false, false, '😊'),
-    (error) => error?.code === 'FONT_MISSING' && /emoji/i.test(error.message),
-  );
   await fs.rm(fontDir, { recursive: true, force: true });
+});
+
+test('an unembeddable emoji face never downgrades to a symbol font that lacks the requested glyph', async (context) => {
+  const hostConfig = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
+  const emoji = resolveFontFile(hostConfig.fontDir, 'Segoe UI Emoji', false, false);
+  const symbol = resolveFontFile(hostConfig.fontDir, 'Segoe UI Symbol', false, false);
+  if (!emoji || !symbol) {
+    context.skip('requires the Windows Segoe emoji and symbol fonts');
+    return;
+  }
+  const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-colour-emoji-'));
+  await fs.copyFile(emoji, path.join(fontDir, 'seguiemj.ttf'));
+  await fs.copyFile(symbol, path.join(fontDir, 'seguisym.ttf'));
+  try {
+    await withEnv('SystemRoot', fontDir, async () => withEnv('LOCALAPPDATA', fontDir, async () => {
+      const config = loadConfig({
+        ...process.env,
+        RDL_FONT_DIR: fontDir,
+        RDL_STRICT_FONTS: 'false',
+        RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+      });
+      assert.throws(
+        () => pdfFont(config, 'Segoe UI Emoji', false, false, '🤨'),
+        (error) => error?.code === 'FONT_MISSING' && /embeddable font covers/i.test(error.message),
+      );
+    }));
+  } finally {
+    await fs.rm(fontDir, { recursive: true, force: true });
+  }
 });
 
 test('compatible emoji fallback is explicit and visible in font availability', async () => {
   const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-emoji-fallback-'));
   const fallback = path.join(fontDir, 'NotoEmoji-Regular.ttf');
   await fs.writeFile(fallback, 'resolver fixture');
-  const disabled = loadConfig({
-    ...process.env,
-    RDL_FONT_DIR: fontDir,
-    RDL_STRICT_FONTS: 'true',
-    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'false',
-  });
-  assert.throws(() => pdfFont(disabled, 'Segoe UI Emoji'), (error) => error?.code === 'FONT_MISSING');
+  await withIsolatedSystemFonts(() => {
+    const disabled = loadConfig({
+      ...process.env,
+      RDL_FONT_DIR: fontDir,
+      RDL_STRICT_FONTS: 'true',
+      RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'false',
+    });
+    assert.throws(() => pdfFont(disabled, 'Segoe UI Emoji'), (error) => error?.code === 'FONT_MISSING');
 
-  const enabled = loadConfig({
-    ...process.env,
-    RDL_FONT_DIR: fontDir,
-    RDL_STRICT_FONTS: 'true',
-    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+    const enabled = loadConfig({
+      ...process.env,
+      RDL_FONT_DIR: fontDir,
+      RDL_STRICT_FONTS: 'true',
+      RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+    });
+    assert.equal(pdfFont(enabled, 'Segoe UI Emoji'), fallback);
+    const [availability] = fontAvailability(enabled, ['Segoe UI Emoji']);
+    assert.equal(availability.available, false);
+    assert.equal(availability.compatibleFallback, 'Noto Emoji');
+    assert.equal(availability.renderable, true);
+    assert.equal(availability.blocksStrictRender, false);
   });
-  assert.equal(pdfFont(enabled, 'Segoe UI Emoji'), fallback);
-  const [availability] = fontAvailability(enabled, ['Segoe UI Emoji']);
-  assert.equal(availability.available, false);
-  assert.equal(availability.compatibleFallback, 'Noto Emoji');
-  assert.equal(availability.renderable, true);
-  assert.equal(availability.blocksStrictRender, false);
   await fs.rm(fontDir, { recursive: true, force: true });
 });
 
 test('a fallback filename alone is insufficient when its font does not cover the emoji', async () => {
   const fontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-invalid-emoji-fallback-'));
   await fs.writeFile(path.join(fontDir, 'NotoEmoji-Regular.ttf'), 'not a font');
-  const config = loadConfig({
-    ...process.env,
-    RDL_FONT_DIR: fontDir,
-    RDL_STRICT_FONTS: 'false',
-    RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+  await withIsolatedSystemFonts(() => {
+    const config = loadConfig({
+      ...process.env,
+      RDL_FONT_DIR: fontDir,
+      RDL_STRICT_FONTS: 'false',
+      RDL_ALLOW_COMPATIBLE_FONT_FALLBACKS: 'true',
+    });
+    assert.throws(
+      () => pdfFont(config, 'Segoe UI Emoji', false, false, UNCOVERED_PICTOGRAPH),
+      (error) => error?.code === 'FONT_MISSING',
+    );
   });
-  assert.throws(() => pdfFont(config, 'Segoe UI Emoji', false, false, '😡'), (error) => error?.code === 'FONT_MISSING');
   await fs.rm(fontDir, { recursive: true, force: true });
 });
 
@@ -157,7 +212,11 @@ test('a font installed in the per-user %LOCALAPPDATA% fonts directory resolves',
   await fs.mkdir(perUserFonts, { recursive: true });
   await fs.writeFile(path.join(perUserFonts, 'arialbd.ttf'), 'stub'); // Arial Bold, Windows filename
   const emptyFontDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-emptyfonts-'));
-  const resolved = await withEnv('LOCALAPPDATA', localAppData, () => resolveFontFile(emptyFontDir, 'Arial', true, false));
+  // %SystemRoot%\Fonts is probed before the per-user store, so the machine's own Arial Bold would answer
+  // first and this would assert nothing about the per-user directory.
+  const emptySystemRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-no-sysroot-'));
+  const resolved = await withEnv('SystemRoot', emptySystemRoot, () => withEnv('LOCALAPPDATA', localAppData, () => resolveFontFile(emptyFontDir, 'Arial', true, false)));
+  await fs.rm(emptySystemRoot, { recursive: true, force: true });
   assert.equal(resolved, path.join(perUserFonts, 'arialbd.ttf'));
   await fs.rm(localAppData, { recursive: true, force: true });
   await fs.rm(emptyFontDir, { recursive: true, force: true });

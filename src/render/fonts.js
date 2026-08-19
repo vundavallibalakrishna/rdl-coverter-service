@@ -175,6 +175,14 @@ function openedFont(file) {
 const USABLE = Object.freeze({ covers: true, embeddable: true });
 const UNUSABLE = Object.freeze({ covers: false, embeddable: false });
 
+// Font files are responsible for visible glyphs, not Unicode layout controls. Requiring a glyph for a
+// newline, tab, BOM, joiner, variation selector, or another default-ignorable code point turns valid
+// multiline/structured text into a misleading FONT_MISSING failure in strict mode. Keep the original text
+// unchanged for measurement and drawing; this projection is used only for glyph-coverage validation.
+export function renderableGlyphText(text) {
+  return String(text || '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu, '');
+}
+
 /**
  * What `file` can do with `text`: draw it (`covers`) and survive being embedded in the PDF (`embeddable`).
  *
@@ -191,34 +199,22 @@ function fontCapability(file, text) {
   if (cached !== undefined) return cached;
   let capability;
   try {
-    // Whole-string layout rather than per-code-point lookup: it is what actually gets drawn, so ligatures,
-    // combining marks and multi-code-point emoji sequences are judged as the clusters they render as.
-    const glyphs = openedFont(file).layout(String(text)).glyphs;
-    capability = {
-      covers: glyphs.every((glyph) => glyph.id !== 0),
-      embeddable: glyphs.every((glyph) => typeof glyph._decode === 'function'),
-    };
-     } catch {
-    // Unreadable, truncated or collection (.ttc) file — not usable for this text either way.
-    capability = UNUSABLE;
-  }
-  if (coverageCache.size >= COVERAGE_CACHE_LIMIT) coverageCache.clear();
-  coverageCache.set(key, capability);
-  return capability;
-}
-// Font files are responsible for visible glyphs, not Unicode layout controls. Requiring a glyph for a
-// newline, tab, BOM, joiner, variation selector, or another default-ignorable code point turns valid
-// multiline/structured text into a misleading FONT_MISSING failure in strict mode. Keep the original text
-// unchanged for measurement and drawing; this projection is used only for glyph-coverage validation.
-export function renderableGlyphText(text) {
-  return String(text || '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu, '');
-}
-
-function fontCoversText(file, text) {
-  if (!text) return true;
-  try {
-    const visibleText = renderableGlyphText(text);
-    return !visibleText || openedFont(file).layout(visibleText).glyphs.every((glyph) => glyph.id !== 0);
+    // Layout controls are projected out before measuring. No shipping font carries a glyph for U+000A or
+    // U+0009, so judging the raw string reports every multi-line or tabbed textbox as uncovered: the whole
+    // substitution ladder is walked for nothing, and a run that also holds a pictograph then finds no
+    // candidate at all and fails the export. Coverage is a question about visible glyphs only.
+    const visible = renderableGlyphText(text);
+    if (!visible) {
+      capability = USABLE;
+    } else {
+      // Whole-string layout rather than per-code-point lookup: it is what actually gets drawn, so ligatures,
+      // combining marks and multi-code-point emoji sequences are judged as the clusters they render as.
+      const glyphs = openedFont(file).layout(visible).glyphs;
+      capability = {
+        covers: glyphs.every((glyph) => glyph.id !== 0),
+        embeddable: glyphs.every((glyph) => typeof glyph._decode === 'function'),
+      };
+    }
   } catch {
     // Unreadable, truncated or collection (.ttc) file — not usable for this text either way.
     capability = UNUSABLE;
@@ -423,8 +419,11 @@ export function pdfFont(config, family, bold = false, italic = false, text = '')
     if (covering) {
       return rememberPdfFontSelection(config, selectionKey, covering.file, [normalized, covering.family, 'glyph-coverage']);
     }
-    // Returning the declared TrueType file is safe even for emoji: an embedded font renders an uncovered
-    // code point as .notdef, whereas the base-14 path below would write corrupt surrogate bytes.
+    // Keeping the declared TrueType file is correct for every uncovered character, pictographs included:
+    // an embedded font renders one it lacks as .notdef — precisely what SSRS does on a host without that
+    // glyph — whereas the base-14 path below would write corrupt surrogate bytes. Refusing the export here
+    // instead would reject a whole report over one decorative character in one cell while the equivalent
+    // CJK or dingbat character degrades quietly, so the substitution is recorded rather than fatal.
     if (fontEmbeddableFor(file, text)) {
       return rememberPdfFontSelection(
         config,
@@ -433,8 +432,15 @@ export function pdfFont(config, family, bold = false, italic = false, text = '')
         text ? [normalized, normalized, 'no-covering-font'] : null,
       );
     }
-    // The declared font is itself a colour font, so embedding it would abort the render. Anything the
-    // renderer can actually embed is better, even if some characters fall back to .notdef.
+    // The declared font is itself a colour font (COLR/CBDT/sbix), so embedding it would abort the render
+    // during subsetting. For pictographic text there is no honest stand-in left: every embeddable face the
+    // ladder can still offer was already rejected for not covering the run, so selecting one would print a
+    // .notdef box while reporting a successful export. Fail closed instead.
+    if (containsEmoji(text)) {
+      throw new ServiceError('FONT_MISSING', `No embeddable font covers the required emoji for: ${normalized}`, 503);
+    }
+    // Non-pictographic text: anything the renderer can actually embed beats a render that dies mid-subset,
+    // even if some characters fall back to .notdef.
     const embeddable = embeddableFont(config, normalized, bold, italic, text);
     if (embeddable) {
       return rememberPdfFontSelection(config, selectionKey, embeddable.file, [normalized, embeddable.family, 'not-embeddable']);
