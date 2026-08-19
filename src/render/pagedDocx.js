@@ -26,6 +26,7 @@ import {
   TextWrappingType,
   UnderlineType,
   VerticalAlignTable,
+  VerticalMergeType,
   VerticalPositionRelativeFrom,
   WidthType,
 } from 'docx';
@@ -38,6 +39,7 @@ import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { editableFontEmbeddingPermission, resolveFontFile } from './fonts.js';
 import { renderPdf } from './pdf.js';
+import { buildGridBoundaries } from './gridBoundaries.js';
 import { validateLayoutTrace } from './layoutTrace.js';
 import { validateWindowsWordRequest } from './windowsWordCompatibility.js';
 
@@ -88,18 +90,15 @@ function cleanColor(value, fallback = '000000') {
   return /^[0-9a-f]{6}$/i.test(normalized) ? normalized.toUpperCase() : fallback;
 }
 
-function uniqueBoundaries(values) {
-  const sorted = values.map(snap).sort((left, right) => left - right);
-  const result = [];
-  for (const value of sorted) {
-    if (result.length === 0 || Math.abs(result[result.length - 1] - value) > GEOMETRY_EPSILON) result.push(value);
-  }
-  return result;
+// The grid must address every traced edge, but two edges closer than the certification tolerance are the
+// same Word grid line: Word cannot render a table band that narrow and separates the two cell borders
+// instead, turning one canonical rule into a double line. See gridBoundaries.js for the full reasoning.
+function pageGridAxis(values, protectedSpans) {
+  return buildGridBoundaries(values.map(snap), { protectedSpans });
 }
 
-function boundaryIndex(boundaries, value) {
-  const snapped = snap(value);
-  const index = boundaries.findIndex((candidate) => Math.abs(candidate - snapped) <= GEOMETRY_EPSILON);
+function boundaryIndex(axis, value) {
+  const index = axis.indexOf(snap(value));
   if (index < 0) unsupported('PDF layout geometry cannot be represented by a stable Word table grid', { value });
   return index;
 }
@@ -471,11 +470,11 @@ function strongerBorder(left, right) {
   return rightWidth >= leftWidth ? right : left;
 }
 
-function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null) {
+function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null, topPaddingTwips = 0) {
   const source = item.lines || [];
   if (source.length === 0) return [new Paragraph({
     spacing: {
-      before: 0,
+      before: Math.max(0, topPaddingTwips),
       after: Math.max(0, bottomPaddingTwips),
       line: 1,
       lineRule: LineRuleType.EXACT,
@@ -567,7 +566,10 @@ function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null)
     return new Paragraph({
       alignment: alignment(first.alignment),
       spacing: {
-        before: Math.max(0, pointsToTwips(first.before || 0)),
+        before: Math.max(
+          0,
+          pointsToTwips(first.before || 0) + (groupIndex === 0 ? topPaddingTwips : 0),
+        ),
         after: Math.max(
           0,
           pointsToTwips(last.after || 0)
@@ -653,6 +655,7 @@ async function pictureForItem(
   tempDir,
   chartIndex,
   bottomPaddingTwips = 0,
+  topPaddingTwips = 0,
 ) {
   let data;
   let type;
@@ -719,7 +722,8 @@ async function pictureForItem(
     // cell and keep their anchor paragraph physically negligible. Cell-relative positioning also remains
     // stable in Word footer stories and avoids page offsets being applied twice by alternate OOXML viewers.
     spacing: {
-      before: 0,
+      // The drawing is anchored to this paragraph, so it must absorb any top margin the cell gave up.
+      before: Math.max(0, topPaddingTwips),
       after: Math.max(0, bottomPaddingTwips),
       line: 1,
       lineRule: LineRuleType.EXACT,
@@ -1027,16 +1031,20 @@ function preparePageGrid(page, {
     }
   }
 
-  const xBoundaries = uniqueBoundaries([
+  // Only owners occupy grid cells, so only their extents have to survive the collapse; a decorator or a
+  // line that loses a sub-tolerance band still resolves onto the shared edge it decorates.
+  const xAxis = pageGridAxis([
     0,
     page.width,
     ...normalized.flatMap((item) => [item.x, item.x + item.width]),
-  ]);
-  const yBoundaries = uniqueBoundaries([
+  ], owners.map((item) => [snap(item.x), snap(item.x + item.width)]));
+  const yAxis = pageGridAxis([
     0,
     canvasBottom,
     ...normalized.flatMap((item) => [item.y, item.y + item.height]),
-  ]);
+  ], owners.map((item) => [snap(item.y), snap(item.y + item.height)]));
+  const xBoundaries = xAxis.boundaries;
+  const yBoundaries = yAxis.boundaries;
   if (xBoundaries.length - 1 > WORD_MAX_TABLE_COLUMNS) {
     unsupported('The PDF page requires more than Microsoft Word’s 63 table columns', {
       page: page.number,
@@ -1052,11 +1060,25 @@ function preparePageGrid(page, {
 
   const placements = owners.map((item) => ({
     item,
-    startColumn: boundaryIndex(xBoundaries, item.x),
-    endColumn: boundaryIndex(xBoundaries, item.x + item.width),
-    startRow: boundaryIndex(yBoundaries, item.y),
-    endRow: boundaryIndex(yBoundaries, item.y + item.height),
+    startColumn: boundaryIndex(xAxis, item.x),
+    endColumn: boundaryIndex(xAxis, item.x + item.width),
+    startRow: boundaryIndex(yAxis, item.y),
+    endRow: boundaryIndex(yAxis, item.y + item.height),
   }));
+  for (const placement of placements) {
+    // Every owner paints text, an image, or a fill, so it must keep at least one grid cell. A protected
+    // span guarantees that for the collapse above; anything left here is a genuinely sub-tolerance box
+    // that Word cannot show, and dropping it silently would lose report content.
+    if (placement.endColumn <= placement.startColumn || placement.endRow <= placement.startRow) {
+      unsupported('A PDF region is too small to occupy its own native Word grid cell', {
+        page: page.number,
+        item: placement.item.itemName,
+        kind: placement.item.kind,
+        widthPt: placement.item.width,
+        heightPt: placement.item.height,
+      });
+    }
+  }
   const coverage = Array.from(
     { length: yBoundaries.length - 1 },
     () => Array(xBoundaries.length - 1).fill(null),
@@ -1164,10 +1186,23 @@ function cellBox(grid, row, column, rowSpan = 1, columnSpan = 1) {
   };
 }
 
-function cellMargins(item) {
+// Word starts a cell's content area - and the background fill behind it - below the cell's top margin.
+// When the cell is vertically merged and its first band is shorter than that margin, which is what any
+// neighbouring item starting a fraction lower produces, the fill cannot begin in that band at all: it
+// resumes in the next one, leaving the top border stranded above a strip of unfilled cell. Word's screen
+// renderer draws that as a separate rule above the item with a gap beneath it. Such a margin has to move
+// out of `tcMar` and into the paragraph flow, which carries the same offset without displacing the fill.
+// A cell whose first band can hold its own padding - every ordinary cell - keeps the margin untouched.
+function topMarginFitsFirstBand(item, firstBandTwips) {
+  return pointsToTwips(item?.padding?.top || 0) <= firstBandTwips;
+}
+
+function cellMargins(item, firstBandTwips = Infinity) {
   const padding = item?.padding || {};
   return {
-    top: Math.max(0, pointsToTwips(padding.top || 0)),
+    top: topMarginFitsFirstBand(item, firstBandTwips)
+      ? Math.max(0, pointsToTwips(padding.top || 0))
+      : 0,
     right: Math.max(0, pointsToTwips(padding.right || 0)),
     // Microsoft Word adds the largest bottom cell margin to an exact row height. The canonical PDF trace
     // already includes bottom padding inside the physical cell box, so tcMar/bottom would make the Word
@@ -1176,6 +1211,23 @@ function cellMargins(item) {
     bottom: 0,
     left: Math.max(0, pointsToTwips(padding.left || 0)),
     marginUnitType: WidthType.DXA,
+  };
+}
+
+// One traced report item can span several page-grid rows, because any other item anywhere on the page
+// contributes its own edges to the shared grid. WordprocessingML expresses that as a vertical merge, and
+// the merged region's rules come from its outer cells: the top from the first band, the bottom from the
+// last, the sides from every band. Repeating the item's own top and bottom on the inner bands paints a
+// horizontal rule *inside* the cell at each grid row it crosses. That is invisible while the bands are
+// tall enough for Word to suppress it, but a band only as tall as the strokes themselves - the common
+// case when a neighbouring item starts a point below this one - renders it as a second rule just under
+// the real border. Distribute the horizontal rules across the merge instead of repeating them.
+function mergeBandBorders(borders, band) {
+  if (!band || band.count <= 1) return borders;
+  return {
+    ...borders,
+    top: band.index === 0 ? borders.top : NONE_BORDER,
+    bottom: band.index === band.count - 1 ? borders.bottom : NONE_BORDER,
   };
 }
 
@@ -1191,18 +1243,47 @@ async function tableCellFor(
   tempDir,
   chartCounter,
   fitTextCounter,
+  band = null,
 ) {
   const rowSpan = placement ? placement.endRow - placement.startRow : 1;
   const columnSpan = placement ? placement.endColumn - placement.startColumn : 1;
   const owner = placement?.item || null;
-  const box = cellBox(grid, row, column, rowSpan, columnSpan);
+  const merged = Boolean(band) && band.count > 1;
+  const continuation = merged && band.index > 0;
+  // Borders, background, and geometry are always resolved against the item's whole traced box, never
+  // against the individual band, so a merge cannot change what the canonical PDF painted.
+  const box = cellBox(grid, placement ? placement.startRow : row, column, rowSpan, columnSpan);
+  if (continuation) {
+    return new TableCell({
+      width: { size: pointsToTwips(box.width), type: WidthType.DXA },
+      columnSpan,
+      verticalMerge: VerticalMergeType.CONTINUE,
+      borders: mergeBandBorders(resolvedCellBorders(box, owner, grid.decorators, grid.lines), band),
+      shading: (() => {
+        const fill = resolvedBackground(box, owner, grid.decorators);
+        return fill ? { type: ShadingType.CLEAR, fill: cleanColor(fill), color: 'auto' } : undefined;
+      })(),
+      children: [new Paragraph({
+        spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
+        children: [new TextRun({ text: '' })],
+      })],
+    });
+  }
   const bottomPaddingTwips = Math.max(
     0,
     pointsToTwips(owner?.padding?.bottom || 0),
   );
-  const margins = owner ? cellMargins(owner) : {
+  const firstBandTwips = placement
+    ? pointsToTwips(grid.yBoundaries[placement.startRow + 1] - grid.yBoundaries[placement.startRow])
+    : Infinity;
+  const margins = owner ? cellMargins(owner, firstBandTwips) : {
     top: 0, right: 0, bottom: 0, left: 0, marginUnitType: WidthType.DXA,
   };
+  // Whatever `cellMargins` refused to put in `tcMar/top` is carried by the content instead, so the item
+  // keeps the same inner box it had in the canonical PDF.
+  const displacedTopPaddingTwips = owner && !topMarginFitsFirstBand(owner, firstBandTwips)
+    ? Math.max(0, pointsToTwips(owner.padding?.top || 0))
+    : 0;
   let children;
   if (owner?.kind === 'image' || owner?.kind === 'chart') {
     const withPage = {
@@ -1219,18 +1300,23 @@ async function tableCellFor(
       tempDir,
       chartCounter.value++,
       bottomPaddingTwips,
+      displacedTopPaddingTwips,
     )];
   } else {
-    children = owner ? linesForParagraphs(owner, bottomPaddingTwips, fitTextCounter) : [new Paragraph({
-      spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
-      children: [new TextRun({ text: '' })],
-    })];
+    children = owner
+      ? linesForParagraphs(owner, bottomPaddingTwips, fitTextCounter, displacedTopPaddingTwips)
+      : [new Paragraph({
+        spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
+        children: [new TextRun({ text: '' })],
+      })];
   }
   const background = resolvedBackground(box, owner, grid.decorators);
   return new TableCell({
     width: { size: pointsToTwips(box.width), type: WidthType.DXA },
     columnSpan,
-    rowSpan,
+    // The continuation bands are emitted explicitly above, so `rowSpan` must stay off: it would make the
+    // docx builder append its own continuations that repeat this cell's borders on every inner band.
+    verticalMerge: merged ? VerticalMergeType.RESTART : undefined,
     margins,
     verticalAlign: owner?.kind === 'image' || owner?.kind === 'chart'
       // The floating picture is positioned from this paragraph's top edge. Centering a negligible
@@ -1242,7 +1328,7 @@ async function tableCellFor(
     // only the physical direction painted by PDF and never re-evaluates report data independently.
     textDirection: owner ? wordTextDirection(owner.writingMode) || undefined : undefined,
     shading: background ? { type: ShadingType.CLEAR, fill: cleanColor(background), color: 'auto' } : undefined,
-    borders: resolvedCellBorders(box, owner, grid.decorators, grid.lines),
+    borders: mergeBandBorders(resolvedCellBorders(box, owner, grid.decorators, grid.lines), band),
     children,
   });
 }
@@ -1264,11 +1350,6 @@ async function pageTable(
     while (column < grid.xBoundaries.length - 1) {
       const placement = grid.coverage[row][column];
       if (placement) {
-        if (placement.startRow < row) {
-          if (placement.startColumn === column) column = placement.endColumn;
-          else column += 1;
-          continue;
-        }
         if (placement.startColumn !== column) {
           column += 1;
           continue;
@@ -1285,6 +1366,10 @@ async function pageTable(
           tempDir,
           chartCounter,
           fitTextCounter,
+          {
+            index: row - placement.startRow,
+            count: placement.endRow - placement.startRow,
+          },
         );
         children.push(cell);
         column = placement.endColumn;

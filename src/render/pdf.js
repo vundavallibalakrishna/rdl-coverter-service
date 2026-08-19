@@ -1781,6 +1781,9 @@ export async function renderPdf(model, request, config, options = {}) {
         } else if (bandY >= pageBottom || (
           fixedBand
           && bandY + bandHeight > pageBottom
+          // Same rule as the body-level flow: a band taller than an empty page gains nothing from being
+          // deferred, so it must not consume the remainder of the page it is standing on.
+          && bandHeight <= (pageBottom - bodyTop) + COINCIDENT_EDGE_TOLERANCE_PT
           && endY > bodyTop + COINCIDENT_EDGE_TOLERANCE_PT
         )) {
           pageAdvance();
@@ -1945,9 +1948,16 @@ export async function renderPdf(model, request, config, options = {}) {
     const bandBottomOffset = Math.max(...band.map((candidate) => (
       candidate.top - item.top + candidate.height
     )));
+    // Deferring a band to a fresh page is only worth the remainder it throws away when the band actually
+    // fits on a fresh page. A band taller than the whole printable body cannot be rescued by moving it: it
+    // will overflow wherever it starts, so deferring costs the entire remainder of this page and leaves a
+    // blank band its own height. Such a band starts where it stands and fragments across pages, exactly as
+    // the growable-textbox flow above already reasons about its own oversized blocks.
+    const freshPageCapacity = pageBottom - bodyTop;
     if (y >= pageBottom || (
       band.every((candidate) => candidate.type !== 'Tablix')
       && y + bandBottomOffset > pageBottom
+      && bandBottomOffset <= freshPageCapacity + COINCIDENT_EDGE_TOLERANCE_PT
       && pageHasContent
     )) {
       addPage();

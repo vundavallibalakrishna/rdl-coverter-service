@@ -12,6 +12,7 @@ import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { measureTextboxHeight } from './pdf.js';
+import { buildGridBoundaries } from './gridBoundaries.js';
 import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
 
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
@@ -417,9 +418,18 @@ function paintsOwnExtent(style, context) {
 // children at absolute body coordinates and the partition falls between them. Containers without a nested
 // break keep the existing container path untouched.
 //
-// A container that paints its own fill or border cannot be expanded without losing that paint. That is the
-// same construct the PDF renderer refuses to fragment, so it fails closed with the same code rather than
-// producing a silently different worksheet.
+// A page-spanning container that paints its own fill or border cannot be expanded without losing that
+// paint. That is the same construct the PDF renderer refuses to fragment, so it fails closed with the same
+// code rather than producing a silently different worksheet.
+//
+// A container holding a tablix is expanded for a different reason. A Rectangle is a coordinate container,
+// not a flow unit: its children keep their declared positions, so two children in disjoint horizontal lanes
+// stay side by side. Only the coordinate scheduler honours that, and it needs a flat item list - a
+// container holding a tablix otherwise falls back to the flow path, which appends each child below the
+// previous one and collapses a two-column design into a single column. Expanding to absolute body
+// coordinates keeps the declared layout. Nothing is lost when such a container paints: it keeps a childless
+// copy of itself at the same coordinates, and the scheduler grows that copy over whatever its former
+// children resolve to.
 function expandBreakBearingContainers(items, context, offsetLeft = 0, offsetTop = 0) {
   const expanded = [];
   for (const item of items) {
@@ -429,11 +439,18 @@ function expandBreakBearingContainers(items, context, offsetLeft = 0, offsetTop 
     const shifted = offsetLeft || offsetTop
       ? { ...item, left: (item.left || 0) + offsetLeft, top: (item.top || 0) + offsetTop }
       : item;
-    if (item.type !== 'Rectangle' || !declaresNestedPageBreak(item, context)) {
+    if (item.type !== 'Rectangle') {
       expanded.push(shifted);
       continue;
     }
-    if (paintsOwnExtent(item.style, context)) {
+    const fragments = declaresNestedPageBreak(item, context);
+    const schedulesTablix = containsTablix(item);
+    if (!fragments && !schedulesTablix) {
+      expanded.push(shifted);
+      continue;
+    }
+    const paints = paintsOwnExtent(item.style, context);
+    if (fragments && paints) {
       throw new ServiceError(
         'UNSUPPORTED_FEATURE',
         'A page-spanning rectangle with a visible fill or border cannot be safely fragmented',
@@ -441,6 +458,9 @@ function expandBreakBearingContainers(items, context, offsetLeft = 0, offsetTop 
         { item: item.name || null },
       );
     }
+    // The shell is emitted before its former children so they keep painting over it, exactly as the
+    // container path drew them.
+    if (paints) expanded.push({ ...shifted, items: [], containerPaintShell: true });
     expanded.push(...expandBreakBearingContainers(item.items || [], context, shifted.left, shifted.top));
   }
   return expanded;
@@ -541,14 +561,38 @@ function tablixLayout(item, request, globals, model, cache) {
   return result;
 }
 
-function collectXBoundaries(items, request, globals, model, tablixCache, target, parentLeft = 0) {
+// A worksheet band narrower than the certified geometry tolerance is not drawable at that width: Excel
+// keeps both bounding cells and paints a border on each, so a container edge that sits a fraction of a
+// point outside the tablix it holds becomes a visible double rule. Collapse those coordinates onto one
+// grid line and record every collapsed value so the existing boundary lookups still resolve.
+// See gridBoundaries.js for the shared reasoning.
+function collapsedBoundaries(values, spans, existingAliases = new Map()) {
+  const { boundaries, indexOf } = buildGridBoundaries(values, { protectedSpans: spans });
+  const aliases = new Map();
+  for (const [raw, target] of existingAliases) {
+    const index = indexOf(target);
+    if (index >= 0) aliases.set(raw, boundaries[index]);
+  }
+  for (const value of values) {
+    if (aliases.has(value)) continue;
+    const index = indexOf(value);
+    if (index >= 0) aliases.set(value, boundaries[index]);
+  }
+  const resolved = [...boundaries];
+  resolved.aliases = aliases;
+  return resolved;
+}
+
+function collectXBoundaries(items, request, globals, model, tablixCache, target, spans, parentLeft = 0) {
   const collectNested = (nested, cellLeft) => {
     const left = point(cellLeft + (nested.item.left || 0));
     target.add(left);
     let cursor = left;
     for (const width of nested.columns || nested.item.columns || []) {
+      const previous = cursor;
       cursor = point(cursor + width);
       target.add(cursor);
+      spans.add(`${previous}|${cursor}`);
     }
     const placements = computeCellPlacements(nested.rows || [], (nested.columns || []).length);
     for (const [rowIndex, row] of (nested.rows || []).entries()) {
@@ -564,13 +608,16 @@ function collectXBoundaries(items, request, globals, model, tablixCache, target,
     const right = point(left + (item.width || 0));
     target.add(left);
     target.add(right);
+    spans.add(`${left}|${right}`);
     if (item.type === 'Tablix') {
       const layout = tablixLayout(item, request, globals, model, tablixCache);
       let cursor = left;
       const offsets = [0];
       for (const width of layout.columns) {
+        const previous = cursor;
         cursor = point(cursor + width);
         target.add(cursor);
+        spans.add(`${previous}|${cursor}`);
         offsets.push(cursor - left);
       }
       const placements = computeCellPlacements(layout.rows, layout.columns.length);
@@ -582,14 +629,15 @@ function collectXBoundaries(items, request, globals, model, tablixCache, target,
         }
       }
     }
-    collectXBoundaries(item.items, request, globals, model, tablixCache, target, left);
+    collectXBoundaries(item.items, request, globals, model, tablixCache, target, spans, left);
   }
 }
 
 function reportGrid(model, section, request, globals, tablixCache) {
   const boundaries = new Set([0]);
-  collectXBoundaries(model.page.header?.items || [], request, globals, model, tablixCache, boundaries);
-  collectXBoundaries(section, request, globals, model, tablixCache, boundaries);
+  const spans = new Set();
+  collectXBoundaries(model.page.header?.items || [], request, globals, model, tablixCache, boundaries, spans);
+  collectXBoundaries(section, request, globals, model, tablixCache, boundaries, spans);
   const aliases = new Map();
   const context = { parameters: request.parameters || {}, globals, fields: {} };
   collectEquivalentXEdges(model.page.header?.items || [], aliases, context);
@@ -601,8 +649,11 @@ function reportGrid(model, section, request, globals, tablixCache) {
     .filter((value) => value >= 0 && value <= maximum)
     .sort((a, b) => a - b);
   if (values.length < 2) values.push(point(maximum || 100));
-  values.aliases = aliases;
-  return values;
+  // Every collected span is one report item's or one tablix column's own extent, so both of its ends must
+  // stay distinct grid lines or that item would lose the only column it can occupy.
+  const protectedSpans = [...spans].map((key) => key.split('|').map(Number))
+    .map(([from, to]) => [aliases.get(from) ?? from, aliases.get(to) ?? to]);
+  return collapsedBoundaries(values, protectedSpans, aliases);
 }
 
 function boundaryIndex(boundaries, value) {
@@ -680,6 +731,32 @@ function applyFillFontAlignment(cell, style, context) {
     wrapText: true,
     textRotation: writingMode === 'rotate270' ? 90 : writingMode === 'vertical' ? -90 : 0,
   };
+}
+
+// A container's declared border ADDS an edge on its own perimeter; it never removes one, and its fill sits
+// behind whatever its contents already painted. Applied after the contents, so the contents' own resolved
+// edges survive wherever the two perimeters coincide.
+function paintContainerExtent(worksheet, range, item, context) {
+  const fill = hex(styleColor(item.style?.backgroundColor, context, null));
+  const borders = item.style?.borders || {};
+  for (let row = range.startRow; row <= range.endRow; row += 1) {
+    for (let column = range.startCol; column <= range.endCol; column += 1) {
+      const target = worksheet.getCell(row, column);
+      if (fill && !target.fill?.type && (target.value === null || target.value === undefined)) {
+        target.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
+      }
+      const containerEdge = (side, onEdge) => (
+        (onEdge ? excelBorderSide(borders[side], context) : undefined) || target.border?.[side]
+      );
+      target.border = {
+        ...(target.border || {}),
+        top: containerEdge('top', row === range.startRow),
+        bottom: containerEdge('bottom', row === range.endRow),
+        left: containerEdge('left', column === range.startCol),
+        right: containerEdge('right', column === range.endCol),
+      };
+    }
+  }
 }
 
 function applyRegionStyle(worksheet, range, style, context, { includeBorders = true } = {}) {
@@ -828,22 +905,28 @@ function allocateHeightRows(worksheet, boundaries, startRow) {
   return boundaries.length - 1;
 }
 
-function collectYBoundaries(items, target, parentTop = 0) {
+function collectYBoundaries(items, target, spans, parentTop = 0) {
   for (const item of items || []) {
     const top = point(parentTop + (item.top || 0));
     const bottom = point(top + (item.height || 0));
     target.add(top);
     target.add(bottom);
-    collectYBoundaries(item.items, target, top);
+    spans.add(`${top}|${bottom}`);
+    collectYBoundaries(item.items, target, spans, top);
   }
 }
 
 function freeformRows(worksheet, items, height, startRow) {
   const boundaries = new Set([0, point(height)]);
-  collectYBoundaries(items, boundaries);
-  const values = splitTallRowIntervals(
+  const spans = new Set();
+  collectYBoundaries(items, boundaries, spans);
+  const collapsed = collapsedBoundaries(
     [...boundaries].filter((value) => value >= 0 && value <= point(height)).sort((a, b) => a - b),
+    [...spans].map((key) => key.split('|').map(Number)),
   );
+  // splitTallRowIntervals only inserts extra intermediate boundaries, so the collapse aliases stay valid.
+  const values = splitTallRowIntervals(collapsed);
+  values.aliases = collapsed.aliases;
   allocateHeightRows(worksheet, values, startRow);
   return values;
 }
@@ -1828,23 +1911,60 @@ async function renderCoordinateScheduledSection({
     }
   }
 
+  // A container expanded into this list left behind a childless shell carrying its fill and border. The
+  // shell was declared around content that has since been measured and may have grown, so stretch it back
+  // over everything that used to be inside it. Containment is decided on the declared boxes the RDL gave
+  // them, so this can never capture an item the container did not hold.
+  for (const shell of plans.filter((plan) => plan.item.containerPaintShell)) {
+    const declaredLeft = point(shell.item.left || 0);
+    const declaredRight = point(declaredLeft + (shell.item.width || 0));
+    for (const member of plans) {
+      if (member === shell) continue;
+      const memberLeft = point(member.item.left || 0);
+      if (memberLeft < declaredLeft - COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      if (point(memberLeft + (member.item.width || 0)) > declaredRight + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      if (member.designTop < shell.designTop - COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      if (member.designTop > point(shell.designTop + shell.designHeight) + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+      shell.occupiedHeight = Math.max(
+        shell.occupiedHeight,
+        point(member.resolvedTop + member.occupiedHeight - shell.resolvedTop),
+      );
+    }
+  }
+
   const boundaries = new Set([0]);
+  const spans = new Set();
   for (const plan of plans) {
     boundaries.add(plan.resolvedTop);
     boundaries.add(point(plan.resolvedTop + plan.occupiedHeight));
+    spans.add(`${plan.resolvedTop}|${point(plan.resolvedTop + plan.occupiedHeight)}`);
     if (plan.item.type === 'Tablix') {
-      for (const boundary of plan.localBoundaries) boundaries.add(point(plan.resolvedTop + boundary));
+      let previous = plan.resolvedTop;
+      for (const boundary of plan.localBoundaries) {
+        const value = point(plan.resolvedTop + boundary);
+        boundaries.add(value);
+        if (value > previous) spans.add(`${previous}|${value}`);
+        previous = value;
+      }
     } else {
-      collectYBoundaries([{ ...plan.item, top: plan.resolvedTop }], boundaries);
+      collectYBoundaries([{ ...plan.item, top: plan.resolvedTop }], boundaries, spans);
     }
   }
   const maximum = Math.max(...boundaries);
   boundaries.add(maximum);
-  const yGrid = splitTallRowIntervals([...boundaries].filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b));
+  const collapsedY = collapsedBoundaries(
+    [...boundaries].filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b),
+    [...spans].map((key) => key.split('|').map(Number)),
+  );
+  const yGrid = splitTallRowIntervals(collapsedY);
+  yGrid.aliases = collapsedY.aliases;
   allocateHeightRows(worksheet, yGrid, startRow);
 
   const detailRegions = [];
   for (const plan of plans) {
+    // An expanded container's paint shell is applied last: its former children write their own resolved
+    // edges into the same cells, and a container edge must add to those, never replace them.
+    if (plan.item.containerPaintShell) continue;
     if (plan.item.type === 'Tablix') {
       const region = copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges });
       if (region.dynamic) detailRegions.push(region);
@@ -1869,6 +1989,17 @@ async function renderCoordinateScheduledSection({
       merges,
       measureDoc,
     });
+  }
+  for (const shell of plans.filter((plan) => plan.item.containerPaintShell)) {
+    paintContainerExtent(
+      worksheet,
+      {
+        ...gridRange(xGrid, point(shell.item.left || 0), shell.item.width || 0),
+        ...rowRange(yGrid, startRow, shell.resolvedTop, shell.occupiedHeight),
+      },
+      shell.item,
+      context,
+    );
   }
   return { rowsConsumed: Math.max(1, yGrid.length - 1), detailRegions };
 }
@@ -2071,31 +2202,7 @@ async function renderReportExcel(model, request, config, tempDir) {
           startRow: containerStart,
           endRow: Math.max(containerStart, cursor - 1),
         };
-        const fill = hex(styleColor(item.style?.backgroundColor, sectionContext, null));
-        const borders = item.style?.borders || {};
-        for (let row = range.startRow; row <= range.endRow; row += 1) {
-          for (let column = range.startCol; column <= range.endCol; column += 1) {
-            const target = worksheet.getCell(row, column);
-            if (fill && !target.fill?.type && (target.value === null || target.value === undefined)) {
-              target.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
-            }
-            // A container's declared border ADDS an edge on its own perimeter; it never removes one. The
-            // children already wrote their resolved edges into these cells, and a container edge resolving
-            // to None must leave them alone. Assigning the resolved side unconditionally erased them: a
-            // Rectangle with Border/Style=None wrapping a tablix wiped the tablix's own outer rule wherever
-            // the two perimeters coincide — visibly, the closing bottom rule of the table's last row.
-            const containerEdge = (side, onEdge) => (
-              (onEdge ? excelBorderSide(borders[side], sectionContext) : undefined) || target.border?.[side]
-            );
-            target.border = {
-              ...(target.border || {}),
-              top: containerEdge('top', row === range.startRow),
-              bottom: containerEdge('bottom', row === range.endRow),
-              left: containerEdge('left', column === range.startCol),
-              right: containerEdge('right', column === range.endCol),
-            };
-          }
-        }
+        paintContainerExtent(worksheet, range, item, sectionContext);
         return;
       }
       if (item.type === 'Tablix') {
