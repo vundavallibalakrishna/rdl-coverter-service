@@ -12,7 +12,7 @@ import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { measureTextboxHeight } from './pdf.js';
-import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
+import { DEFAULT_EXCEL_DATE_FORMAT, DEFAULT_EXCEL_DATETIME_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
 
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
 const DEFAULT_ROW_POINTS = 15;
@@ -114,7 +114,9 @@ function excelCellValue(cell, context) {
     return { value: raw, numFmt: excelNumberFormat(format) || undefined };
   }
   if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    return { value: raw, numFmt: DEFAULT_EXCEL_DATE_FORMAT };
+    // No format resolves to general date/time (date and time) to match SSRS and the PDF/DOCX text default;
+    // an explicit-but-untranslatable format keeps the date-only fallback.
+    return { value: raw, numFmt: format ? DEFAULT_EXCEL_DATE_FORMAT : DEFAULT_EXCEL_DATETIME_FORMAT };
   }
   return { value: cellString(display) };
 }

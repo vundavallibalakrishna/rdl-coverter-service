@@ -42,5 +42,10 @@ export function excelNumberFormat(format) {
   return null;
 }
 
-// A general-purpose Excel date format used when a real Date value carries a format we don't translate.
+// A general-purpose Excel date format used when a real Date value carries an explicit format we don't
+// translate. Explicit-format Excel date translation is a separate known deviation.
 export const DEFAULT_EXCEL_DATE_FORMAT = 'yyyy-mm-dd';
+
+// The Excel display for a DateTime with NO format: general date/time (date and time), matching .NET/SSRS
+// default DateTime rendering so Excel stays consistent with the PDF/DOCX text renderers.
+export const DEFAULT_EXCEL_DATETIME_FORMAT = 'yyyy-mm-dd hh:mm:ss';

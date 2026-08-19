@@ -11,6 +11,11 @@ Guidance for coding agents working on the standalone RDL Converter Service.
 
 ## Required Renderer Skills
 
+- **The engine must match Microsoft SSRS.** Before RCA'ing or fixing ANY rendering difference (borders,
+  sizing/growth, value formatting, charts/axes, page headers/footers, positioning, pagination) in any
+  renderer, read and follow `skills/rdl-ssrs-fidelity/SKILL.md`. It defines what the correct output is —
+  always "what SSRS produces," never "what makes this sample look right" — and is the governing skill the
+  others serve. Never ship a fix specific to one PDF/report.
 - Before changing PDF measurement, pagination, drawing, borders, fonts, or the internal canonical layout
   trace, read and follow `skills/rdl-pdf-layout-certification/SKILL.md`.
 - Before changing or certifying `DOCX_EDITABLE`, Word page geometry, native tables, font embedding, or OOXML

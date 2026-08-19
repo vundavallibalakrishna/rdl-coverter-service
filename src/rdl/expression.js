@@ -83,7 +83,11 @@ export function formatValue(value, format) {
   if (value instanceof Date || /^\d{4}-\d{2}-\d{2}/.test(String(value))) {
     const date = new Date(value);
     if (!Number.isNaN(date.getTime())) {
-      const pattern = String(format || 'dd/MM/yyyy');
+      // No Format on a DateTime resolves to .NET's general date/time long pattern (date AND time, with
+      // seconds) — the value's default ToString under the report culture, exactly what SSRS renders. A bare
+      // date would drop the time SSRS shows (e.g. a footer =Globals!ExecutionTime). Explicit formats below
+      // and via formatNet still win. Culture ordering is currently fixed to en-GB (see known-deviations).
+      const pattern = String(format || 'dd/MM/yyyy HH:mm:ss');
       if (pattern === 'y' || pattern === 'Y') return new Intl.DateTimeFormat('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date);
       if (pattern === 'd') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'short', timeZone: 'UTC' }).format(date);
       if (pattern === 'D') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeZone: 'UTC' }).format(date);
