@@ -86,14 +86,18 @@ export function recordLayoutItem(doc, item) {
         ? 'footer'
         : 'body'
   );
-  page.items.push({
+  const record = {
     ...item,
     region,
     x: roundPoint(item.x),
     y: roundPoint(item.y),
     width: roundPoint(item.width),
     height: roundPoint(item.height),
-  });
+  };
+  page.items.push(record);
+  // Returned so callers that only know a flow container's final height after laying out its children
+  // (e.g. a Rectangle whose Tablix grows) can correct the recorded geometry in place.
+  return record;
 }
 
 function uniquePoints(values) {

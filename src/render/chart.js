@@ -18,6 +18,15 @@ function niceScale(maxValue) {
   return { max: Math.ceil(maxValue / interval) * interval, interval };
 }
 
+// A tick value is an accumulated multiple of the interval, so binary floating point leaves noise
+// (3 * 0.2 === 0.6000000000000001). Rendered verbatim in the narrow axis-label gutter that long string
+// wraps to several lines. Rounding to the interval's own decimal precision yields the clean label SSRS
+// shows ("0.6"), and String(Number(...)) drops any trailing zero ("1.0" -> "1").
+function formatTick(value, interval) {
+  const decimals = Math.min(10, Math.max(0, -Math.floor(Math.log10(interval || 1))));
+  return String(Number(value.toFixed(decimals)));
+}
+
 function setFont(doc, config, { size = 8, bold = false, italic = false, family = 'Arial' } = {}) {
   doc.font(pdfFont(config, family, bold, italic)).fontSize(size);
 }
@@ -179,6 +188,22 @@ function titleHeight(chart, context) {
     + styleSize(style.paddingTop, context, 2) + styleSize(style.paddingBottom, context, 2));
 }
 
+function titleWidth(doc, config, chart, context, maximum) {
+  const caption = String(evaluateExpression(chart.title.caption, context) ?? '').trim();
+  const style = chart.title.style || {};
+  styleFont(doc, config, style, context, 9);
+  const paddingLeft = styleSize(style.paddingLeft, context, 2);
+  const paddingRight = styleSize(style.paddingRight, context, 2);
+  const widestLine = Math.max(0, ...caption.split(/\r?\n/).map((line) => doc.widthOfString(line)));
+  return Math.min(maximum, Math.max(1, widestLine + paddingLeft + paddingRight));
+}
+
+function anchoredStart(start, end, size, alignment) {
+  if (/^(?:left|top)$/i.test(alignment)) return start;
+  if (/^(?:right|bottom)$/i.test(alignment)) return end - size;
+  return start + (end - start - size) / 2;
+}
+
 function drawTitle(doc, config, chart, x, y, width, height, context) {
   const caption = String(evaluateExpression(chart.title.caption, context) ?? '').trim();
   const style = chart.title.style || {};
@@ -203,11 +228,11 @@ function drawValueGrid(doc, config, scale, plot, orientation, axis, context) {
     if (orientation === 'horizontal') {
       const gx = plot.x + (value / scale.max) * plot.width;
       doc.save().lineWidth(0.5).strokeColor(AXIS_COLOR).moveTo(gx, plot.y).lineTo(gx, plot.y + plot.height).stroke().restore();
-      fillText(doc, value, gx - 10, plot.y + plot.height + 4, { width: 20, align: 'center', color: axisAppearance.color });
+      fillText(doc, formatTick(value, scale.interval), gx - 10, plot.y + plot.height + 4, { width: 20, align: 'center', color: axisAppearance.color });
     } else {
       const gy = plot.y + plot.height - (value / scale.max) * plot.height;
       doc.save().lineWidth(0.5).strokeColor(AXIS_COLOR).moveTo(plot.x, gy).lineTo(plot.x + plot.width, gy).stroke().restore();
-      fillText(doc, value, plot.x - 34, gy - 4, { width: 30, align: 'right', color: axisAppearance.color });
+      fillText(doc, formatTick(value, scale.interval), plot.x - 34, gy - 4, { width: 30, align: 'right', color: axisAppearance.color });
     }
   }
 }
@@ -464,12 +489,29 @@ export function drawChart(doc, config, chart, data, x, y, width, height, context
   const titleVisible = chart.title && !isHidden(chart.title.hidden, context);
   if (titleVisible) {
     const measuredHeight = titleHeight(chart, context);
-    const titlePosition = String(styleValue(chart.title.position, context, 'TopCenter')).toLowerCase();
+    const titlePosition = String(styleValue(chart.title.position, context, 'TopCenter'))
+      .replace(/\s+/g, '')
+      .toLowerCase();
+    const measuredWidth = titleWidth(doc, config, chart, context, content.right - content.left);
     if (titlePosition.startsWith('bottom')) {
-      drawTitle(doc, config, chart, content.left, content.bottom - measuredHeight, content.right - content.left, measuredHeight, context);
+      const alignment = titlePosition.slice('bottom'.length) || 'center';
+      const titleX = anchoredStart(content.left, content.right, measuredWidth, alignment);
+      drawTitle(doc, config, chart, titleX, content.bottom - measuredHeight, measuredWidth, measuredHeight, context);
       content.bottom -= measuredHeight + 6;
+    } else if (titlePosition.startsWith('left') || titlePosition.startsWith('right')) {
+      const side = titlePosition.startsWith('left') ? 'left' : 'right';
+      const alignment = titlePosition.slice(side.length) || 'center';
+      const titleY = anchoredStart(content.top, content.bottom, measuredHeight, alignment);
+      const titleX = side === 'left' ? content.left : content.right - measuredWidth;
+      drawTitle(doc, config, chart, titleX, titleY, measuredWidth, measuredHeight, context);
+      if (side === 'left') content.left += measuredWidth + 6;
+      else content.right -= measuredWidth + 6;
     } else {
-      drawTitle(doc, config, chart, content.left, content.top, content.right - content.left, measuredHeight, context);
+      const alignment = titlePosition.startsWith('top')
+        ? titlePosition.slice('top'.length) || 'center'
+        : 'center';
+      const titleX = anchoredStart(content.left, content.right, measuredWidth, alignment);
+      drawTitle(doc, config, chart, titleX, content.top, measuredWidth, measuredHeight, context);
       content.top += measuredHeight + 6;
     }
   }
@@ -527,7 +569,21 @@ export function drawChart(doc, config, chart, data, x, y, width, height, context
   // Plot area, leaving gutters for axis/category labels.
   const circular = chart.chartType === 'pie' || chart.chartType === 'doughnut';
   const leftGutter = chart.chartType === 'bar' ? Math.min(165, (content.right - content.left) * 0.4) : circular ? 0 : 40;
-  const bottomGutter = circular ? 0 : 16;
+  // Reserve the true rendered height of the bottom category labels so a long label that wraps to a second
+  // line inside its narrow column slot is not clipped by the chart's outer clip rectangle. Bar charts put
+  // their category labels on the left gutter, so their bottom band only carries short numeric value ticks.
+  // The plot width does not depend on the bottom gutter, so it can be estimated here to size the slot the
+  // same way the series renderers do, then measured with the auto-fitted axis font.
+  let bottomGutter = circular ? 0 : 16;
+  const bottomCategoryLabels = new Set(['column', 'line', 'area', 'scatter']);
+  if (!circular && bottomCategoryLabels.has(chart.chartType) && data.categories?.length) {
+    const estimatedPlotWidth = Math.max(1, content.right - content.left - leftGutter - 24);
+    const slot = estimatedPlotWidth / data.categories.length;
+    const labels = data.categories.map((entry) => String(entry.label ?? ''));
+    axisFont(doc, config, chart.categoryAxis, context, labels, slot, 7);
+    const labelHeight = Math.max(0, ...labels.map((label) => doc.heightOfString(label, { width: Math.max(1, slot) })));
+    bottomGutter = Math.max(16, Math.ceil(labelHeight) + 6);
+  }
   const plot = {
     x: content.left + leftGutter,
     y: content.top + 6,

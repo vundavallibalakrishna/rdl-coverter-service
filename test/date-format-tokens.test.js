@@ -51,8 +51,9 @@ test('the tokens that already worked are byte-for-byte unchanged, in UTC', () =>
   assert.equal(formatValue(SAMPLE, 'dd/MM/yyyy'), '13/08/2026');
   assert.equal(formatValue(SAMPLE, 'MM/dd/yyyy'), '08/13/2026');
   assert.equal(formatValue(SAMPLE, 'dd/MM/yyyy HH:mm:ss'), '13/08/2026 08:04:53');
-  // No format at all keeps the established default rather than falling through to a raw Date string.
-  assert.equal(formatValue(SAMPLE, undefined), '13/08/2026');
+  // No format at all resolves to .NET/SSRS general date/time (date AND time, with seconds), the value's
+  // default ToString — not a bare date and not a raw JS Date string.
+  assert.equal(formatValue(SAMPLE, undefined), '13/08/2026 08:04:53');
   // A pattern must resolve in UTC, never in the host time zone: 22:30Z is still the 13th, not the 14th.
   const lateUtc = new Date(Date.UTC(2026, 7, 13, 22, 30, 0));
   assert.equal(formatValue(lateUtc, 'dd MMMM yyyy'), '13 August 2026');
@@ -147,4 +148,57 @@ test('XLSX writes the resolved month name for a date format Excel cannot represe
   })));
   assert.ok(values.some((value) => value.includes('August 2026')), `expected "August 2026" in ${JSON.stringify(values)}`);
   assert.equal(values.some((value) => value.includes('AugM')), false);
+});
+
+// Same synthetic textbox, but with NO Format — SSRS renders a DateTime's general date/time default
+// (date AND time), not a bare date and not a raw Date string. Every renderer must agree.
+function reportNoFormat() {
+  return Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <ReportSections><ReportSection>
+    <Body>
+      <ReportItems>
+        <Textbox Name="Stamp">
+          <CanGrow>true</CanGrow>
+          <Paragraphs><Paragraph><TextRuns><TextRun>
+            <Value>=Parameters!Stamp.Value</Value>
+            <Style><FontFamily>Arial</FontFamily></Style>
+          </TextRun></TextRuns></Paragraph></Paragraphs>
+          <Top>0in</Top><Left>0in</Left><Height>0.3in</Height><Width>5in</Width>
+          <Style><FontFamily>Arial</FontFamily></Style>
+        </Textbox>
+      </ReportItems>
+      <Height>1in</Height><Style/>
+    </Body>
+    <Width>7in</Width>
+    <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.5in</LeftMargin><RightMargin>0.5in</RightMargin><TopMargin>0.5in</TopMargin><BottomMargin>0.5in</BottomMargin></Page>
+  </ReportSection></ReportSections>
+  <ReportParameters>
+    <ReportParameter Name="Stamp"><DataType>DateTime</DataType><Prompt>Stamp</Prompt></ReportParameter>
+  </ReportParameters>
+</Report>`, 'utf8');
+}
+
+test('a no-format DateTime renders general date/time (date and time) in PDF', async (context) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-date-noformat-pdf-'));
+  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const pdfPath = path.join(tempDir, 'date-noformat.pdf');
+  const rendered = await renderPdf(parseRdl(reportNoFormat()), request, config);
+  await fs.writeFile(pdfPath, rendered.buffer);
+  const { stdout } = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
+  assert.match(stdout, /13\/08\/2026 08:04:53/);
+});
+
+test('a no-format DateTime displays general date/time in XLSX, consistent with PDF/DOCX', async (context) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-date-noformat-xlsx-'));
+  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const rendered = await renderExcel(parseRdl(reportNoFormat()), { ...request, excelLayoutMode: 'REPORT' }, config, tempDir);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(rendered.buffer);
+  const values = [];
+  workbook.worksheets.forEach((sheet) => sheet.eachRow((row) => row.eachCell((cell) => {
+    const value = String(cell.value ?? '').trim();
+    if (value) values.push(value);
+  })));
+  assert.ok(values.some((value) => value.includes('13/08/2026 08:04:53')), `expected date and time in ${JSON.stringify(values)}`);
 });

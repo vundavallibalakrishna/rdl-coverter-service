@@ -6,16 +6,23 @@
 // header is repeated by physically redrawing it per page (page-fragment mode). These tests assert the model
 // flagging, the shared border helper, and the emitted OpenXML on synthetic RDLs isolating each construct.
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import test from 'node:test';
+import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
+import { PNG } from 'pngjs';
 import { parseRdl } from '../src/rdl/parser.js';
 import { tablixRows, enforcedBottomBorder, shouldEnforceTablixBottom } from '../src/render/common.js';
 import { renderEditableDocx } from '../src/render/docx.js';
+import { renderExcel } from '../src/render/excel.js';
 import { renderPdf } from '../src/render/pdf.js';
+import { renderVisualDocx } from '../src/render/visualDocx.js';
 import { loadConfig } from '../src/config.js';
 
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
 const documentXml = async (buffer) => (await JSZip.loadAsync(buffer)).file('word/document.xml').async('string');
+const tmpRoot = path.resolve(new URL('../tmp/', import.meta.url).pathname);
 
 // A tablix with one static column-header row and a dynamic detail row grouped by V (no merged cells).
 const flatTablixRdl = `<?xml version="1.0"?>
@@ -74,7 +81,7 @@ test('editable DOCX returns the canonical PDF page count instead of an estimated
   assert.equal(docx.layoutMode, 'windows-paged-editable');
 });
 
-test('the page-locked DOCX inherits first-page tablix placement from the canonical PDF trace', async () => {
+test('the first visible body Top is preserved across PDF, native Word, visual Word, and XLSX', async (context) => {
   const atPageTop = parseRdl(flatTablixRdl);
   const belowPriorContent = parseRdl(flatTablixRdl.replace('<Top>0in</Top>', '<Top>2in</Top>'));
   const explicitPageStart = parseRdl(flatTablixRdl.replace(
@@ -85,24 +92,83 @@ test('the page-locked DOCX inherits first-page tablix placement from the canonic
     const tablix = model.body.items.find((item) => item.type === 'Tablix');
     tablix.style.borders.left = { style: 'Solid', color: '#000000', width: 1 };
   }
-  const renderRequest = request(40);
-  const firstPageRows = async (model) => {
+  const renderRequest = request(1);
+  const canonicalTop = async (model) => {
     const canonical = await renderPdf(model, renderRequest, config, { captureLayoutTrace: true });
-    const firstPageCount = canonical.layoutTrace.pages[0].items.filter((item) => (
-      item.kind === 'tablixCell' && /^Row \d+$/.test(item.text)
-    )).length;
+    const page = canonical.layoutTrace.pages.find((candidate) => candidate.items.some((item) => (
+      item.kind === 'tablixCell' && item.text === 'COLHDR'
+    )));
+    const cell = page?.items.find((item) => item.kind === 'tablixCell' && item.text === 'COLHDR');
+    assert.ok(page && cell);
     const docx = await renderEditableDocx(model, renderRequest, config);
     assert.equal(docx.pageCount, canonical.pageCount);
-    return firstPageCount;
+    return { canonical, offset: cell.y - page.bodyTop, xml: await documentXml(docx.buffer) };
   };
 
-  const topCount = await firstPageRows(atPageTop);
-  const offsetCount = await firstPageRows(belowPriorContent);
-  const explicitStartCount = await firstPageRows(explicitPageStart);
-  assert.equal(offsetCount, topCount,
-    'the PDF flow engine ignores an absolute Top offset on the first visible body item');
-  assert.equal(explicitStartCount, topCount,
-    'an absolute Top at an explicit page-break start is the page origin, not consumed page space');
+  const top = await canonicalTop(atPageTop);
+  const offset = await canonicalTop(belowPriorContent);
+  const explicitStart = await canonicalTop(explicitPageStart);
+  assert.equal(top.offset, 0);
+  assert.equal(offset.offset, 144, 'the canonical PDF retains the declared two-inch body offset');
+  assert.equal(explicitStart.offset, 0, 'an explicit Start break establishes a page-local origin');
+
+  const firstWordRowHeight = (xml) => Number(xml.match(/<w:tbl>[\s\S]*?<w:trHeight[^>]*w:val="(\d+)"/)?.[1]);
+  assert.notEqual(firstWordRowHeight(top.xml), 2880);
+  assert.equal(firstWordRowHeight(offset.xml), 2880, 'native Word receives an exact two-inch spacer row');
+  assert.notEqual(firstWordRowHeight(explicitStart.xml), 2880);
+
+  const excelPlacement = async (model) => {
+    const rendered = await renderExcel(model, { ...renderRequest, excelLayoutMode: 'REPORT' }, config, null);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(rendered.buffer);
+    const worksheet = workbook.worksheets[0];
+    let target = null;
+    worksheet.eachRow((row) => row.eachCell((cell) => {
+      if (cell.value === 'COLHDR') target = cell;
+    }));
+    assert.ok(target);
+    return { row: target.row, leadingHeight: worksheet.getRow(1).height };
+  };
+  const topExcel = await excelPlacement(atPageTop);
+  const offsetExcel = await excelPlacement(belowPriorContent);
+  const explicitStartExcel = await excelPlacement(explicitPageStart);
+  assert.equal(topExcel.row, 1);
+  assert.deepEqual(offsetExcel, { row: 2, leadingHeight: 144 });
+  assert.equal(explicitStartExcel.row, 1);
+
+  const visualInkTop = async (model, label) => {
+    const tempDir = await fs.mkdtemp(path.join(tmpRoot, `initial-body-top-${label}-`));
+    context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+    const visual = await renderVisualDocx(model, renderRequest, config, tempDir);
+    const zip = await JSZip.loadAsync(visual.buffer);
+    const mediaName = Object.keys(zip.files).find((name) => /^word\/media\/.+\.png$/.test(name));
+    assert.ok(mediaName);
+    const png = PNG.sync.read(await zip.file(mediaName).async('nodebuffer'));
+    for (let y = 0; y < png.height; y += 1) {
+      for (let x = 0; x < png.width; x += 1) {
+        const pixel = (y * png.width + x) * 4;
+        if (png.data[pixel] < 220 || png.data[pixel + 1] < 220 || png.data[pixel + 2] < 220) return y;
+      }
+    }
+    return null;
+  };
+  const topInk = await visualInkTop(atPageTop, 'origin');
+  const offsetInk = await visualInkTop(belowPriorContent, 'offset');
+  const explicitStartInk = await visualInkTop(explicitPageStart, 'page-start');
+  assert.ok(Math.abs((offsetInk - topInk) - 600) <= 3,
+    'the 300-DPI visual Word page inherits the two-inch PDF gap within raster antialiasing tolerance');
+  assert.equal(explicitStartInk, topInk);
+
+  const overflow = parseRdl(flatTablixRdl.replace('<Top>0in</Top>', '<Top>2in</Top>'));
+  overflow.page.height = 100;
+  const overflowPdf = await renderPdf(overflow, renderRequest, config, { captureLayoutTrace: true });
+  const continuationPage = overflowPdf.layoutTrace.pages.find((page) => page.items.some((item) => (
+    item.kind === 'tablixCell' && item.text === 'COLHDR'
+  )));
+  const continuationHeader = continuationPage?.items.find((item) => item.kind === 'tablixCell' && item.text === 'COLHDR');
+  assert.ok(continuationPage && continuationHeader);
+  assert.equal(continuationHeader.y, continuationPage.bodyTop,
+    'an initial offset that overflows resumes at the next printable body origin');
 });
 
 test('the last row of a bordered data tablix closes when its bottom edge is None', async () => {

@@ -3,6 +3,7 @@ import { XMLParser } from 'fast-xml-parser';
 import { ServiceError } from '../errors.js';
 import { toPoints } from '../units.js';
 import { inspectRdlCapabilities } from './capabilities.js';
+import { canonicalizeCulture } from './culture.js';
 import { FUNCTION_NAMES } from './functions/index.js';
 import { CUSTOM_CODE_FUNCTION_NAMES } from './functions/customCode.js';
 import { asArray, childEntries, firstDefined, flattenCellItems, parseBoolean, RENDERABLE_CELL_ITEMS, textValue } from './helpers.js';
@@ -734,9 +735,14 @@ export function parseRdl(input, limits = {}) {
     ...(Number.parseInt(textValue(page.NumberOfColumns, '1'), 10) > 1 ? ['PageColumns'] : []),
   ])];
 
+  const reportLanguage = textValue(report.Language, '').trim();
   const model = {
     namespace,
     name: textValue(report.Description, 'RDL Report'),
+    // Report `Language` (culture). A literal is canonicalized now; an `=expression` is resolved at render
+    // time from `language`. Null culture means no declared Language — the formatter keeps its legacy defaults.
+    language: reportLanguage || null,
+    culture: canonicalizeCulture(reportLanguage),
     identity: {
       name: textValue(report.Description, 'RDL Report'),
       definitionSha256: createHash('sha256').update(xml).digest('hex'),

@@ -5,16 +5,15 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
-import { evaluateExpression } from '../rdl/expression.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { evaluateExpression, resolveReportCulture } from '../rdl/expression.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { measureTextboxHeight } from './pdf.js';
 import { buildGridBoundaries } from './gridBoundaries.js';
-import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
-
+import { DEFAULT_EXCEL_DATETIME_FORMAT, excelDateFormat, excelNumberFormat, cellString } from './excelFormat.js';
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
 const DEFAULT_ROW_POINTS = 15;
 const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
@@ -114,8 +113,17 @@ function excelCellValue(cell, context) {
   if (typeof raw === 'number' && Number.isFinite(raw)) {
     return { value: raw, numFmt: excelNumberFormat(format) || undefined };
   }
-  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    return { value: raw, numFmt: DEFAULT_EXCEL_DATE_FORMAT };
+  // A DateTime value (a Date, or an ISO-8601 string from parameter/field coercion) becomes a live typed
+  // Excel date so the workbook carries a real date, matching the PDF/DOCX text treatment of the same value.
+  const asDate = raw instanceof Date ? raw : (isDateLikeValue(raw) ? new Date(raw) : null);
+  if (asDate && !Number.isNaN(asDate.getTime())) {
+    // No format resolves to general date/time (date and time) to match SSRS and the PDF/DOCX text default.
+    if (!format) return { value: asDate, numFmt: DEFAULT_EXCEL_DATETIME_FORMAT };
+    // An explicit format is translated to a live Excel number format so the cell stays a typed date and
+    // still displays what the author asked for; an untranslatable format writes the exact formatted string.
+    const excelFmt = excelDateFormat(format);
+    if (excelFmt) return { value: asDate, numFmt: excelFmt };
+    return { value: cellString(display) };
   }
   return { value: cellString(display) };
 }
@@ -290,7 +298,7 @@ async function renderDataExcel(model, request, config, tempDir) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'RDL Converter Service';
   workbook.title = request.outputFileName || model.name || 'Report';
-  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
+  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {}, culture: resolveReportCulture(model, { parameters: request.parameters || {} }) };
   const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets: normalizeDatasets(model, request) };
   const chartCounter = { value: 0 };
 
@@ -1840,14 +1848,15 @@ async function renderCoordinateScheduledSection({
   merges,
   tablixCache,
   measureDoc,
+  preserveLeadingBodyGap,
 }) {
   // Report body coordinates remain absolute even after an explicit page break starts a new logical Excel
   // section. Each worksheet has its own local origin, matching the legacy section renderer and SSRS's
   // page-local placement semantics; carrying the global body Top into the new sheet creates a giant blank
   // row containing the height of every earlier section.
-  const sectionOriginTop = section.length
-    ? Math.min(...section.map((item) => point(item.top || 0)))
-    : 0;
+  const sectionOriginTop = preserveLeadingBodyGap || !section.length
+    ? 0
+    : Math.min(...section.map((item) => point(item.top || 0)));
   const plans = [];
   for (const item of section) {
     const designTop = point((item.top || 0) - sectionOriginTop);
@@ -2096,7 +2105,7 @@ async function renderReportExcel(model, request, config, tempDir) {
   workbook.creator = 'RDL Converter Service';
   workbook.title = request.outputFileName || model.name || 'Report';
   workbook.calcProperties.fullCalcOnLoad = true;
-  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
+  const globals = { PageNumber: 1, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {}, culture: resolveReportCulture(model, { parameters: request.parameters || {} }) };
   const datasets = normalizeDatasets(model, request);
   const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets };
   const sections = partitionReportSections(model, context);
@@ -2116,6 +2125,13 @@ async function renderReportExcel(model, request, config, tempDir) {
     // Page 1 of 1 hides constructs intended for interior sections while still reserving their band height.
     const sectionGlobals = { ...globals, PageNumber: index + 1, TotalPages: sections.length };
     const sectionContext = { ...context, globals: sectionGlobals };
+    const firstSectionItem = section[0];
+    // REPORT worksheets mirror body coordinate semantics without pretending that each worksheet is a PDF
+    // page. Only the first report section preserves the body's leading Top. Sections created by an explicit
+    // Start break keep their established local origin, matching PDF page-start and continuation behavior.
+    const preserveLeadingBodyGap = index === 0
+      && firstSectionItem
+      && !/^(Start|StartAndEnd)$/i.test(visiblePageBreak(firstSectionItem, sectionContext));
     const title = declaredSectionName(section, sectionContext)
       || firstVisibleText(section, model, request, sectionGlobals);
     const name = uniqueSheetName(workbook, title, `Section ${index + 1}`);
@@ -2155,6 +2171,7 @@ async function renderReportExcel(model, request, config, tempDir) {
         merges,
         tablixCache,
         measureDoc,
+        preserveLeadingBodyGap,
       });
       cursor += scheduled.rowsConsumed;
       detailRegions.push(...scheduled.detailRegions);
@@ -2278,7 +2295,9 @@ async function renderReportExcel(model, request, config, tempDir) {
       }
       if (peerBand.length > 1) {
         const bandTop = item.top || 0;
-        const gap = previousDesignBottom === null ? 0 : Math.max(0, bandTop - previousDesignBottom);
+        const gap = previousDesignBottom === null
+          ? (preserveLeadingBodyGap ? Math.max(0, bandTop) : 0)
+          : Math.max(0, bandTop - previousDesignBottom);
         cursor += addGapRows(worksheet, cursor, gap);
         const consumed = await renderFreeformBand({
           workbook,
@@ -2300,7 +2319,9 @@ async function renderReportExcel(model, request, config, tempDir) {
         itemIndex += peerBand.length - 1;
         continue;
       }
-      const gap = previousDesignBottom === null ? 0 : Math.max(0, (item.top || 0) - previousDesignBottom);
+      const gap = previousDesignBottom === null
+        ? (preserveLeadingBodyGap ? Math.max(0, item.top || 0) : 0)
+        : Math.max(0, (item.top || 0) - previousDesignBottom);
       cursor += addGapRows(worksheet, cursor, gap);
       await renderSectionItem({ ...item, top: 0 });
       previousDesignBottom = Math.max(previousDesignBottom ?? 0, (item.top || 0) + (item.height || 0));

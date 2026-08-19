@@ -7,6 +7,7 @@ import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { drawChart } from './chart.js';
+import { resolveReportCulture } from '../rdl/expression.js';
 import {
   attachLayoutTrace,
   beginLayoutTracePage,
@@ -1129,6 +1130,22 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     });
   };
 
+  // A canvas cell is an SSRS List / free-form layout — a Rectangle flattened into several positioned items
+  // (multiple textboxes, or any line/chart/image) drawn item-by-item. Its height is the extent of those
+  // items, not the tablix's large design row height (which would falsely exceed a page).
+  // Gated to cells that carry a Line, Chart, or Image — content that previously could not render in a cell
+  // at all (it was refused at analyze time). A cell with only textboxes keeps its existing single-textbox
+  // path, so ordinary multi-textbox cells are unchanged and no existing report regresses.
+  const isCanvasCell = (cell) => (cell.items || []).some((entry) => (
+    entry.type === 'Line' || entry.type === 'Chart' || entry.type === 'Image'
+  ));
+  const canvasCellExtent = (cell, width) => Math.max(
+    0,
+    ...(cell.items || []).filter((entry) => entry.type !== 'Tablix' && entry.type !== 'Subreport')
+      .map((entry) => (entry.top || 0) + (entry.height || 0)),
+    ...(cell.nestedTablixes || []).map((nested) => (nested.item.top || 0) + nestedLayout(nested, width).height),
+  );
+
   const rowMeasurementCache = new WeakMap();
   const measureRow = (row, texts = row.cells.map((cell) => cellText(cell))) => {
     statistics.rowMeasurementRequests += 1;
@@ -1156,14 +1173,23 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }
     }
     statistics.rowMeasurementsComputed += 1;
-    const measured = layoutsForRow(row, texts).reduce((height, layout) => Math.max(
-      height,
-      measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
-        + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
-      Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
-        (nested.item.top || 0) + nestedLayout(nested, layout.width).height
-      ))),
-    ), row.height);
+    const layouts = layoutsForRow(row, texts);
+    const canvasCells = row.cells.filter(isCanvasCell);
+    let measured;
+    if (canvasCells.length > 0) {
+      // A List/canvas row is sized to its content extent, not the tablix's design row height.
+      const widthOf = new Map(layouts.map((layout) => [layout.cell, layout.width]));
+      measured = Math.max(0, ...canvasCells.map((cell) => canvasCellExtent(cell, widthOf.get(cell) || totalWidth)));
+    } else {
+      measured = layouts.reduce((height, layout) => Math.max(
+        height,
+        measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
+          + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
+        Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
+          (nested.item.top || 0) + nestedLayout(nested, layout.width).height
+        ))),
+      ), row.height);
+    }
     if (cacheable) pageCache.set(textKey, measured);
     return measured;
   };
@@ -1305,7 +1331,47 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       if (renderedHeight <= 0) continue;
       // Recursive (parent/child) groups render expanded with the first cell indented by depth.
       const padLeft = index === 0 && row.indentLevel ? row.indentLevel * 12 : 0;
-      if (textbox && !cell.hidden) {
+      // A canvas cell (an SSRS List / free-form layout: a Rectangle flattened into several positioned items
+      // — multiple textboxes, lines, charts, images) is drawn item-by-item at each item's position, rather
+      // than as one textbox filling the cell. Its nested tablixes are drawn by the loop below, so those are
+      // excluded here. A plain data cell (one textbox) keeps the fast path unchanged.
+      const cellItems = cell.items || [];
+      if (isCanvasCell(cell) && !cell.hidden) {
+        const cellStyle = textbox?.style || item.style || {};
+        const cellBackground = styleColor(cellStyle.backgroundColor, cellContext, null);
+        if (cellBackground) doc.save().fillColor(cellBackground).rect(x, y, width, renderedHeight).fill().restore();
+        recordLayoutItem(doc, {
+          kind: 'tablixCell',
+          itemName: null,
+          tablixName: item.name || null,
+          rowIndex,
+          columnIndex,
+          colSpan: span,
+          rowSpan: 1,
+          repeatedHeader: Boolean(row.isHeader),
+          zIndex: item.zIndex || 0,
+          x,
+          y,
+          width,
+          height: renderedHeight,
+          text: '',
+          lines: [],
+          writingMode: 'default',
+          verticalAlign: 'top',
+          padding: { top: 0, right: 0, bottom: 0, left: 0 },
+          backgroundColor: cellBackground,
+          borders: resolvedTraceBorders(cellBorderStyle(cell, item) || {}, cellContext, edges),
+        });
+        // Charts/tablixes inside a List cell are scoped to the group instance, so the region dataset resolves
+        // to the current group's rows rather than the whole dataset.
+        const canvasContext = item.datasetName
+          ? { ...cellContext, datasets: { ...cellContext.datasets, [item.datasetName]: cellContext.dataset } }
+          : cellContext;
+        for (const canvasItem of [...cellItems].sort((left, right) => (left.zIndex || 0) - (right.zIndex || 0) || (left.top || 0) - (right.top || 0) || (left.left || 0) - (right.left || 0))) {
+          if (canvasItem.type === 'Tablix' || canvasItem.type === 'Subreport') continue;
+          drawSimpleItem(doc, config, model, canvasItem, x + (canvasItem.left || 0), y + (canvasItem.top || 0), canvasContext);
+        }
+      } else if (textbox && !cell.hidden) {
         drawTextbox(doc, config, textbox, x, y, cellContext, {
           width,
           height: renderedHeight,
@@ -1390,10 +1456,82 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     fragmentStartY = y;
   };
 
+  // Draw a List / canvas row: a single cell holding a Rectangle-flattened free-form layout that can be
+  // taller than a page. Items (textboxes, lines, charts, images, nested tablixes) are placed by their
+  // canvas-relative top and reflowed across pages — when the next item would not fit the current page, a
+  // page is added and that item begins the new page. Each item is atomic (SSRS keeps a report item
+  // together); a single item taller than a full page is drawn where it starts rather than looping forever.
+  const drawCanvasRow = (row) => {
+    const cell = row.cells[0];
+    const rowIndex = rowIndexes.get(row);
+    const columnIndex = placements[rowIndex][0];
+    const span = cell.colSpan || 1;
+    const { xOffsetPt, widthPt: width } = cellGeometryPt(columnWidths, columnIndex, span);
+    const x = startX + xOffsetPt;
+    const cellContext = contextForCell(rowIndex, cell);
+    const canvasContext = item.datasetName
+      ? { ...cellContext, datasets: { ...cellContext.datasets, [item.datasetName]: cellContext.dataset } }
+      : cellContext;
+    const cellBackground = styleColor((cellTextbox(cell)?.style || item.style || {}).backgroundColor, cellContext, null);
+    const drawables = [];
+    for (const canvasItem of cell.items || []) {
+      if (canvasItem.type === 'Tablix' || canvasItem.type === 'Subreport') continue;
+      drawables.push({
+        top: canvasItem.top || 0,
+        declaredHeight: canvasItem.height || 0,
+        actualHeight: canvasItem.height || 0,
+        draw: (screenY) => drawSimpleItem(doc, config, model, canvasItem, x + (canvasItem.left || 0), screenY, canvasContext),
+      });
+    }
+    for (const nested of cell.nestedTablixes || []) {
+      const top = nested.item.top || 0;
+      drawables.push({
+        top,
+        declaredHeight: nested.item.height || 0,
+        actualHeight: nestedLayout(nested, width).height,
+        // drawNestedTablix positions at parentY + item.top, so pass parentY = screenY - item.top.
+        draw: (screenY) => drawNestedTablix(nested, x, screenY - top, width),
+      });
+    }
+    drawables.sort((left, right) => left.top - right.top || (left.declaredHeight - right.declaredHeight));
+    // SSRS vertical displacement: when a region renders taller than its design height, items below it are
+    // pushed down by the growth so they do not overlap. Tracked as a running offset added to each later
+    // item's design top.
+    let displacement = 0;
+    let windowStart = 0;
+    let pageTop = y;
+    let windowBottom = windowStart + (pageBottom - pageTop);
+    let cursor = y;
+    for (const drawable of drawables) {
+      const displacedTop = drawable.top + displacement;
+      const itemBottom = displacedTop + drawable.actualHeight;
+      const startsBelowWindow = displacedTop >= windowBottom - 0.5;
+      const overflowsWindow = itemBottom > windowBottom + 0.5;
+      const canFitFreshPage = drawable.actualHeight <= (pageBottom - addPage.bodyTop) + 0.5;
+      if ((startsBelowWindow || overflowsWindow) && canFitFreshPage && cursor > addPage.bodyTop + 0.5) {
+        addPage();
+        windowStart = displacedTop;
+        pageTop = addPage.bodyTop;
+        windowBottom = windowStart + (pageBottom - pageTop);
+      }
+      const screenY = pageTop + (displacedTop - windowStart);
+      if (cellBackground) doc.save().fillColor(cellBackground).rect(x, screenY, width, Math.max(0, drawable.actualHeight)).fill().restore();
+      drawable.draw(screenY);
+      cursor = Math.max(cursor, screenY + drawable.actualHeight);
+      displacement += Math.max(0, drawable.actualHeight - drawable.declaredHeight);
+    }
+    y = cursor;
+  };
+
   const drawRow = (row) => {
     // A row-group page break starts the group's first row on a fresh page (unless we're already at the
     // top of a page). Reuses the continuation-page machinery so repeated headers redraw.
     if (row.pageBreakBefore && y > addPage.bodyTop) startContinuationPage();
+    // A List / canvas row (one cell of free-form positioned items) reflows across pages on its own path.
+    if (row.cells.length === 1 && isCanvasCell(row.cells[0])) {
+      drawCanvasRow(row);
+      return;
+    }
     let remainingTexts = row.cells.map((cell) => cellText(cell));
     let measured = measureRow(row, remainingTexts);
     const repeatedHeaderHeight = headerMeasurements().total;
@@ -1516,6 +1654,18 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       return;
     }
 
+    // The row does not fit and the split loop below only advances rows that have splittable text. A row
+    // whose cells carry no continuation-able text (e.g. the trailing row of a row-span group, whose columns
+    // are covered by the merged header) would otherwise fall through the loop undrawn: its height is never
+    // consumed and its open row-span stays open, so the header's residual later closes against the *next*
+    // group's cursor and paints on top of it (two same-named cells at one origin — unrepresentable in Word).
+    // Move the whole row to a fresh page so it draws in order and its span closes against its own row.
+    if (!remainingTexts.some(Boolean) && !atFreshContentStart && measured <= freshPageCapacity) {
+      startContinuationPage();
+      drawRowContent(row, measureRow(row, remainingTexts), remainingTexts);
+      return;
+    }
+
     while (remainingTexts.some(Boolean)) {
       if (pageBottom - y < Math.max(12, row.height)) startContinuationPage();
       const availableHeight = pageBottom - y;
@@ -1580,7 +1730,7 @@ export async function renderPdf(model, request, config, options = {}) {
   const footerHeight = page.footer?.height || 0;
   const bodyTop = page.marginTop + headerHeight;
   const pageBottom = page.height - page.marginBottom - footerHeight;
-  const globals = { PageNumber: 0, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {} };
+  const globals = { PageNumber: 0, TotalPages: 1, ReportName: request.outputFileName || model.name, ExecutionTime: new Date(), variables: model.variables || {}, culture: resolveReportCulture(model, { parameters: request.parameters || {} }) };
   const addPage = () => {
     doc.addPage({ size: [page.width, page.height], margins: { top: 0, right: 0, bottom: 0, left: 0 } });
     globals.PageNumber += 1;
@@ -1728,7 +1878,7 @@ export async function renderPdf(model, request, config, options = {}) {
     }
     if (item.type === 'Rectangle') {
       const backgroundColor = styleColor(item.style.backgroundColor, context, null);
-      recordLayoutItem(doc, {
+      const rectangleTrace = recordLayoutItem(doc, {
         kind: 'rectangle',
         itemName: item.name || null,
         zIndex: item.zIndex || 0,
@@ -1740,7 +1890,13 @@ export async function renderPdf(model, request, config, options = {}) {
         borders: resolvedTraceBorders(item.style, context),
       });
       if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
-      drawBorder(doc, x, y, item.width, item.height, item.style, context);
+      // The border is deferred to the end of this branch, after the child bands are laid out, so its
+      // bottom edge tracks the container's *rendered* height. A flow child such as a Tablix with a CanGrow
+      // cell can grow past the rectangle's declared height; drawing the border here at item.height would
+      // strand it above the grown content and paint a second, higher bottom line beneath the coincident
+      // tablix edge (the "double line" defect). A bordered/filled rectangle is guarded against page
+      // fragmentation below, so the grown extent stays on one page and endY - y is a valid single-page
+      // height.
       const visibleChildren = (item.items || []).filter((child) => !isHidden(child.hidden, context));
       const bands = containerLayoutBands(
         visibleChildren,
@@ -1866,8 +2022,14 @@ export async function renderPdf(model, request, config, options = {}) {
       if (hasRenderedBand) {
         endY += Math.max(0, item.height - previousDesignBottom);
       }
+      const renderedHeight = Math.max(item.height, endY - y);
+      // Correct the recorded geometry and draw the border/box at the rendered height so PDF, and the
+      // trace-driven editable DOCX built from it, keep the container's bottom edge coincident with grown
+      // flow content instead of doubling it at the declared height.
+      if (rectangleTrace) rectangleTrace.height = Math.round(renderedHeight * 1000) / 1000;
+      drawBorder(doc, x, y, item.width, renderedHeight, item.style, context);
       return {
-        height: Math.max(item.height, endY - y),
+        height: renderedHeight,
         endY: hasRenderedBand ? endY : y + item.height,
         pageBreakAfter: pendingBreak,
       };
@@ -1943,7 +2105,18 @@ export async function renderPdf(model, request, config, options = {}) {
       pageHasContent = false;
       forcePageBreak = false;
     }
-    const gap = pageHasContent ? Math.max(0, item.top - previousDesignBottom) : 0;
+    // Body coordinates are relative to the body's printable origin. Preserve the first visible band's
+    // declared Top on the initial report page so a designed spacer between the page header and body is not
+    // collapsed. A page break at Start deliberately establishes a new page-local origin, and continuation
+    // or overflow pages also resume at bodyTop, so neither consumes the report's absolute leading offset.
+    const initialBodyGap = globals.PageNumber === 1
+      && !pageHasContent
+      && !breaksBeforeItem(breakLocation)
+      ? Math.max(0, item.top || 0)
+      : 0;
+    const gap = pageHasContent
+      ? Math.max(0, item.top - previousDesignBottom)
+      : initialBodyGap;
     let y = cursorY + gap;
     const bandBottomOffset = Math.max(...band.map((candidate) => (
       candidate.top - item.top + candidate.height

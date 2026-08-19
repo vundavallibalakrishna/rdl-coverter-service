@@ -2,6 +2,22 @@ import { ServiceError } from '../errors.js';
 import { FUNCTION_REGISTRY } from './functions/index.js';
 import { CUSTOM_CODE_FUNCTION_REGISTRY } from './functions/customCode.js';
 import { formatNet } from './format.js';
+import { canonicalizeCulture, currencyForCulture } from './culture.js';
+
+// The report's effective culture for `globals.culture`: a literal Language canonicalized at parse time, or
+// an `=expression` Language resolved here against the render context. Null when no Language is declared.
+export function resolveReportCulture(model, context = {}) {
+  if (model?.culture) return model.culture;
+  const raw = model?.language;
+  if (typeof raw === 'string' && raw.startsWith('=')) {
+    try {
+      return canonicalizeCulture(String(evaluateExpression(raw, context) ?? ''));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 function splitArguments(value) {
   const args = [];
@@ -68,26 +84,35 @@ function unwrap(value) {
   return current;
 }
 
-export function formatValue(value, format) {
+// `culture` is the resolved report Language (a BCP-47 locale) or null. Null keeps the engine's legacy
+// defaults (en-US numbers/currency, en-GB dates) so a report that declares no Language is unchanged; a
+// declared culture drives separators, currency symbol, month/day names, and standard date ordering.
+export function formatValue(value, format, culture = null) {
   if (value === null || value === undefined) return '';
+  const numericLocale = culture || 'en-US';
+  const dateLocale = culture || 'en-GB';
   const normalized = String(format || '').toLowerCase();
   if (normalized.includes('%')) return `${(Number(value) * 100).toFixed(normalized.includes('.00') ? 2 : 0)}%`;
   if (/^[cC]\d?$/.test(String(format || ''))) {
     const digits = Number(String(format).slice(1) || 2);
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: digits }).format(Number(value));
+    return new Intl.NumberFormat(numericLocale, { style: 'currency', currency: currencyForCulture(culture), minimumFractionDigits: digits }).format(Number(value));
   }
   if (/^[nN]\d?$/.test(String(format || ''))) {
     const digits = Number(String(format).slice(1) || 2);
-    return new Intl.NumberFormat('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(Number(value));
+    return new Intl.NumberFormat(numericLocale, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(Number(value));
   }
   if (value instanceof Date || /^\d{4}-\d{2}-\d{2}/.test(String(value))) {
     const date = new Date(value);
     if (!Number.isNaN(date.getTime())) {
-      const pattern = String(format || 'dd/MM/yyyy');
-      if (pattern === 'y' || pattern === 'Y') return new Intl.DateTimeFormat('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date);
-      if (pattern === 'd') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'short', timeZone: 'UTC' }).format(date);
-      if (pattern === 'D') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'long', timeZone: 'UTC' }).format(date);
-      if (pattern === 'g' || pattern === 'G') return new Intl.DateTimeFormat('en-GB', { dateStyle: 'short', timeStyle: pattern === 'G' ? 'medium' : 'short', timeZone: 'UTC' }).format(date);
+      // No Format on a DateTime resolves to .NET's general date/time long pattern (date AND time, with
+      // seconds) — the value's default ToString under the report culture, exactly what SSRS renders. A bare
+      // date would drop the time SSRS shows (e.g. a footer =Globals!ExecutionTime). Explicit formats below
+      // and via formatNet still win. Culture ordering is currently fixed to en-GB (see known-deviations).
+      const pattern = String(format || 'dd/MM/yyyy HH:mm:ss');
+      if (pattern === 'y' || pattern === 'Y') return new Intl.DateTimeFormat(dateLocale, { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date);
+      if (pattern === 'd') return new Intl.DateTimeFormat(dateLocale, { dateStyle: 'short', timeZone: 'UTC' }).format(date);
+      if (pattern === 'D') return new Intl.DateTimeFormat(dateLocale, { dateStyle: 'long', timeZone: 'UTC' }).format(date);
+      if (pattern === 'g' || pattern === 'G') return new Intl.DateTimeFormat(dateLocale, { dateStyle: 'short', timeStyle: pattern === 'G' ? 'medium' : 'short', timeZone: 'UTC' }).format(date);
       // Custom date/time patterns resolve through the complete .NET format engine. The local token table
       // this replaced covered only {yyyy, MMM, MM, dd, HH, mm, ss} and substituted them with a single
       // first-match-wins alternation, so any longer token was cut short and its remainder emitted as a
@@ -95,13 +120,13 @@ export function formatValue(value, format) {
       // truncation hit dddd/ddd, and the single-character forms M/d/y/h/s plus tt were not tokens at all
       // and survived verbatim. Both engines resolve custom patterns in UTC, so every token that already
       // worked is unchanged.
-      return formatNet(date, pattern);
+      return formatNet(date, pattern, culture || undefined);
     }
   }
   // Fall back to the full .NET format-string engine for everything the branches above don't handle
   // (custom numeric like "#,##0.00", standard "P1"/"F2", section formats, …). Additive: the cases handled
   // above already returned, so existing date/currency/percent output is unchanged.
-  return formatNet(value, format);
+  return formatNet(value, format, culture || undefined);
 }
 
 function evaluateArgument(argument, context) {
@@ -257,7 +282,7 @@ function evaluateFunction(name, args, context) {
     const rows = scopeRows(args[1], context);
     return evaluateArgument(args[0], { ...context, fields: rows[rows.length - 1] || context.fields || {} });
   }
-  if (normalized === 'format') return formatValue(evaluateArgument(args[0], context), evaluateArgument(args[1], context));
+  if (normalized === 'format') return formatValue(evaluateArgument(args[0], context), evaluateArgument(args[1], context), context?.globals?.culture ?? null);
   if (normalized === 'isnothing') {
     const value = evaluateArgument(args[0], context);
     return value === null || value === undefined;

@@ -35,6 +35,7 @@ import { loadConfig } from '../config.js';
 import { ServiceError } from '../errors.js';
 import { pointsToTwips } from '../units.js';
 import { normalizeDatasets } from './common.js';
+import { resolveReportCulture } from '../rdl/expression.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { editableFontEmbeddingPermission, resolveFontFile } from './fonts.js';
@@ -149,7 +150,11 @@ function textPaintBounds(item) {
 }
 
 function isUnpaintedOwner(item) {
-  return !item.backgroundColor && !Object.values(item.borders || {}).some(Boolean);
+  // Images and charts always paint their declared owner even though they have no text, fill, or cell
+  // border metadata. Treating them as empty lets a real drawing overlap bypass the shallow-edge cap.
+  return ['textbox', 'tablixCell'].includes(item.kind)
+    && !item.backgroundColor
+    && !Object.values(item.borders || {}).some(Boolean);
 }
 
 function primaryTextAlignment(item) {
@@ -328,17 +333,58 @@ function coalesceHorizontalEdge(first, second) {
   };
 }
 
-function coalesceShallowEdgeOverlaps(items) {
+function canonicalCoalescibleDrawingAxis(first, second, canonicalBounds) {
+  const firstBounds = canonicalBounds?.get(first);
+  const secondBounds = canonicalBounds?.get(second);
+  if (!firstBounds || !secondBounds) return null;
+
+  const left = firstBounds.x <= secondBounds.x ? firstBounds : secondBounds;
+  const right = left === firstBounds ? secondBounds : firstBounds;
+  const verticalSpan = Math.min(left.y + left.height, right.y + right.height)
+    - Math.max(left.y, right.y);
+  const horizontalEdgeOverlap = (left.x + left.width) - right.x;
+  if (verticalSpan > GEOMETRY_EPSILON
+    && horizontalEdgeOverlap >= -GEOMETRY_EPSILON
+    && horizontalEdgeOverlap <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON) {
+    return 'horizontal';
+  }
+
+  const upper = firstBounds.y <= secondBounds.y ? firstBounds : secondBounds;
+  const lower = upper === firstBounds ? secondBounds : firstBounds;
+  const horizontalSpan = Math.min(upper.x + upper.width, lower.x + lower.width)
+    - Math.max(upper.x, lower.x);
+  const verticalEdgeOverlap = (upper.y + upper.height) - lower.y;
+  if (horizontalSpan > GEOMETRY_EPSILON
+    && verticalEdgeOverlap >= -GEOMETRY_EPSILON
+    && verticalEdgeOverlap <= CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON) {
+    return 'vertical';
+  }
+  return null;
+}
+
+function coalesceShallowEdgeOverlaps(items, canonicalBounds) {
   const adjustments = [];
   for (let leftIndex = 0; leftIndex < items.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < items.length; rightIndex += 1) {
       const left = items[leftIndex];
       const right = items[rightIndex];
       if (!positiveOverlap(left, right)) continue;
-      if (!['textbox', 'tablixCell'].includes(left.kind)
-        || !['textbox', 'tablixCell'].includes(right.kind)) continue;
+      const supportedKinds = ['textbox', 'tablixCell', 'image', 'chart'];
+      if (!supportedKinds.includes(left.kind) || !supportedKinds.includes(right.kind)) continue;
       if (!/^(default|horizontal)?$/i.test(String(left.writingMode || 'default'))
         || !/^(default|horizontal)?$/i.test(String(right.writingMode || 'default'))) continue;
+
+      const includesDrawing = ['image', 'chart'].includes(left.kind)
+        || ['image', 'chart'].includes(right.kind);
+      // A drawing has no text paint bounds with which to prove an arbitrary overlap harmless. Permit it
+      // only when the unsnapped canonical PDF rectangles meet, or overlap by no more than the certified
+      // 0.5pt Word geometry tolerance, on the corresponding edge. This handles both a three-decimal trace
+      // edge straddling a 0.125pt Word-grid midpoint and the sub-point edge strips emitted by RDL designers,
+      // without accepting a deliberately stacked logo, image, or chart.
+      const canonicalAxis = includesDrawing
+        ? canonicalCoalescibleDrawingAxis(left, right, canonicalBounds)
+        : null;
+      if (includesDrawing && !canonicalAxis) continue;
 
       const overlapWidth = Math.min(left.x + left.width, right.x + right.width)
         - Math.max(left.x, right.x);
@@ -351,9 +397,13 @@ function coalesceShallowEdgeOverlaps(items) {
       // coalesced without moving either painted run. Try the likely axis first, then the other
       // axis; each helper independently proves that its trim preserves the canonical paint.
       const preferVertical = overlapHeight <= overlapWidth;
-      const adjustment = preferVertical
-        ? coalesceVerticalEdge(left, right) || coalesceHorizontalEdge(left, right)
-        : coalesceHorizontalEdge(left, right) || coalesceVerticalEdge(left, right);
+      const adjustment = canonicalAxis === 'horizontal'
+        ? coalesceHorizontalEdge(left, right)
+        : canonicalAxis === 'vertical'
+          ? coalesceVerticalEdge(left, right)
+          : preferVertical
+            ? coalesceVerticalEdge(left, right) || coalesceHorizontalEdge(left, right)
+            : coalesceHorizontalEdge(left, right) || coalesceVerticalEdge(left, right);
       if (adjustment) adjustments.push(adjustment);
     }
   }
@@ -681,6 +731,7 @@ async function pictureForItem(
       TotalPages: item.totalPages || 1,
       ExecutionTime: new Date(),
       variables: model.variables || {},
+      culture: resolveReportCulture(model, { parameters: request.parameters || {} }),
     };
     const chartData = materializeChart(chart, datasets, request.parameters || {}, globals);
     const rendered = await renderChartPng(
@@ -860,6 +911,55 @@ function lineCrossesInterior(line, box) {
   return false;
 }
 
+function sideCoordinate(bounds, side) {
+  if (side === 'top') return bounds.y;
+  if (side === 'bottom') return bounds.y + bounds.height;
+  if (side === 'left') return bounds.x;
+  return bounds.x + bounds.width;
+}
+
+function perpendicularOverlap(first, second, side) {
+  if (side === 'top' || side === 'bottom') {
+    return Math.min(first.x + first.width, second.x + second.width) - Math.max(first.x, second.x);
+  }
+  return Math.min(first.y + first.height, second.y + second.height) - Math.max(first.y, second.y);
+}
+
+function alignResolvedFragmentBordersToCellEdges(lines, owners, canonicalBounds) {
+  for (const line of lines) {
+    const side = String(line.fragmentSide || '').toLowerCase();
+    if (line.traceRole !== 'resolvedTablixFragmentBorder'
+      || !['top', 'right', 'bottom', 'left'].includes(side)
+      || !line.tablixName) continue;
+
+    const canonicalLine = canonicalBounds.get(line);
+    if (!canonicalLine) continue;
+    const lineCoordinate = sideCoordinate(canonicalLine, side);
+    const matchingCells = owners.filter((owner) => {
+      if (owner.kind !== 'tablixCell' || owner.tablixName !== line.tablixName) return false;
+      const canonicalCell = canonicalBounds.get(owner);
+      return canonicalCell
+        && Math.abs(sideCoordinate(canonicalCell, side) - lineCoordinate) <= GEOMETRY_EPSILON
+        && perpendicularOverlap(canonicalLine, canonicalCell, side) > GEOMETRY_EPSILON;
+    });
+    if (matchingCells.length === 0) continue;
+
+    // The trace stores origins and dimensions to three decimal places. Two physically identical PDF
+    // edges can therefore serialize on opposite sides of a 0.125pt Word-grid rounding midpoint (for
+    // example, a cell bottom at 732.125pt and its fragment closure at 732.124pt). Only coalesce a
+    // provenance-linked outer tablix border whose canonical edge already coincides with the covered
+    // cells. A genuine crossing, including a mislabeled fragment line, remains on the rejection path.
+    const targetEdges = matchingCells.map((cell) => sideCoordinate(cell, side));
+    const target = targetEdges[0];
+    if (!targetEdges.every((edge) => Math.abs(edge - target) <= GEOMETRY_EPSILON)) continue;
+    const normalizedLineCoordinate = sideCoordinate(line, side);
+    if (Math.abs(normalizedLineCoordinate - target)
+      > CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON) continue;
+    if (side === 'top' || side === 'bottom') line.y = target;
+    else line.x = target;
+  }
+}
+
 function resolvedCellBorders(box, owner, decorators, lines) {
   return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => {
     let resolved = owner?.borders?.[side] || null;
@@ -909,18 +1009,27 @@ function preparePageGrid(page, {
   // Snap physical edges, not origins and dimensions independently. Independent rounding can move the
   // derived right/bottom edge by another quarter point and turn two coincident PDF cells into a false
   // overlap in Word (or leave a false gap). This is the same edge-coalescing semantic the PDF trace uses.
+  const canonicalBounds = new WeakMap();
   const normalized = items.map((item) => {
-    const x = snap(item.x);
-    const y = snap(Number(item.y || 0) - originY);
-    const right = snap(Number(item.x || 0) + Number(item.width || 0));
-    const bottom = snap(Number(item.y || 0) + Number(item.height || 0) - originY);
-    return {
+    const canonical = {
+      x: Number(item.x || 0),
+      y: Number(item.y || 0) - originY,
+      width: Number(item.width || 0),
+      height: Number(item.height || 0),
+    };
+    const x = snap(canonical.x);
+    const y = snap(canonical.y);
+    const right = snap(canonical.x + canonical.width);
+    const bottom = snap(canonical.y + canonical.height);
+    const normalizedItem = {
       ...item,
       x,
       y,
       width: Math.max(0, right - x),
       height: Math.max(0, bottom - y),
     };
+    canonicalBounds.set(normalizedItem, canonical);
+    return normalizedItem;
   }).filter((item) => (
     item.width >= 0
     && item.height >= 0
@@ -988,8 +1097,9 @@ function preparePageGrid(page, {
   // or by the renderer's quarter-point edge precision. Word table cells cannot overlap, so resolve only
   // those shallow, content-free edge strips to their midpoint. Each source edge moves by no more than the
   // certified 0.5pt geometry tolerance. Full containment and genuine content crossings remain fail-closed.
-  const coalescedEdges = coalesceShallowEdgeOverlaps(owners);
+  const coalescedEdges = coalesceShallowEdgeOverlaps(owners, canonicalBounds);
   moveCoalescedBorderLines(lines, coalescedEdges);
+  alignResolvedFragmentBordersToCellEdges(lines, owners, canonicalBounds);
   for (let leftIndex = 0; leftIndex < owners.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < owners.length; rightIndex += 1) {
       const left = owners[leftIndex];

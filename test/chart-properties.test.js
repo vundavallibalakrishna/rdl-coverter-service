@@ -3,14 +3,17 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import JSZip from 'jszip';
 import { PNG } from 'pngjs';
 import { loadConfig } from '../src/config.js';
 import { analyzeRdl, parseRdl } from '../src/rdl/parser.js';
 import { normalizeDatasets } from '../src/render/common.js';
 import { materializeChart } from '../src/render/chartData.js';
 import { renderEditableDocx } from '../src/render/docx.js';
+import { renderExcel } from '../src/render/excel.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { rasterizePdf } from '../src/render/raster.js';
+import { renderVisualDocx } from '../src/render/visualDocx.js';
 
 const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1 }) => `
 <Chart Name="${name}">
@@ -61,6 +64,30 @@ const sideBySideRdl = `<?xml version="1.0" encoding="utf-8"?>
   <Page><PageWidth>8.5in</PageWidth><PageHeight>3in</PageHeight><TopMargin>0.1in</TopMargin>
     <BottomMargin>0.1in</BottomMargin><LeftMargin>0.1in</LeftMargin><RightMargin>0.1in</RightMargin></Page>
 </Report>`;
+
+const chartTitlePositionRdl = (position = null, textAlign = 'Left') => {
+  const chart = chartXml({
+    name: 'TitlePositionChart', type: 'Shape', subtype: 'Pie', property: 'PieLineColor', value: 'Black', top: 0.1,
+  }).replace(
+    '  <DataSetName>D</DataSetName>',
+    `  <ChartTitles><ChartTitle Name="Title"><Caption>TITLE_POSITION_PROBE</Caption>
+      ${position ? `<Position>${position}</Position>` : ''}
+      <Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize><FontWeight>Bold</FontWeight>
+        <TextAlign>${textAlign}</TextAlign></Style>
+    </ChartTitle></ChartTitles>
+  <DataSetName>D</DataSetName>`,
+  );
+  return `<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <Body><ReportItems>${chart}</ReportItems><Height>2.2in</Height></Body><Width>4.2in</Width>
+  <DataSets><DataSet Name="D"><Fields>
+    <Field Name="Category"><DataField>Category</DataField></Field>
+    <Field Name="Amount"><DataField>Amount</DataField></Field>
+  </Fields></DataSet></DataSets>
+  <Page><PageWidth>4.4in</PageWidth><PageHeight>2.4in</PageHeight><TopMargin>0.1in</TopMargin>
+    <BottomMargin>0.1in</BottomMargin><LeftMargin>0.1in</LeftMargin><RightMargin>0.1in</RightMargin></Page>
+</Report>`;
+};
 
 const styledDoughnutRdl = (subtype = 'ExplodedDoughnut', legendPosition = 'RightCenter', pieStartAngle = null) => `<?xml version="1.0" encoding="utf-8"?>
 <Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
@@ -135,6 +162,91 @@ test('fixed charts with the same RDL Top render side by side on one PDF page', a
   const result = await renderPdf(parseRdl(sideBySideRdl), request, config);
   assert.equal(result.pageCount, 1);
   assert.ok(result.buffer.length > 2_000);
+});
+
+test('chart title Position anchors its auto-sized box independently of TextAlign in every rendered format', async (context) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-chart-title-position-'));
+  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const centeredModel = parseRdl(chartTitlePositionRdl());
+  const centeredChart = centeredModel.body.items[0];
+  assert.equal(centeredChart.title.position, 'TopCenter', 'an omitted Position uses the RDL TopCenter default');
+  assert.equal(centeredChart.title.style.textAlign, 'Left', 'TextAlign remains an independent text-box style');
+
+  const inkCenter = (buffer, { left, right, top, bottom }) => {
+    const png = PNG.sync.read(buffer);
+    let minimum = Infinity;
+    let maximum = -Infinity;
+    for (let y = Math.max(0, Math.floor(top)); y < Math.min(png.height, Math.ceil(bottom)); y += 1) {
+      for (let x = Math.max(0, Math.floor(left)); x < Math.min(png.width, Math.ceil(right)); x += 1) {
+        const pixel = (y * png.width + x) * 4;
+        if (png.data[pixel] < 100 && png.data[pixel + 1] < 100 && png.data[pixel + 2] < 100) {
+          minimum = Math.min(minimum, x);
+          maximum = Math.max(maximum, x);
+        }
+      }
+    }
+    assert.ok(Number.isFinite(minimum) && Number.isFinite(maximum), 'the chart-title probe must render as dark text');
+    return (minimum + maximum) / 2;
+  };
+  const mediaPng = async (buffer, pattern) => {
+    const zip = await JSZip.loadAsync(buffer);
+    const name = Object.keys(zip.files).find((entry) => pattern.test(entry));
+    assert.ok(name);
+    return zip.file(name).async('nodebuffer');
+  };
+  const chartRegion = (model, dpi) => {
+    const chartItem = model.body.items[0];
+    const scale = dpi / 72;
+    const left = (model.page.marginLeft + chartItem.left) * scale;
+    const top = (model.page.marginTop + chartItem.top) * scale;
+    return {
+      left,
+      right: left + chartItem.width * scale,
+      top: top + 4 * scale,
+      bottom: top + 28 * scale,
+      expected: left + chartItem.width * scale / 2,
+    };
+  };
+
+  const centeredPdf = await renderPdf(centeredModel, request, config);
+  const [centeredPage] = await rasterizePdf(centeredPdf.buffer, config, tempDir, 'centered-title-pdf', {
+    dpi: 150, singleFile: true,
+  });
+  const pdfRegion = chartRegion(centeredModel, 150);
+  assert.ok(Math.abs(inkCenter(centeredPage.data, pdfRegion) - pdfRegion.expected) <= 3);
+
+  for (const [position, textAlign, expectedSide] of [
+    ['TopLeft', 'Center', 'left'],
+    ['TopRight', 'Left', 'right'],
+  ]) {
+    const model = parseRdl(chartTitlePositionRdl(position, textAlign));
+    const rendered = await renderPdf(model, request, config);
+    const [page] = await rasterizePdf(rendered.buffer, config, tempDir, `title-${expectedSide}`, {
+      dpi: 150, singleFile: true,
+    });
+    const region = chartRegion(model, 150);
+    const center = inkCenter(page.data, region);
+    assert.ok(expectedSide === 'left' ? center < region.expected - 100 : center > region.expected + 100,
+      `${position} must anchor the title box on the ${expectedSide}, regardless of TextAlign=${textAlign}`);
+  }
+
+  const editable = await renderEditableDocx(centeredModel, request, config, tempDir);
+  const editableChart = await mediaPng(editable.buffer, /^word\/media\/.+\.png$/);
+  const editablePng = PNG.sync.read(editableChart);
+  const embeddedRegion = { left: 0, right: editablePng.width, top: 8, bottom: 60 };
+  assert.ok(Math.abs(inkCenter(editableChart, embeddedRegion) - editablePng.width / 2) <= 3);
+
+  const excel = await renderExcel(centeredModel, { ...request, excelLayoutMode: 'REPORT' }, config, tempDir);
+  const excelChart = await mediaPng(excel.buffer, /^xl\/media\/.+\.png$/);
+  const excelPng = PNG.sync.read(excelChart);
+  assert.ok(Math.abs(inkCenter(excelChart, {
+    left: 0, right: excelPng.width, top: 8, bottom: 60,
+  }) - excelPng.width / 2) <= 3);
+
+  const visual = await renderVisualDocx(centeredModel, request, config, tempDir);
+  const visualPage = await mediaPng(visual.buffer, /^word\/media\/.+\.png$/);
+  const visualRegion = chartRegion(centeredModel, 300);
+  assert.ok(Math.abs(inkCenter(visualPage, visualRegion) - visualRegion.expected) <= 4);
 });
 
 test('normalizes exploded doughnut, custom palette, chart rectangles, title, and legend semantics', () => {

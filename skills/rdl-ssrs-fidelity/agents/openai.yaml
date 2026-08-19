@@ -1,0 +1,4 @@
+interface:
+  display_name: "RDL SSRS Fidelity"
+  short_description: "Match Microsoft SSRS rendering semantics exactly"
+  default_prompt: "Use $rdl-ssrs-fidelity to RCA a rendering difference against how Microsoft SSRS renders the RDL construct, then fix it generically across every renderer."

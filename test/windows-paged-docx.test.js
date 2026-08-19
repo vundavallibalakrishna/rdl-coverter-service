@@ -452,6 +452,104 @@ test('safe shared-edge overlaps coalesce without permitting genuine content cros
   assert.doesNotMatch(documentXml, /<wps:wsp>|<v:shape(?:\s|>)/);
 });
 
+test('a trace-rounded or sub-half-point textbox/image edge coalesces without allowing real overlap', async () => {
+  const { PNG } = await import('pngjs');
+  const png = new PNG({ width: 4, height: 4 });
+  png.data.fill(0x80);
+  for (let index = 3; index < png.data.length; index += 4) png.data[index] = 0xFF;
+
+  const adjacent = structuredClone(baseModel);
+  adjacent.page.header = null;
+  adjacent.page.footer = null;
+  adjacent.page.marginLeft = 0;
+  adjacent.page.marginRight = 0;
+  adjacent.embeddedImages = {
+    ...(adjacent.embeddedImages || {}),
+    HeaderLogo: { data: PNG.sync.write(png).toString('base64'), mimeType: 'image/png' },
+  };
+  const title = structuredClone(baseModel.body.items.find((item) => item.type === 'Textbox'));
+  Object.assign(title, {
+    name: 'HeaderTitle',
+    value: 'Risk Register Report',
+    paragraphs: [['Risk Register Report']],
+    left: 10.123505,
+    top: 10,
+    width: 100.000507,
+    height: 30,
+    canGrow: false,
+  });
+  title.style = { ...title.style, backgroundColor: '#000080' };
+  const logo = {
+    type: 'Image',
+    name: 'HeaderLogo',
+    source: 'Embedded',
+    value: 'HeaderLogo',
+    sizing: 'FitProportional',
+    left: title.left + title.width,
+    top: 10,
+    width: 30,
+    height: 30,
+    zIndex: 1,
+    hidden: 'false',
+    style: {},
+  };
+  adjacent.body.items = [title, logo];
+
+  const canonical = await renderPdf(adjacent, request, config, { captureLayoutTrace: true });
+  const tracedTitle = canonical.layoutTrace.pages[0].items
+    .find((item) => item.itemName === 'HeaderTitle');
+  const tracedLogo = canonical.layoutTrace.pages[0].items
+    .find((item) => item.itemName === 'HeaderLogo');
+  assert.equal(tracedTitle.x + tracedTitle.width, 110.125);
+  assert.equal(tracedLogo.x, 110.124);
+  assert.equal(Math.round((tracedTitle.x + tracedTitle.width) / 0.25) * 0.25, 110.25);
+  assert.equal(Math.round(tracedLogo.x / 0.25) * 0.25, 110);
+
+  const rendered = await renderEditableDocx(adjacent, request, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+  const nativeText = [...documentXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(nativeText, /Risk Register Report/);
+  assert.match(documentXml, /<a:blip\b/);
+
+  const declaredShallowOverlap = structuredClone(adjacent);
+  declaredShallowOverlap.body.items.find((item) => item.name === 'HeaderLogo').left -= (0.01 / 2.54) * 72;
+  const shallowCanonical = await renderPdf(
+    declaredShallowOverlap,
+    request,
+    config,
+    { captureLayoutTrace: true },
+  );
+  const shallowTitle = shallowCanonical.layoutTrace.pages[0].items
+    .find((item) => item.itemName === 'HeaderTitle');
+  const shallowLogo = shallowCanonical.layoutTrace.pages[0].items
+    .find((item) => item.itemName === 'HeaderLogo');
+  assert.ok(
+    shallowTitle.x + shallowTitle.width - shallowLogo.x > 0.28,
+    'the canonical PDF retains the explicitly declared 0.01cm image/title overlap',
+  );
+  const shallowRendered = await renderEditableDocx(declaredShallowOverlap, request, config);
+  const shallowXml = await (await JSZip.loadAsync(shallowRendered.buffer))
+    .file('word/document.xml').async('string');
+  const shallowNativeText = [...shallowXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)]
+    .map((match) => match[1])
+    .join('');
+  assert.match(shallowNativeText, /Risk Register Report/);
+  assert.match(shallowXml, /<a:blip\b/);
+
+  const genuineOverlap = structuredClone(adjacent);
+  genuineOverlap.body.items.find((item) => item.name === 'HeaderLogo').left -= 2;
+  await assert.rejects(
+    renderEditableDocx(genuineOverlap, request, config),
+    (error) => error.code === 'UNSUPPORTED_FEATURE'
+      && /Overlapping editable PDF regions/.test(error.message)
+      && error.details?.first === 'HeaderTitle'
+      && error.details?.second === 'HeaderLogo',
+  );
+});
+
 test('page-locked DOCX coalesces transparent horizontal neighbours when their smaller overlap is vertical', async () => {
   const adjacent = structuredClone(baseModel);
   adjacent.page.header = null;
@@ -724,11 +822,55 @@ test('page-locked DOCX accepts line endpoints that meet editable content without
   const canonical = await renderPdf(endpointModel, request, config, { captureLayoutTrace: true });
   const title = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'TitleBox');
   const endpoint = canonical.layoutTrace.pages[0].items.find((item) => item.itemName === 'EndpointLine');
-  assert.equal(endpoint.y, title.y + title.height, 'the line must begin exactly at the textbox endpoint');
+  assert.ok(Math.abs(endpoint.y - (title.y + title.height)) <= 0.001,
+    'the line must begin exactly at the textbox endpoint within trace precision');
   const rendered = await renderEditableDocx(endpointModel, request, config);
   const zip = await JSZip.loadAsync(rendered.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
   assert.match(documentXml, /<w:(?:left|right) w:val="single" w:color="123456" w:sz="8"\/>/);
+});
+
+test('page-locked DOCX coalesces a trace-rounded tablix fragment closure with its cell edge', async () => {
+  const fragmentFixture = Buffer.from(fixture.toString('utf8')
+    .replace(
+      '<Top>0.1in</Top><Left>0.1in</Left><Height>0.3in</Height>',
+      '<Top>0in</Top><Left>0.1in</Left><Height>0.3in</Height>',
+    )
+    .replace(
+      '<DataSetName>Sales</DataSetName><Top>0.6in</Top>',
+      '<DataSetName>Sales</DataSetName><Top>0.382274in</Top>',
+    )
+    .replace(
+      '<TablixRow><Height>0.25in</Height>',
+      '<TablixRow><Height>0.2361182in</Height>',
+    ));
+  const fragmentModel = parseRdl(fragmentFixture);
+  const fragmentRequest = {
+    ...request,
+    outputFileName: 'trace-rounded-fragment-closure',
+    datasets: { Sales: [{ Name: 'North', Amount: 1 }] },
+  };
+  const canonical = await renderPdf(fragmentModel, fragmentRequest, config, { captureLayoutTrace: true });
+  const page = canonical.layoutTrace.pages[0];
+  const cell = page.items.find((item) => item.kind === 'tablixCell'
+    && item.tablixName === 'SalesTable'
+    && item.rowIndex === 1);
+  const closure = page.items.find((item) => item.traceRole === 'resolvedTablixFragmentBorder'
+    && item.tablixName === 'SalesTable'
+    && item.fragmentSide === 'bottom');
+  assert.ok(cell);
+  assert.ok(closure);
+  assert.equal(cell.y + cell.height, 102.125);
+  assert.equal(closure.y, 102.124);
+  assert.equal(Math.round((cell.y + cell.height) / 0.25) * 0.25, 102.25);
+  assert.equal(Math.round(closure.y / 0.25) * 0.25, 102);
+
+  const rendered = await renderEditableDocx(fragmentModel, fragmentRequest, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+  assert.equal(rendered.pageCount, canonical.pageCount);
+  assert.match(documentXml, /<w:t(?:\s[^>]*)?>North<\/w:t>/);
+  assert.match(documentXml, /<w:bottom w:val="single" w:color="000000" w:sz="8"\/>/);
 });
 
 test('page-locked DOCX still rejects a line that penetrates editable content', async () => {
