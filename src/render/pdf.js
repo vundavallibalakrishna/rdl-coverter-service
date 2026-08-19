@@ -1654,6 +1654,18 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       return;
     }
 
+    // The row does not fit and the split loop below only advances rows that have splittable text. A row
+    // whose cells carry no continuation-able text (e.g. the trailing row of a row-span group, whose columns
+    // are covered by the merged header) would otherwise fall through the loop undrawn: its height is never
+    // consumed and its open row-span stays open, so the header's residual later closes against the *next*
+    // group's cursor and paints on top of it (two same-named cells at one origin — unrepresentable in Word).
+    // Move the whole row to a fresh page so it draws in order and its span closes against its own row.
+    if (!remainingTexts.some(Boolean) && !atFreshContentStart && measured <= freshPageCapacity) {
+      startContinuationPage();
+      drawRowContent(row, measureRow(row, remainingTexts), remainingTexts);
+      return;
+    }
+
     while (remainingTexts.some(Boolean)) {
       if (pageBottom - y < Math.max(12, row.height)) startContinuationPage();
       const availableHeight = pageBottom - y;

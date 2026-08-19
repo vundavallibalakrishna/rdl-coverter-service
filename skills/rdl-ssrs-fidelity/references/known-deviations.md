@@ -41,6 +41,20 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
 
 ## Verified fixed (kept for regression awareness)
 
+- **Row-span group header duplicated across a page break (DOCX overlap).** A row-span (merged) group-header
+  cell whose group crossed a page boundary could be emitted twice at one origin, so DOCX_EDITABLE failed
+  with "Overlapping editable PDF regions" (native Word cells cannot overlap; PDF and XLSX tolerate it). Root
+  cause: the trailing row of a row-span group is text-less (columns covered by the merged header, empty
+  body); when it did not fit at a page boundary the text-split loop could not advance it, so it was silently
+  dropped — its open row-span stayed open and the header's residual later closed against the *next* group's
+  cursor, painting a duplicate. Fixed in the shared tablix layer (`renderTablix`, `pdf.js`): a non-fitting,
+  unsplittable row now moves to a fresh page and draws in order instead of being dropped. Shared-layer (the
+  duplicate was in the PDF trace both renderers consume), construct-driven (any row-span group header
+  spilling a text-less trailing row across a page break), not report-specific. Verified against the real
+  production payload (overlap gone, full 297-page DOCX renders) and the full corpus (zero page-count/size/
+  status changes). Regression: `test/rowspan-header-page-break.test.js`. Ref: `page-and-flow.md`.
+
+
 - **SSRS List / canvas cells (all renderers).** A grouped 1×1 tablix whose cell is a Rectangle free-form
   canvas (textboxes, lines, charts, images, nested tablixes) now renders. **PDF**: cell content types
   Line/Chart/Image are supported (`RENDERABLE_CELL_ITEMS`), the canvas is drawn item-by-item at each item's
