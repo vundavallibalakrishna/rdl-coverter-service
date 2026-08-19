@@ -1719,7 +1719,7 @@ export async function renderPdf(model, request, config, options = {}) {
     }
     if (item.type === 'Rectangle') {
       const backgroundColor = styleColor(item.style.backgroundColor, context, null);
-      recordLayoutItem(doc, {
+      const rectangleTrace = recordLayoutItem(doc, {
         kind: 'rectangle',
         itemName: item.name || null,
         zIndex: item.zIndex || 0,
@@ -1731,7 +1731,13 @@ export async function renderPdf(model, request, config, options = {}) {
         borders: resolvedTraceBorders(item.style, context),
       });
       if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
-      drawBorder(doc, x, y, item.width, item.height, item.style, context);
+      // The border is deferred to the end of this branch, after the child bands are laid out, so its
+      // bottom edge tracks the container's *rendered* height. A flow child such as a Tablix with a CanGrow
+      // cell can grow past the rectangle's declared height; drawing the border here at item.height would
+      // strand it above the grown content and paint a second, higher bottom line beneath the coincident
+      // tablix edge (the "double line" defect). A bordered/filled rectangle is guarded against page
+      // fragmentation below, so the grown extent stays on one page and endY - y is a valid single-page
+      // height.
       const visibleChildren = (item.items || []).filter((child) => !isHidden(child.hidden, context));
       const bands = containerLayoutBands(
         visibleChildren,
@@ -1854,8 +1860,14 @@ export async function renderPdf(model, request, config, options = {}) {
       if (hasRenderedBand) {
         endY += Math.max(0, item.height - previousDesignBottom);
       }
+      const renderedHeight = Math.max(item.height, endY - y);
+      // Correct the recorded geometry and draw the border/box at the rendered height so PDF, and the
+      // trace-driven editable DOCX built from it, keep the container's bottom edge coincident with grown
+      // flow content instead of doubling it at the declared height.
+      if (rectangleTrace) rectangleTrace.height = Math.round(renderedHeight * 1000) / 1000;
+      drawBorder(doc, x, y, item.width, renderedHeight, item.style, context);
       return {
-        height: Math.max(item.height, endY - y),
+        height: renderedHeight,
         endY: hasRenderedBand ? endY : y + item.height,
         pageBreakAfter: pendingBreak,
       };

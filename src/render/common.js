@@ -47,7 +47,13 @@ export function styledTextForItem(item, context) {
       const runStyle = definition.style || item.style;
       if (value === null || value === undefined) return { text: '', style: runStyle };
       const format = styleValue(runStyle?.format ?? item.style?.format, context, null);
-      const formatted = format ? String(formatValue(value, format)) : String(value);
+      // A Date with no explicit Format must resolve through the .NET-style formatter (its default date
+      // pattern), not JS String(Date) — the latter emits the verbose "Tue Aug 18 2026 14:27:38 GMT+0530
+      // (India Standard Time)" toString, which wraps to a second line and is cropped inside a fixed-height
+      // band (e.g. =Globals!ExecutionTime in a page footer).
+      const formatted = format ? String(formatValue(value, format))
+        : value instanceof Date ? String(formatValue(value, null))
+          : String(value);
       return {
         text: normalizeDisplayText(renderMarkupText(formatted, definition.markupType)),
         style: runStyle,
@@ -117,7 +123,12 @@ export function textForItem(item, context) {
   if (styled) return normalizeDisplayText(styled.map((paragraph) => paragraph.runs.map((run) => run.text).join('')).join('\n'));
   const value = evaluateExpression(item.value, context);
   if (value === null || value === undefined) return '';
-  return normalizeDisplayText(item.style?.format ? String(formatValue(value, styleValue(item.style.format, context))) : String(value));
+  // See styledTextForItem: a no-format Date routes through formatValue so it is not stringified with the
+  // verbose JS Date.toString(); non-dates keep raw String(value).
+  return normalizeDisplayText(item.style?.format
+    ? String(formatValue(value, styleValue(item.style.format, context)))
+    : value instanceof Date ? String(formatValue(value, null))
+      : String(value));
 }
 
 function styleDeclaresVisibleBorder(style) {
