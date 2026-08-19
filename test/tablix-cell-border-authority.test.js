@@ -19,6 +19,7 @@ const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
 // hidden and which SSRS leaves completely blank.
 const SUBREPORT_COLOR = '#3366cc';
 const REGION_COLOR = '#000000';
+const WRAPPED_TEXTBOX_COLOR = '#663399';
 
 const childRdl = `<?xml version="1.0" encoding="utf-8"?>
 <Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
@@ -132,6 +133,27 @@ function prepared(hidden, output = 'PDF') {
   return { model, request };
 }
 
+function preparedWrappedTextbox(output = 'PDF') {
+  const { model, request } = prepared(false, output);
+  const tablix = model.body.items.find((item) => item.name === 'Grid');
+  const cell = tablix.rows[0].cells[0];
+  const textbox = cell.items[0];
+  const visible = { style: 'Solid', color: WRAPPED_TEXTBOX_COLOR, width: 1 };
+  textbox.style.border = { ...visible };
+  textbox.style.borders = { top: { ...visible }, right: { ...visible }, bottom: { ...visible }, left: { ...visible } };
+  cell.items = [{
+    type: 'Rectangle',
+    name: 'StructuralWrapper',
+    left: 0,
+    top: 0,
+    width: 108,
+    height: 28.8,
+    style: { borders: { top: { style: 'None' }, right: { style: 'None' }, bottom: { style: 'None' }, left: { style: 'None' } } },
+    items: [textbox],
+  }];
+  return { model, request };
+}
+
 const subreportCellBorders = (trace) => trace.pages
   .flatMap((page) => page.items)
   .filter((item) => item.kind === 'tablixCell' && item.columnIndex === 1)
@@ -161,6 +183,35 @@ test('a cell whose only content is hidden contributes no border of its own', () 
   const { rows: materialized } = tablixRows(tablix, request, {}, model);
   assert.equal(cellBorderStyle(materialized[0].cells[1], tablix)?.borders?.top?.color, SUBREPORT_COLOR);
   assert.equal(cellBorderStyle(materialized[1].cells[1], tablix), null);
+});
+
+test('a Rectangle-wrapped textbox with explicit borders remains the cell border authority in PDF, DOCX, and XLSX', async () => {
+  const { model, request } = preparedWrappedTextbox();
+  const tablix = model.body.items.find((item) => item.name === 'Grid');
+  const { rows: materialized } = tablixRows(tablix, request, {}, model);
+  assert.equal(materialized[0].cells[0].containerWrapped, true);
+  assert.equal(cellBorderStyle(materialized[0].cells[0], tablix)?.borders?.top?.color, WRAPPED_TEXTBOX_COLOR);
+
+  const pdf = await renderPdf(model, request, config, { captureLayoutTrace: true });
+  const pdfBorders = pdf.layoutTrace.pages.flatMap((page) => page.items)
+    .filter((item) => item.kind === 'tablixCell' && item.columnIndex === 0 && item.text === 'First')
+    .map((item) => item.borders?.top?.color);
+  assert.deepEqual(pdfBorders, [WRAPPED_TEXTBOX_COLOR]);
+
+  const docx = await renderEditableDocx(model, request, config);
+  const documentXml = await (await JSZip.loadAsync(docx.buffer)).file('word/document.xml').async('string');
+  assert.match(documentXml, /w:color="663399"/i);
+
+  const xlsx = await renderExcel(...Object.values(preparedWrappedTextbox('XLSX')), config, null);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(xlsx.buffer);
+  const sheet = workbook.worksheets[0];
+  let border = null;
+  sheet.eachRow((row) => row.eachCell((cell) => {
+    if (cell.value === 'First') border = cell.border;
+  }));
+  assert.equal(border?.top?.color?.argb, 'FF663399');
+  assert.equal(border?.bottom?.color?.argb, 'FF663399');
 });
 
 test('PDF draws the subreport edges only where the subreport renders, and keeps the region border', async () => {

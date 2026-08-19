@@ -486,7 +486,7 @@ Two different conditions are treated differently, because they are not the same 
 | Condition | Behaviour |
 | --- | --- |
 | The declared family has **no file** on this host | Strict mode fails closed (`FONT_MISSING`, 503). Substituting would change the advance widths of every run, and therefore every page break. |
-| The declared family **is installed but has no glyph** for some character | The run is drawn in an installed font that does cover it. Never fails. |
+| The declared family **is installed but has no glyph** for some character | The run is drawn in an installed, embeddable font that covers it. When nothing covers it, the declared font is kept and that character alone comes out as `.notdef`. Never fails. |
 
 The second case is a property of a few characters, not of the document: Arial has no `✓` (U+2713), `✗`
 (U+2717) or `☹` (U+2639), and no Latin family covers CJK or Indic. The declared font still draws every
@@ -497,18 +497,33 @@ flag gates this — the alternative is a 503 for a report that renders correctly
   it covers the run the page breaks are identical to SSRS), then widest-coverage: Segoe UI Symbol, Noto
   Sans Symbols 2, Arial Unicode MS, Lucida Sans Unicode, Microsoft Sans Serif, DejaVu Sans, Noto Sans.
   A candidate is used only when it covers **the whole run** — a face covering the missing character but not
-  the surrounding text would trade one unrenderable character for an unrenderable run.
+  the surrounding text would trade one unrenderable character for an unrenderable run. This is why a
+  mounted `NotoEmoji-Regular.ttf` is chosen for an emoji token but not for `Low 😊`: it has no Latin. Text
+  is laid out token by token, so in practice the Latin token keeps the declared family and the emoji token
+  gets Noto Emoji.
+- Coverage is judged on **visible glyphs only**. Newlines, tabs, BOMs, joiners and variation selectors are
+  projected out first: no shipping font has a glyph for `U+000A`, so measuring the raw string reported every
+  multi-line textbox as uncovered — walking the whole ladder for nothing, and, for a string that also held a
+  pictograph, finding no candidate at all.
 - A candidate must also be **embeddable**, not merely cover the text. PDFKit subsets an embedded TrueType
   font by decoding each glyph it used; colour fonts (COLR/CBDT/sbix — Segoe UI Emoji is one) return glyphs
   with no decoder and abort the render with `glyph._decode is not a function` at the very end, as an opaque
   `RENDER_FAILED` 500. fontkit reports coverage for those glyphs happily, so coverage alone is not a safe
   test. Colour fonts are therefore skipped, including when the report declares one directly.
-- When nothing on the host covers the run, the declared font is kept and only the characters it lacks come
-  out as `.notdef`, as SSRS renders them. The export still succeeds.
+- When nothing on the host covers the run, the declared font is kept — pictographs included — and only the
+  characters it lacks come out as `.notdef`, as SSRS renders them on the same host. The export succeeds and
+  the degrade is reported. Failing instead would reject a whole report over one decorative character in one
+  cell, while an equivalent CJK or dingbat character degraded quietly.
+- `FONT_MISSING` (503) is reserved for the cases where there is no honest output at all: the declared family
+  has no file and strict mode is on; or the declared face is a colour font that cannot be embedded **and**
+  nothing embeddable covers the pictograph, where every remaining candidate would print a missing-glyph box
+  while reporting success; or the base-14 tail, which cannot represent supplementary-plane code points and
+  would emit corrupt surrogate bytes.
 - Substitutions are reported, never silent: the `X-Font-Substitutions` response header and the
   `fontSubstitutions` field of the render log line list `requested => substituted (reason, runs)`.
 - To widen coverage without a code change, drop a single-face file into `RDL_FONT_DIR`:
-  `NotoSansSymbols2-Regular.ttf`, `NotoSansCJK-Regular.ttf`, or `NotoSansDevanagari-Regular.ttf`. Font
+  `NotoEmoji-Regular.ttf`, `NotoSansSymbols2-Regular.ttf`, `NotoSansCJK-Regular.ttf`, or
+  `NotoSansDevanagari-Regular.ttf`. Font
   collections (`.ttc`, e.g. Windows `Nirmala.ttc` / `msgothic.ttc`) are **not** usable — a collection needs
   a face name that the path-based font handoff to PDFKit cannot carry.
 - Licensed fonts are **never committed to the repository or baked into the image** (see `AGENTS.md`). Mount

@@ -163,8 +163,12 @@ function styleDeclaresVisibleBorder(style) {
 
 function itemDeclaresVisibleBorder(item) {
   if (!item) return false;
-  if (styleDeclaresVisibleBorder(item.style)) return true;
-  return (item.items || item.children || []).some(itemDeclaresVisibleBorder);
+  // A nested tablix owns an independent grid. Its outer border must never be promoted into a full-width
+  // closing edge for the containing tablix fragment.
+  if (item.type === 'Tablix') return false;
+  // Only direct cell content can express a cell/grid edge needed to close a containing fragment; nested
+  // descendants paint their own local coordinates and cannot imply a parent-table border.
+  return styleDeclaresVisibleBorder(item.style);
 }
 
 // A populated dynamic tablix is not necessarily a visual data grid: RDL commonly uses data-bound tablixes
@@ -370,17 +374,20 @@ export function cellTextbox(cell) {
 // repainted the region border into every interior cell that holds something other than a textbox — a
 // subreport, image, or chart — producing a full grid where SSRS draws none.
 //
-// Resolution order: a Rectangle-only wrapper keeps the tablix as the authority (its own container style
-// is flattened away during materialization); otherwise the cell's textbox wins, then the first VISIBLE
-// non-Rectangle content item. A cell whose content is entirely hidden contributes no border of its own,
+// Resolution order: an explicitly bordered textbox remains authoritative even when structural Rectangles
+// were flattened away during materialization. A Rectangle-only wrapper whose flattened content declares no
+// border keeps the tablix as authority, preserving the existing grid fallback. Otherwise the cell's textbox
+// wins, then the first VISIBLE non-Rectangle content item. A cell whose content is entirely hidden contributes no border of its own,
 // leaving the neighbouring cells' shared edges to define the grid there, exactly as SSRS renders it.
 // Only a cell with no content at all falls back to the tablix style, which keeps synthesized blank grid
 // cells closed.
 export function cellBorderStyle(cell, tablix) {
   const tablixStyle = tablix?.style;
   if (!cell) return tablixStyle;
-  if (cell.containerWrapped) return tablixStyle;
   const textbox = cellTextbox(cell);
+  if (cell.containerWrapped) {
+    return textbox && styleDeclaresVisibleBorder(textbox.style) ? textbox.style : tablixStyle;
+  }
   if (textbox) return textbox.style;
   const items = cell.items || [];
   // A nested Tablix is skipped: it is a data region that draws its own outer border on its own rect, so

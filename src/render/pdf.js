@@ -140,7 +140,15 @@ function traceTextbox(doc, config, item, x, y, context, details) {
   // the canonical trace before drawing and therefore retains the complete existing path.
   if (details.trace === false || !doc._rdlLayoutTrace) return;
   const layout = details.styledLayout;
-  const fallbackFont = resolvedTraceFont(config, item.style || {}, context, details.text);
+  // Resolved lazily: it is consumed only by the no-styled-layout branch below, and asking for one font that
+  // suits the entire textbox is a strictly harder question than the per-run resolution the styled path uses
+  // (a single string mixing scripts, or Latin with a pictograph, has no single covering face). Computing it
+  // eagerly imposed that harder question on every traced textbox and threw away the answer.
+  let resolvedFallbackFont = null;
+  const fallbackFont = () => {
+    if (!resolvedFallbackFont) resolvedFallbackFont = resolvedTraceFont(config, item.style || {}, context, details.text);
+    return resolvedFallbackFont;
+  };
   let lineOffset = details.localTextY || 0;
   const innerWidth = Math.max(1, details.width - details.padding.left - details.padding.right);
   const lines = layout?.lines?.map((line) => {
@@ -190,12 +198,13 @@ function traceTextbox(doc, config, item, x, y, context, details) {
     lineOffset += line.height;
     return traced;
   }) || String(details.text ?? '').split('\n').map((text, index) => {
-    const contentHeight = fallbackFont.size * 1.2;
+    const font = fallbackFont();
+    const contentHeight = font.size * 1.2;
     const textTop = details.padding.top + (details.localTextY || 0) + index * contentHeight;
     const absoluteTextTop = y + textTop;
     const runX = x + details.padding.left;
-    const baseline = fallbackFont.metrics
-      ? absoluteTextTop + fallbackFont.metrics.ascender
+    const baseline = font.metrics
+      ? absoluteTextTop + font.metrics.ascender
       : absoluteTextTop;
     return {
       width: null,
@@ -211,7 +220,7 @@ function traceTextbox(doc, config, item, x, y, context, details) {
       paragraphEnd: true,
       wrapped: false,
       alignment: String(styleValue(item.style?.textAlign, context, 'left')).toLowerCase(),
-      runs: [{ text, x: runX, y: absoluteTextTop, baseline, width: null, font: fallbackFont }],
+      runs: [{ text, x: runX, y: absoluteTextTop, baseline, width: null, font }],
     };
   });
   recordLayoutItem(doc, {
