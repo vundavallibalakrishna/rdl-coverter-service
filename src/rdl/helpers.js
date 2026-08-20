@@ -14,6 +14,16 @@ export function textValue(value, fallback = '') {
     .replace(/&amp;/g, '&');
 }
 
+// RDL style strings whose element is present but EMPTY (`<FontFamily />`, `<TextAlign></TextAlign>`) carry
+// no declared value: writers emit them for properties the author never set. SSRS ignores such an element and
+// uses the inherited/default value, so the empty string must not survive normalization — carried forward it
+// looks like a declared-but-blank property, and font selection then fails the whole render closed on a
+// nameless family. Style strings only: an empty Textbox/TextRun Value is genuinely empty text.
+export function styleTextValue(value, fallback = '') {
+  const text = textValue(value, null);
+  return text === null || text.trim() === '' ? fallback : text;
+}
+
 export function childEntries(container, names) {
   if (!container || typeof container !== 'object') return [];
   return names.flatMap((name) => asArray(container[name]).map((value) => [name, value]));
