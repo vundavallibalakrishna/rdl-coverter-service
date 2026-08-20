@@ -12,7 +12,7 @@ import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { renderChartPng } from './chartImage.js';
 import { measureTextboxHeight } from './pdf.js';
-import { buildGridBoundaries } from './gridBoundaries.js';
+import { GRID_BOUNDARY_TOLERANCE_POINTS, buildGridBoundaries } from './gridBoundaries.js';
 import { DEFAULT_EXCEL_DATE_FORMAT, excelNumberFormat, cellString } from './excelFormat.js';
 
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/g;
@@ -352,15 +352,32 @@ function visibleBorderWidth(border, context = {}) {
   return /^none$/i.test(style) ? 0 : Math.max(0, styleSize(border?.width, context, 1));
 }
 
-// RDL designers commonly make adjacent free-form boxes overlap by exactly their shared border width so
-// raster/fixed renderers draw one continuous rule. Excel cannot represent two overlapping merged ranges.
-// Record only sibling edges whose vertical spans overlap and whose horizontal difference is no greater
-// than the visible shared-edge stroke. Those two physical coordinates then become one native grid edge.
-// Larger/intentional overlaps remain distinct and still fail closed in mergeSafe.
-function collectEquivalentXEdges(items, target, context, parentLeft = 0, parentTop = 0) {
-  const positioned = (items || []).map((item) => {
-    // Match collectXBoundaries/renderFreeformItem exactly: round the positioned origin first, then add
-    // dimensions. Rounding the combined expression instead creates a different quarter-point edge.
+// Decides whether the coordinate between two adjacent sibling boxes is one native grid edge.
+//
+// A GAP is real whitespace between them. It may only be closed when it is no wider than the shared border
+// stroke that was drawn into it: RDL designers commonly make adjacent free-form boxes meet across exactly
+// their border width so raster/fixed renderers draw one continuous rule.
+//
+// A positive OVERLAP is different in kind. A grid renderer cannot place two items in overlapping cell
+// ranges at all — Excel rejects the export outright — yet a sub-point overlap is routine, because an
+// inch-valued box and a centimetre-valued neighbour rarely land on the same quarter point. Resolving the
+// pair onto their shared midpoint is representable and moves each edge by half the overlap, so it stays
+// inside the certified geometry tolerance for any overlap up to twice that. This is the same rule the
+// page-locked Word renderer already applies to the same construct (coalesceShallowEdgeOverlaps), so both
+// grid renderers now agree about which overlaps are shared edges and which are real. A deeper overlap is
+// intentional, cannot be resolved without moving an edge past the tolerance, and still fails closed.
+function sameGridEdge(separation, borderTolerance) {
+  return separation >= 0
+    ? separation <= borderTolerance
+    : -separation <= Math.max(borderTolerance, GRID_BOUNDARY_TOLERANCE_POINTS * 2);
+}
+
+// Sibling boxes sorted along the grid axis, with both extents on each axis resolved the way
+// collectXBoundaries/collectYBoundaries/renderFreeformItem resolve them: round the positioned origin
+// first, then add the dimension. Rounding the combined expression instead creates a different
+// quarter-point edge that no boundary lookup would then find.
+function positionedSiblings(items, parentLeft, parentTop) {
+  return (items || []).map((item) => {
     const left = point(parentLeft + (item.left || 0));
     const top = point(parentTop + (item.top || 0));
     return {
@@ -370,25 +387,64 @@ function collectEquivalentXEdges(items, target, context, parentLeft = 0, parentT
       top,
       bottom: point(top + (item.height || 0)),
     };
-  }).sort((left, right) => left.left - right.left || left.top - right.top);
+  });
+}
 
-  for (let index = 1; index < positioned.length; index += 1) {
-    const previous = positioned[index - 1];
-    const current = positioned[index];
-    const verticallyOverlaps = previous.top < current.bottom && current.top < previous.bottom;
-    if (!verticallyOverlaps) continue;
-    const previousWidth = visibleBorderWidth(previous.item.style?.borders?.right, context);
-    const currentWidth = visibleBorderWidth(current.item.style?.borders?.left, context);
-    const tolerance = Math.max(1 / POINT_PRECISION, previousWidth, currentWidth);
-    if (Math.abs(previous.right - current.left) <= tolerance) {
-      const canonical = point((previous.right + current.left) / 2);
-      target.set(previous.right, canonical);
-      target.set(current.left, canonical);
+function collectEquivalentXEdges(items, target, context, parentLeft = 0, parentTop = 0) {
+  const positioned = positionedSiblings(items, parentLeft, parentTop);
+
+  // Every pair, not just neighbours in a sorted list: a section commonly holds dozens of free-form boxes
+  // spread down the page, so the two that share a vertical band are rarely adjacent in x across the whole
+  // group. Comparing only consecutive entries silently skipped exactly the pairs this rule exists for.
+  for (const [firstIndex, first] of positioned.entries()) {
+    for (const second of positioned.slice(firstIndex + 1)) {
+      const [previous, current] = first.left <= second.left ? [first, second] : [second, first];
+      const verticallyOverlaps = previous.top < current.bottom && current.top < previous.bottom;
+      if (!verticallyOverlaps) continue;
+      // One box enclosing the other is a containment, not a shared edge; moving the outer box's far edge
+      // onto the inner one would shrink the container over its own content.
+      if (current.right <= previous.right) continue;
+      const previousWidth = visibleBorderWidth(previous.item.style?.borders?.right, context);
+      const currentWidth = visibleBorderWidth(current.item.style?.borders?.left, context);
+      const tolerance = Math.max(1 / POINT_PRECISION, previousWidth, currentWidth);
+      if (sameGridEdge(current.left - previous.right, tolerance)) {
+        const canonical = point((previous.right + current.left) / 2);
+        target.set(previous.right, canonical);
+        target.set(current.left, canonical);
+      }
     }
   }
 
   for (const entry of positioned) {
     collectEquivalentXEdges(entry.item.items, target, context, entry.left, entry.top);
+  }
+}
+
+// The vertical mirror of collectEquivalentXEdges. A shallow overlap between stacked siblings breaks the
+// worksheet row grid exactly the way a shallow horizontal overlap breaks the column grid, so the same rule
+// resolves it. Only the axis and the shared border side differ.
+function collectEquivalentYEdges(items, target, context, parentLeft = 0, parentTop = 0) {
+  const positioned = positionedSiblings(items, parentLeft, parentTop);
+
+  for (const [firstIndex, first] of positioned.entries()) {
+    for (const second of positioned.slice(firstIndex + 1)) {
+      const [previous, current] = first.top <= second.top ? [first, second] : [second, first];
+      const horizontallyOverlaps = previous.left < current.right && current.left < previous.right;
+      if (!horizontallyOverlaps) continue;
+      if (current.bottom <= previous.bottom) continue;
+      const previousWidth = visibleBorderWidth(previous.item.style?.borders?.bottom, context);
+      const currentWidth = visibleBorderWidth(current.item.style?.borders?.top, context);
+      const tolerance = Math.max(1 / POINT_PRECISION, previousWidth, currentWidth);
+      if (sameGridEdge(current.top - previous.bottom, tolerance)) {
+        const canonical = point((previous.bottom + current.top) / 2);
+        target.set(previous.bottom, canonical);
+        target.set(current.top, canonical);
+      }
+    }
+  }
+
+  for (const entry of positioned) {
+    collectEquivalentYEdges(entry.item.items, target, context, entry.left, entry.top);
   }
 }
 
@@ -916,13 +972,18 @@ function collectYBoundaries(items, target, spans, parentTop = 0) {
   }
 }
 
-function freeformRows(worksheet, items, height, startRow) {
+function freeformRows(worksheet, items, height, startRow, context = { parameters: {}, globals: {}, fields: {} }) {
   const boundaries = new Set([0, point(height)]);
   const spans = new Set();
   collectYBoundaries(items, boundaries, spans);
+  const aliases = new Map();
+  collectEquivalentYEdges(items, aliases, context);
   const collapsed = collapsedBoundaries(
-    [...boundaries].filter((value) => value >= 0 && value <= point(height)).sort((a, b) => a - b),
-    [...spans].map((key) => key.split('|').map(Number)),
+    [...new Set([...boundaries].map((value) => aliases.get(value) ?? value))]
+      .filter((value) => value >= 0 && value <= point(height)).sort((a, b) => a - b),
+    [...spans].map((key) => key.split('|').map(Number))
+      .map(([from, to]) => [aliases.get(from) ?? from, aliases.get(to) ?? to]),
+    aliases,
   );
   // splitTallRowIntervals only inserts extra intermediate boundaries, so the collapse aliases stay valid.
   const values = splitTallRowIntervals(collapsed);
@@ -1157,7 +1218,7 @@ async function renderFreeformBand({
     height,
     ...resolved.map((entry) => point(entry.resolvedTop + entry.occupiedHeight)),
   );
-  const yGrid = freeformRows(worksheet, resolvedItems, occupiedHeight, startRow);
+  const yGrid = freeformRows(worksheet, resolvedItems, occupiedHeight, startRow, context);
   for (const item of [...resolvedItems].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
     await renderFreeformItem({
       workbook,
@@ -1952,9 +2013,21 @@ async function renderCoordinateScheduledSection({
   }
   const maximum = Math.max(...boundaries);
   boundaries.add(maximum);
+  // Stacked siblings that overlap by a sliver break the row grid exactly as side-by-side ones break the
+  // column grid. Resolve those shared edges against the SCHEDULED rects, which are the ones this grid is
+  // built from. See collectEquivalentYEdges.
+  const yAliases = new Map();
+  collectEquivalentYEdges(
+    plans.map((plan) => ({ ...plan.item, top: plan.resolvedTop, height: plan.occupiedHeight })),
+    yAliases,
+    context,
+  );
   const collapsedY = collapsedBoundaries(
-    [...boundaries].filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b),
-    [...spans].map((key) => key.split('|').map(Number)),
+    [...new Set([...boundaries].map((value) => yAliases.get(value) ?? value))]
+      .filter((value) => value >= 0 && value <= maximum).sort((a, b) => a - b),
+    [...spans].map((key) => key.split('|').map(Number))
+      .map(([from, to]) => [yAliases.get(from) ?? from, yAliases.get(to) ?? to]),
+    yAliases,
   );
   const yGrid = splitTallRowIntervals(collapsedY);
   yGrid.aliases = collapsedY.aliases;

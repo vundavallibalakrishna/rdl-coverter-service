@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, freeformCellTextboxes, continuationMarkersEnabled, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -931,6 +931,56 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       if (edges[side]) collectEdge(x, y, width, height, side, edges[side].border, edges[side].context);
     }
   };
+  // ---- free-form cell compositions -------------------------------------------------------------------
+  // A cell whose CellContents is a Rectangle holding several positioned children is a container, not a
+  // text cell (see freeformCellTextboxes). Each child textbox keeps its own declared rect inside the cell,
+  // exactly as the nested data regions beside it already do, and the cell rectangle carries only fill and
+  // borders. Measurement therefore asks how far down each child reaches, not how tall one stretched
+  // cell-wide text block would be.
+  const freeformCellHeight = (freeform, cell, context) => Math.max(0, ...freeform.map(({ item: child, index }) => {
+    if (cell.itemHidden?.[index]) return 0;
+    const text = String(cell.values?.[index] ?? '');
+    const padTop = styleSize(child.style?.paddingTop, context, 2);
+    const padBottom = styleSize(child.style?.paddingBottom, context, 2);
+    const measured = measureTextboxHeight(doc, config, child, context, text, child.width || 0) + padTop + padBottom;
+    // A child that cannot grow keeps its declared box exactly as SSRS clips it.
+    const height = child.canGrow ? Math.max(child.height || 0, measured) : (child.height || 0);
+    return (child.top || 0) + height;
+  }));
+  // Records the cell rectangle as a content-free container and draws every child textbox at its own rect.
+  // The container keeps the cell's resolved borders so the tablix grid still closes around the composition;
+  // its background comes from the data region rather than from a child, because the child now paints only
+  // its own box.
+  const drawFreeformCell = (owner, freeform, cell, context, x, y, width, height, edges, traceMeta) => {
+    recordLayoutItem(doc, {
+      ...traceMeta,
+      kind: 'tablixCell',
+      itemName: null,
+      zIndex: owner.zIndex || 0,
+      x,
+      y,
+      width,
+      height,
+      text: '',
+      lines: [],
+      writingMode: 'default',
+      verticalAlign: 'top',
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      backgroundColor: styleColor(owner.style?.backgroundColor, context, null),
+      borders: resolvedTraceBorders(cellBorderStyle(cell, owner) || {}, context, edges),
+    });
+    for (const { item: child, index } of freeform) {
+      if (cell.itemHidden?.[index]) continue;
+      const childHeight = Math.min(child.height || 0, Math.max(0, y + height - (y + (child.top || 0))));
+      if (childHeight <= 0) continue;
+      drawTextbox(doc, config, child, x + (child.left || 0), y + (child.top || 0), context, {
+        width: child.width || 0,
+        height: childHeight,
+        text: String(cell.values?.[index] ?? ''),
+      });
+    }
+  };
+
   const nestedLayout = (nested, availableWidth) => {
     const nestedParameters = nested.parameters || request.parameters || {};
     const nestedDatasets = nested.datasets || datasets;
@@ -952,10 +1002,13 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         dataset: nestedDatasets[nested.item.datasetName] || [],
         datasets: nestedDatasets,
       });
-      const textHeight = textbox && !cell.hidden
-        ? measureTextboxHeight(doc, config, textbox, context, cellText(cell), cellWidth)
-          + styleSize(textbox.style?.paddingTop, context, 2) + styleSize(textbox.style?.paddingBottom, context, 2)
-        : 0;
+      const freeform = cell.hidden ? null : freeformCellTextboxes(cell);
+      const textHeight = freeform
+        ? freeformCellHeight(freeform, cell, context)
+        : textbox && !cell.hidden
+          ? measureTextboxHeight(doc, config, textbox, context, cellText(cell), cellWidth)
+            + styleSize(textbox.style?.paddingTop, context, 2) + styleSize(textbox.style?.paddingBottom, context, 2)
+          : 0;
       const childHeight = Math.max(0, ...(cell.nestedTablixes || []).map((child) => {
         const layout = nestedLayout(child, cellWidth);
         return (child.item.top || 0) + layout.height;
@@ -995,22 +1048,36 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         });
         const style = textbox?.style || nested.item.style || {};
         const borderStyle = cellBorderStyle(cell, nested.item) || {};
-        const background = styleColor(style.backgroundColor, context, null);
+        const freeform = cell.hidden ? null : freeformCellTextboxes(cell);
+        // A composition's children paint their own boxes, so the cell-wide fill must not come from one of
+        // them; it stays with the data region exactly as it does for a cell holding only nested regions.
+        const background = styleColor((freeform ? nested.item.style : style)?.backgroundColor, context, null);
         if (background) doc.save().rect(x, cellY, width, height).fill(background).restore();
-        if (textbox && !cell.hidden) {
+        const nestedEdges = Object.fromEntries(
+          ['top', 'right', 'bottom', 'left'].map((side) => {
+            const border = borderStyle.borders?.[side];
+            return [side, border && !/^none$/i.test(String(styleValue(border.style, context, 'None')))
+              ? { border, context }
+              : null];
+          }),
+        );
+        if (freeform) {
+          drawFreeformCell(nested.item, freeform, cell, context, x, cellY, width, height, nestedEdges, {
+            tablixName: nested.item.name || null,
+            rowIndex,
+            columnIndex,
+            colSpan,
+            rowSpan,
+            repeatedHeader: Boolean(row.isHeader),
+            nested: true,
+          });
+        } else if (textbox && !cell.hidden) {
           drawTextbox(doc, config, textbox, x, cellY, context, {
             width,
             height,
             text: cellText(cell),
             skipBorder: true,
-            traceEdges: Object.fromEntries(
-              ['top', 'right', 'bottom', 'left'].map((side) => {
-                const border = borderStyle.borders?.[side];
-                return [side, border && !/^none$/i.test(String(styleValue(border.style, context, 'None')))
-                  ? { border, context }
-                  : null];
-              }),
-            ),
+            traceEdges: nestedEdges,
             traceMeta: {
               kind: 'tablixCell',
               tablixName: nested.item.name || null,
@@ -1156,14 +1223,19 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }
     }
     statistics.rowMeasurementsComputed += 1;
-    const measured = layoutsForRow(row, texts).reduce((height, layout) => Math.max(
-      height,
-      measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
-        + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
-      Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
-        (nested.item.top || 0) + nestedLayout(nested, layout.width).height
-      ))),
-    ), row.height);
+    const measured = layoutsForRow(row, texts).reduce((height, layout) => {
+      const freeform = layout.cell.hidden ? null : freeformCellTextboxes(layout.cell);
+      return Math.max(
+        height,
+        freeform
+          ? freeformCellHeight(freeform, layout.cell, layout.context)
+          : measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
+            + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
+        Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
+          (nested.item.top || 0) + nestedLayout(nested, layout.width).height
+        ))),
+      );
+    }, row.height);
     if (cacheable) pageCache.set(textKey, measured);
     return measured;
   };
@@ -1193,7 +1265,20 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const segmentHeight = Math.min(endY - span.segStartY, Math.max(0, pageBottom - span.segStartY));
     if (segmentHeight <= 0.5) return;
     span.pendingTail = null;
-    if (span.textbox && !span.cell.hidden) {
+    const spanFreeform = span.cell.hidden ? null : freeformCellTextboxes(span.cell);
+    if (spanFreeform) {
+      // A composition never splits its children across segments: each child keeps its declared box, and
+      // drawFreeformCell drops one that the clamped segment can no longer contain.
+      drawFreeformCell(item, spanFreeform, span.cell, span.context, span.x, span.segStartY, span.width, segmentHeight, span.edges, {
+        tablixName: item.name || null,
+        rowIndex: span.rowIndex,
+        columnIndex: span.columnIndex,
+        colSpan: span.colSpan,
+        rowSpan: span.rowSpan,
+        repeatedHeader: Boolean(span.sourceRow?.isHeader),
+        continuation: span.segStartY !== span.firstSegmentY,
+      });
+    } else if (span.textbox && !span.cell.hidden) {
       const { head, tail } = splitTextForHeight(doc, config, span.textbox, span.context, span.text, span.width, segmentHeight);
       if (tail && tail.length > 0) span.pendingTail = tail;
       drawTextbox(doc, config, span.textbox, span.x, span.segStartY, span.context, {
@@ -1305,7 +1390,17 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       if (renderedHeight <= 0) continue;
       // Recursive (parent/child) groups render expanded with the first cell indented by depth.
       const padLeft = index === 0 && row.indentLevel ? row.indentLevel * 12 : 0;
-      if (textbox && !cell.hidden) {
+      const freeform = cell.hidden ? null : freeformCellTextboxes(cell);
+      if (freeform) {
+        drawFreeformCell(item, freeform, cell, cellContext, x, y, width, renderedHeight, edges, {
+          tablixName: item.name || null,
+          rowIndex,
+          columnIndex,
+          colSpan: span,
+          rowSpan: 1,
+          repeatedHeader: Boolean(row.isHeader),
+        });
+      } else if (textbox && !cell.hidden) {
         drawTextbox(doc, config, textbox, x, y, cellContext, {
           width,
           height: renderedHeight,

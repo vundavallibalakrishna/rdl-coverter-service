@@ -36,12 +36,23 @@ function borderOf(border, fallback = {}) {
   };
 }
 
+// Report Builder writes an empty `<FontFamily></FontFamily>` for a style that specifies no family. RDL
+// treats that exactly like an omitted element - the family is inherited, and at the top of the chain that
+// is the report default - so it must never reach the renderers as a declared family named "". Doing so
+// makes strict font resolution demand a font with no name and fail the whole export with FONT_MISSING,
+// and it would put an empty typeface into Word/Excel runs. textValue only substitutes its fallback for a
+// missing element, so blank text needs the same treatment here.
+function declaredFontFamily(value, defaultFontFamily) {
+  const family = textValue(value, defaultFontFamily);
+  return family.trim() === '' ? defaultFontFamily : family;
+}
+
 function styleOf(style = {}, defaultFontFamily = 'Arial') {
   const border = borderOf(style.Border);
   return {
     color: textValue(style.Color, '#000000'),
     backgroundColor: textValue(style.BackgroundColor, null),
-    fontFamily: textValue(style.FontFamily, defaultFontFamily),
+    fontFamily: declaredFontFamily(style.FontFamily, defaultFontFamily),
     // FontSize / Padding / LineHeight are RdlSize ExpressionType — a literal OR an =expression evaluated per
     // row. Keep expressions raw (sizeOrExpression); the renderers resolve them via styleSize at render time.
     fontSize: sizeOrExpression(style.FontSize, 10),
@@ -688,7 +699,7 @@ export function parseRdl(input, limits = {}) {
   if (!report) throw new ServiceError('RDL_INVALID', 'RDL root Report element is missing');
   const capabilities = inspectRdlCapabilities(parsed, namespace);
   const section = firstDefined(asArray(report.ReportSections?.ReportSection)[0], report);
-  const defaultFontFamily = textValue(report['df:DefaultFontFamily'], 'Arial');
+  const defaultFontFamily = declaredFontFamily(report['df:DefaultFontFamily'], 'Arial');
   const page = section.Page || report.Page || {};
   const body = section.Body || report.Body;
   if (!body) throw new ServiceError('RDL_INVALID', 'RDL Body element is missing');
@@ -762,7 +773,11 @@ export function parseRdl(input, limits = {}) {
     parameterDatasets: [...parameterDatasets],
     embeddedImages,
     defaultFontFamily,
-    fonts: [...new Set([defaultFontFamily, ...[...xml.matchAll(/<FontFamily>([^<]+)<\/FontFamily>/g)].map((match) => match[1].trim())])],
+    // A blank `<FontFamily>` declares nothing — the style inherits — so it must not enter the catalogue the
+    // strict readiness/render font checks are driven from. See declaredFontFamily.
+    fonts: [...new Set([defaultFontFamily, ...[...xml.matchAll(/<FontFamily>([^<]+)<\/FontFamily>/g)]
+      .map((match) => match[1].trim())
+      .filter((family) => family !== '')])],
     // Field names the report actually reads, from every `Fields!Name.Value` in every expression. SSRS does
     // not require a declared field to exist in the result set — it only matters where the report reads one
     // — so a dataset routinely declares columns its query never returns (a query edited after the fields

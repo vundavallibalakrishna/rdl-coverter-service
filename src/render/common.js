@@ -330,6 +330,32 @@ export function styleColor(value, context, fallback = '#000000') {
   return color(String(evaluated), fallback);
 }
 
+// A TablixCell's CellContents holds exactly one RDL report item. When that item is a Textbox it fills the
+// cell, which is the ordinary case every renderer assumes. When it is a Rectangle, the Rectangle fills the
+// cell and its children are FREE-FORM: each carries its own Top/Left/Width/Height inside the cell and SSRS
+// draws it exactly there. Materialization flattens the Rectangle away (flattenCellItems accumulates the
+// offsets onto the children), so a cell that ends up holding several positioned children is such a
+// composition rather than a text cell.
+//
+// Treating a composition's textbox as the cell's text stretched it over the whole cell. That put its text
+// at the cell origin instead of its declared offset in the PDF, and it made the cell rectangle enclose the
+// nested data regions positioned beside it — an overlap no native Word or Excel grid can represent, so the
+// page-locked DOCX renderer rejected the report outright.
+//
+// Returns the cell's textboxes paired with their index into `cell.items`/`cell.values`, or null when the
+// cell is an ordinary text cell (including the ubiquitous single-textbox-in-a-Rectangle idiom, whose child
+// does fill its container and must keep rendering exactly as before).
+export function freeformCellTextboxes(cell) {
+  if (!cell?.containerWrapped) return null;
+  const items = cell.items || [];
+  // One content item is a wrapper around that item, not a composition of positioned siblings.
+  if (items.filter((item) => item.type !== 'Rectangle').length < 2) return null;
+  const textboxes = items
+    .map((item, index) => ({ item, index }))
+    .filter((entry) => entry.item.type === 'Textbox');
+  return textboxes.length > 0 ? textboxes : null;
+}
+
 export function cellTextbox(cell) {
   const items = cell.items || [];
   const values = cell.values || [];
