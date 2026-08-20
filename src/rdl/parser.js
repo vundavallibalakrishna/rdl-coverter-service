@@ -6,7 +6,7 @@ import { inspectRdlCapabilities } from './capabilities.js';
 import { canonicalizeCulture } from './culture.js';
 import { FUNCTION_NAMES } from './functions/index.js';
 import { CUSTOM_CODE_FUNCTION_NAMES } from './functions/customCode.js';
-import { asArray, childEntries, firstDefined, flattenCellItems, parseBoolean, RENDERABLE_CELL_ITEMS, textValue } from './helpers.js';
+import { asArray, childEntries, firstDefined, flattenCellItems, parseBoolean, RENDERABLE_CELL_ITEMS, styleTextValue, textValue } from './helpers.js';
 
 const SUPPORTED_NAMESPACES = new Set([
   'http://schemas.microsoft.com/sqlserver/reporting/2008/01/reportdefinition',
@@ -28,11 +28,20 @@ function sizeOrExpression(value, fallback) {
   return toPoints(text || `${fallback}pt`, fallback);
 }
 
+// An empty element (`<Style />`) is not a declared value — see styleTextValue. Drop blanks BEFORE the
+// fallback chain runs, otherwise `<TopBorder><Style /></TopBorder>` would shadow the general Border it is
+// supposed to inherit from. Numbers are already-normalized fallback values and pass through untouched.
+function declaredValue(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'number') return value;
+  return textValue(value, '').trim() === '' ? undefined : value;
+}
+
 function borderOf(border, fallback = {}) {
-  const width = firstDefined(border?.Width, fallback.width, '1pt');
+  const width = firstDefined(declaredValue(border?.Width), declaredValue(fallback.width), '1pt');
   return {
-    style: textValue(firstDefined(border?.Style, border?.['rd:Style'], fallback.style), 'None'),
-    color: textValue(firstDefined(border?.Color, fallback.color), '#000000'),
+    style: styleTextValue(firstDefined(declaredValue(border?.Style), declaredValue(border?.['rd:Style']), declaredValue(fallback.style)), 'None'),
+    color: styleTextValue(firstDefined(declaredValue(border?.Color), declaredValue(fallback.color)), '#000000'),
     width: sizeOrExpression(width, 1),
   };
 }
@@ -40,19 +49,19 @@ function borderOf(border, fallback = {}) {
 function styleOf(style = {}, defaultFontFamily = 'Arial') {
   const border = borderOf(style.Border);
   return {
-    color: textValue(style.Color, '#000000'),
-    backgroundColor: textValue(style.BackgroundColor, null),
-    fontFamily: textValue(style.FontFamily, defaultFontFamily),
+    color: styleTextValue(style.Color, '#000000'),
+    backgroundColor: styleTextValue(style.BackgroundColor, null),
+    fontFamily: styleTextValue(style.FontFamily, defaultFontFamily),
     // FontSize / Padding / LineHeight are RdlSize ExpressionType — a literal OR an =expression evaluated per
     // row. Keep expressions raw (sizeOrExpression); the renderers resolve them via styleSize at render time.
     fontSize: sizeOrExpression(style.FontSize, 10),
-    fontWeight: textValue(style.FontWeight, 'Normal'),
-    fontStyle: textValue(style.FontStyle, 'Normal'),
-    textDecoration: textValue(style.TextDecoration, 'None'),
-    textAlign: textValue(style.TextAlign, 'Left'),
-    verticalAlign: textValue(style.VerticalAlign, 'Top'),
-    writingMode: textValue(style.WritingMode, 'Default'),
-    format: textValue(style.Format, null),
+    fontWeight: styleTextValue(style.FontWeight, 'Normal'),
+    fontStyle: styleTextValue(style.FontStyle, 'Normal'),
+    textDecoration: styleTextValue(style.TextDecoration, 'None'),
+    textAlign: styleTextValue(style.TextAlign, 'Left'),
+    verticalAlign: styleTextValue(style.VerticalAlign, 'Top'),
+    writingMode: styleTextValue(style.WritingMode, 'Default'),
+    format: styleTextValue(style.Format, null),
     paddingLeft: sizeOrExpression(style.PaddingLeft, 2),
     paddingRight: sizeOrExpression(style.PaddingRight, 2),
     paddingTop: sizeOrExpression(style.PaddingTop, 2),
@@ -689,7 +698,7 @@ export function parseRdl(input, limits = {}) {
   if (!report) throw new ServiceError('RDL_INVALID', 'RDL root Report element is missing');
   const capabilities = inspectRdlCapabilities(parsed, namespace);
   const section = firstDefined(asArray(report.ReportSections?.ReportSection)[0], report);
-  const defaultFontFamily = textValue(report['df:DefaultFontFamily'], 'Arial');
+  const defaultFontFamily = styleTextValue(report['df:DefaultFontFamily'], 'Arial');
   const page = section.Page || report.Page || {};
   const body = section.Body || report.Body;
   if (!body) throw new ServiceError('RDL_INVALID', 'RDL Body element is missing');

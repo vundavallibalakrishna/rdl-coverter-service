@@ -6,7 +6,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression, resolveReportCulture } from '../rdl/expression.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleValue, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleText, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -166,7 +166,7 @@ function writeTablix(worksheet, model, item, request, globals, startRow, columnM
       const fill = hex(styleColor(style.backgroundColor, context, null));
       if (fill) target.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
       target.font = {
-        name: String(styleValue(style.fontFamily, context, 'Arial')),
+        name: String(styleText(style.fontFamily, context, 'Arial')),
         size: styleSize(style.fontSize, context, 10) || 10,
         bold: /bold|[6-9]00/i.test(String(styleValue(style.fontWeight, context, 'Normal'))),
         italic: /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal'))),
@@ -238,7 +238,7 @@ async function writeItem(workbook, worksheet, model, item, request, globals, con
     target.value = text;
     columnMaxChars[0] = Math.max(columnMaxChars[0] || 0, ...text.split('\n').map((line) => line.length));
     target.font = {
-      name: String(styleValue(item.style?.fontFamily, context, 'Arial')),
+      name: String(styleText(item.style?.fontFamily, context, 'Arial')),
       size: styleSize(item.style?.fontSize, context, 10) || 10,
       bold: /bold|[6-9]00/i.test(String(styleValue(item.style?.fontWeight, context, 'Normal'))),
       color: { argb: `FF${hex(styleColor(item.style?.color, context, '#000000'), '000000')}` },
@@ -693,7 +693,7 @@ function gridRange(boundaries, left, width) {
 function excelFont(style, context) {
   const decoration = String(styleValue(style?.textDecoration, context, 'None'));
   return {
-    name: String(styleValue(style?.fontFamily, context, 'Arial')),
+    name: String(styleText(style?.fontFamily, context, 'Arial')),
     size: styleSize(style?.fontSize, context, 10) || 10,
     bold: /bold|[6-9]00/i.test(String(styleValue(style?.fontWeight, context, 'Normal'))),
     italic: /italic/i.test(String(styleValue(style?.fontStyle, context, 'Normal'))),

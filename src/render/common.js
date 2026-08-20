@@ -351,6 +351,16 @@ export function styleValue(value, context, fallback) {
   return evaluated ?? fallback;
 }
 
+// styleValue for style strings where BLANK is not a value. A style property can be an =expression that
+// evaluates to "" (`=IIf(Fields!Kind.Value = "x", "Segoe UI", "")`), and a literal `<FontFamily />` means
+// "not set" too — SSRS uses the default in both cases. Returning "" instead reaches font selection as a
+// nameless family, which fails the whole export closed under strict fonts.
+export function styleText(value, context, fallback) {
+  const resolved = styleValue(value, context, fallback);
+  if (resolved === null || resolved === undefined || String(resolved).trim() === '') return fallback;
+  return resolved;
+}
+
 export function styleColor(value, context, fallback = '#000000') {
   const evaluated = styleValue(value, context, fallback);
   if (evaluated === null || evaluated === undefined || evaluated === '') return fallback;

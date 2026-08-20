@@ -1,6 +1,6 @@
 import { evaluateExpression } from '../rdl/expression.js';
 import { pdfFont } from './fonts.js';
-import { color as resolveColor, isHidden, styleColor, styleSize, styleValue } from './common.js';
+import { color as resolveColor, isHidden, styleColor, styleSize, styleText, styleValue } from './common.js';
 
 const AXIS_COLOR = '#d9d9d9';
 const TICK_LABEL_COLOR = '#595959';
@@ -39,7 +39,7 @@ function styleFont(doc, config, style, context, fallbackSize = 8) {
   const weight = String(styleValue(style?.fontWeight, context, 'Normal'));
   const fontStyle = String(styleValue(style?.fontStyle, context, 'Normal'));
   const appearance = {
-    family: String(styleValue(style?.fontFamily, context, 'Arial')),
+    family: String(styleText(style?.fontFamily, context, 'Arial')),
     size: styleSize(style?.fontSize, context, fallbackSize) || fallbackSize,
     bold: /bold|[6-9]00/i.test(weight),
     italic: /italic/i.test(fontStyle),

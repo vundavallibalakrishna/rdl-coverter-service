@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleText, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -88,13 +88,13 @@ function collectDocument(doc) {
 function applyFont(doc, config, style, context = {}, text = '') {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style.fontStyle, context, 'Normal')));
-  doc.font(pdfFont(config, styleValue(style.fontFamily, context, 'Arial'), bold, italic, text)).fontSize(styleSize(style.fontSize, context, 10) || 10).fillColor(styleColor(style.color, context));
+  doc.font(pdfFont(config, styleText(style.fontFamily, context, 'Arial'), bold, italic, text)).fontSize(styleSize(style.fontSize, context, 10) || 10).fillColor(styleColor(style.color, context));
 }
 
 function resolvedTraceFont(config, style, context, text = '') {
   const bold = /bold|600|700|800|900/i.test(String(styleValue(style?.fontWeight, context, 'Normal')));
   const italic = /italic/i.test(String(styleValue(style?.fontStyle, context, 'Normal')));
-  const family = String(styleValue(style?.fontFamily, context, 'Arial'));
+  const family = String(styleText(style?.fontFamily, context, 'Arial'));
   const file = pdfFont(config, family, bold, italic, text);
   const size = styleSize(style?.fontSize, context, 10) || 10;
   return {
@@ -736,7 +736,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     };
     doc.save();
     doc.rect(startX, markerY, totalWidth, height).fill('#FFFFFF');
-    const family = styleValue(style.fontFamily, context, 'Arial');
+    const family = styleText(style.fontFamily, context, 'Arial');
     const fontFile = pdfFont(config, family, false, true, label);
     doc.font(fontFile)
       .fontSize(fontSize)
