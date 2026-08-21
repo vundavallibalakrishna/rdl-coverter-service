@@ -171,14 +171,6 @@ export function resolveBundledSubreports(model, request, config) {
     });
     definition.model = child;
     for (const font of child.fonts) fonts.add(font);
-    const unsupportedBodyItem = child.body.items.find((item) => item.type !== 'Tablix');
-    if (unsupportedBodyItem) {
-      throw new ServiceError(
-        'UNSUPPORTED_FEATURE',
-        `Bundled subreport body item is not supported: ${unsupportedBodyItem.type}`,
-      );
-    }
-
     visitItems([
       ...child.body.items,
       ...(child.page.header?.items || []),

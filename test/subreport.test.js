@@ -68,6 +68,13 @@ const childRdl = `<?xml version="1.0" encoding="utf-8"?>
   </ReportSection></ReportSections>
 </Report>`;
 
+const freeformChildRdl = childRdl.replace(
+  /<Tablix Name="ChildTable">[\s\S]*?<\/Tablix>/,
+  '<Textbox Name="FreeformChild"><Value>SUBREPORT_FREEFORM</Value><Height>0.25in</Height><Width>2in</Width>'
+    + '<Paragraphs><Paragraph><TextRuns><TextRun><Value>SUBREPORT_FREEFORM</Value></TextRun></TextRuns></Paragraph></Paragraphs>'
+    + '<Style><FontFamily>Arial</FontFamily><Border><Style>Solid</Style></Border></Style></Textbox>',
+);
+
 function bundledRequest(instances) {
   return {
     output: 'PDF',
@@ -238,6 +245,38 @@ test('renders bundled subreports through the PDF trace and as native cells in Ex
     }),
     (error) => error.code === 'UNSUPPORTED_FEATURE',
   );
+});
+
+test('renders a bundled subreport whose body is a free-form textbox in PDF, Word, and Excel REPORT mode', async (context) => {
+  const converter = await createConverter({
+    env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
+  });
+  context.after(() => converter.close());
+  const request = bundledRequest([
+    { parameters: { EntityID: 1 }, datasets: { ChildData: [{ EntityID: 1, Label: 'unused' }] } },
+    { parameters: { EntityID: 2 }, datasets: { ChildData: [{ EntityID: 2, Label: 'unused' }] } },
+  ]);
+  request.subreports['/Children/Child'].rdlBase64 = Buffer.from(freeformChildRdl).toString('base64');
+
+  const pdf = await converter.render({ rdl: parentRdl, ...request, output: 'PDF' });
+  const pdfText = await extractPdfText(context, pdf.buffer, 'subreport-freeform-test');
+  assert.equal((pdfText.match(/SUBREPORT_FREEFORM/g) || []).length, 2);
+
+  const docx = await converter.render({ rdl: parentRdl, ...request, output: 'DOCX_EDITABLE' });
+  const docxZip = await JSZip.loadAsync(docx.buffer);
+  const documentXml = await docxZip.file('word/document.xml').async('string');
+  assert.equal((documentXml.match(/SUBREPORT_FREEFORM/g) || []).length, 2);
+
+  const visualDocx = await converter.render({ rdl: parentRdl, ...request, output: 'DOCX_VISUAL' });
+  const visualZip = await JSZip.loadAsync(visualDocx.buffer);
+  assert.ok(Object.keys(visualZip.files).some((name) => name.startsWith('word/media/')));
+
+  const xlsx = await converter.render({ rdl: parentRdl, ...request, output: 'XLSX' });
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(xlsx.buffer);
+  const values = [];
+  for (const worksheet of workbook.worksheets) worksheet.eachRow((row) => row.eachCell((cell) => values.push(String(cell.text))));
+  assert.equal(values.filter((value) => value === 'SUBREPORT_FREEFORM').length, 2);
 });
 
 test('preserves a child-grid bottom edge when another parent cell grows past it in Excel REPORT mode', async (context) => {

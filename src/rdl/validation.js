@@ -478,17 +478,48 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
       variables: resolved.model.variables || {},
       __nestedTablixDepth: (context.nestedTablixDepth || 0) + 1,
     };
+    // A subreport body is free-form and may contain a Textbox (not only a data region). Keep native
+    // tablixes on the existing path and normalize other body items to one-cell nested regions so all
+    // renderers share the same coordinate, growth, and border behavior.
     for (const childItem of resolved.model.body.items) {
-      const nestedItem = {
-        ...childItem,
-        left: (item.left || 0) + (childItem.left || 0),
-        top: (item.top || 0) + (childItem.top || 0),
+      const left = (item.left || 0) + (childItem.left || 0);
+      const top = (item.top || 0) + (childItem.top || 0);
+      if (childItem.type === 'Tablix') {
+        const nestedItem = { ...childItem, left, top };
+        const rawRows = instance.datasets[childItem.datasetName] || [];
+        nestedTablixes.push({
+          item: nestedItem,
+          rows: materializeTablixRows(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
+          columns: materializeTablixColumns(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
+          parameters: instance.parameters,
+          datasets: childDatasets,
+          globals: childGlobals,
+          subreport: true,
+        });
+        continue;
+      }
+      const width = Math.max(1, childItem.width || resolved.model.body.width || 1);
+      const height = Math.max(1, childItem.height || resolved.model.body.height || 1);
+      const wrapper = {
+        type: 'Tablix',
+        name: `${childItem.name || 'SubreportItem'}__nested`,
+        left,
+        top,
+        width,
+        height,
+        columns: [width],
+        rows: [{ height, cells: [{ items: [{ ...childItem, left: 0, top: 0 }] }] }],
+        rowMembers: [],
+        columnMembers: [],
+        rowMemberPaths: [[]],
+        rowHeaderColumns: [],
+        style: { borders: {} },
+        datasetName: null,
       };
-      const rawRows = instance.datasets[childItem.datasetName] || [];
       nestedTablixes.push({
-        item: nestedItem,
-        rows: materializeTablixRows(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
-        columns: materializeTablixColumns(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
+        item: wrapper,
+        rows: materializeTablixRows(wrapper, [], instance.parameters, childGlobals, childDatasets),
+        columns: wrapper.columns,
         parameters: instance.parameters,
         datasets: childDatasets,
         globals: childGlobals,
