@@ -1596,6 +1596,58 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     return result;
   };
 
+  // SSRS free-form displacement, applied inside a tablix cell. A cell whose CellContents Rectangle was
+  // flattened is a canvas of positioned peers, and a child data region that renders taller than its
+  // declared height pushes the later peers in its horizontal lane down by that growth. Without it two
+  // design-time disjoint child regions can be scheduled onto the same worksheet rows, which surfaces as
+  // overlapping merged ranges. Same lane rule as the section and rectangle layouts.
+  const resolvedNestedTops = new WeakMap();
+  const nestedTopsFor = (cell) => {
+    const cached = resolvedNestedTops.get(cell);
+    if (cached) return cached;
+    const peers = [];
+    (cell.items || []).forEach((entry, sourceIndex) => {
+      // Tablix/Subreport entries are the design-time source of the materialized nested regions added
+      // below; counting them twice would displace every later peer by a whole extra region.
+      if (entry.type === 'Tablix' || entry.type === 'Subreport') return;
+      const height = Math.max(0, entry.height || 0);
+      peers.push({
+        sourceIndex, item: entry, designTop: point(entry.top || 0), designHeight: height, occupiedHeight: height, resolvedTop: point(entry.top || 0), nested: null,
+      });
+    });
+    (cell.nestedTablixes || []).forEach((nested, index) => {
+      const measured = measureNestedTablix(nested).heights.reduce((sum, height) => sum + height, 0);
+      const declared = Math.max(0, nested.item.height || 0);
+      peers.push({
+        sourceIndex: (cell.items || []).length + index,
+        item: nested.item,
+        designTop: point(nested.item.top || 0),
+        designHeight: declared,
+        occupiedHeight: Math.max(declared, measured),
+        resolvedTop: point(nested.item.top || 0),
+        nested,
+      });
+    });
+    const layoutOrder = [...peers].sort((left, right) => left.designTop - right.designTop
+      || (left.item.left || 0) - (right.item.left || 0)
+      || left.sourceIndex - right.sourceIndex);
+    for (const [index, peer] of layoutOrder.entries()) {
+      for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
+        const previous = layoutOrder[previousIndex];
+        const previousDesignBottom = point(previous.designTop + previous.designHeight);
+        if (previousDesignBottom > peer.designTop + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+        if (!horizontalDesignOverlap(previous.item, peer.item)) continue;
+        const originalGap = Math.max(0, peer.designTop - previousDesignBottom);
+        peer.resolvedTop = Math.max(peer.resolvedTop, point(previous.resolvedTop + previous.occupiedHeight + originalGap));
+      }
+    }
+    const tops = new WeakMap();
+    for (const peer of peers) if (peer.nested) tops.set(peer.nested, peer.resolvedTop);
+    resolvedNestedTops.set(cell, tops);
+    return tops;
+  };
+  const nestedTop = (cell, nested) => nestedTopsFor(cell).get(nested) ?? point(nested.item.top || 0);
+
   // Excel does not auto-fit merged cells. Measure every logical owner once, then grow the final row of its
   // vertical span only when CanGrow is enabled and the declared combined row heights cannot contain the
   // text. Nested tablixes contribute their measured height too. This preserves RDL row proportions and
@@ -1623,7 +1675,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     for (const nested of owner.cell.nestedTablixes || []) {
       const nestedMeasurement = measureNestedTablix(nested);
       required = Math.max(required,
-        (nested.item.top || 0) + nestedMeasurement.heights.reduce((sum, height) => sum + height, 0));
+        nestedTop(owner.cell, nested) + nestedMeasurement.heights.reduce((sum, height) => sum + height, 0));
     }
     if (required <= 0) continue;
     const endRow = Math.min(rows.length - 1, owner.rowIndex + rowSpan - 1);
@@ -1634,23 +1686,23 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   // Replace declared child-row boundaries with their measured CanGrow boundaries before mapping them to
   // physical Excel rows. Otherwise a nested row may grow in measurement but still be rendered into its old
   // one-line interval.
-  const addMeasuredNestedYBoundaries = (nested, baseTop, target) => {
+  const addMeasuredNestedYBoundaries = (nested, baseTop, target, ownTop) => {
     const measurement = measureNestedTablix(nested);
-    let cursor = point(baseTop + (nested.item.top || 0));
+    let cursor = point(baseTop + ownTop);
     target.add(cursor);
     (nested.rows || []).forEach((row, index) => {
       const rowTop = cursor;
       cursor = point(cursor + measurement.heights[index]);
       target.add(cursor);
       for (const cell of row.cells || []) {
-        for (const child of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(child, rowTop, target);
+        for (const child of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(child, rowTop, target, nestedTop(cell, child));
       }
     });
   };
   rows.forEach((row, rowIndex) => {
     const boundaries = new Set([0, point(row.height || DEFAULT_ROW_POINTS)]);
     for (const cell of row.cells || []) {
-      for (const nested of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(nested, 0, boundaries);
+      for (const nested of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(nested, 0, boundaries, nestedTop(cell, nested));
     }
     rowProfiles[rowIndex] = [...boundaries].sort((left, right) => left - right);
   });
@@ -1688,14 +1740,14 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     }
   });
 
-  const renderNested = (nested, parentCellLeft, parentRowIndex, baseTop = 0) => {
+  const renderNested = (nested, parentCellLeft, parentRowIndex, baseTop, ownTop) => {
     const nestedRows = nested.rows || [];
     const nestedColumns = nested.columns || nested.item.columns || [];
     const nestedPlacements = computeCellPlacements(nestedRows, nestedColumns.length);
     const nestedOffsets = [0];
     nestedColumns.forEach((width) => nestedOffsets.push(point(nestedOffsets.at(-1) + width)));
     const nestedOwners = nestedRows.map(() => new Array(nestedColumns.length).fill(null));
-    const rowOffsets = [point(baseTop + (nested.item.top || 0))];
+    const rowOffsets = [point(baseTop + ownTop)];
     const nestedHeights = measureNestedTablix(nested).heights;
     nestedRows.forEach((row, index) => rowOffsets.push(point(rowOffsets.at(-1) + nestedHeights[index])));
     for (const [rowIndex, row] of nestedRows.entries()) {
@@ -1739,7 +1791,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         applyFillFontAlignment(target, owner.style || {}, owner.context);
         target.border = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item));
         const childCellLeft = left;
-        for (const child of cell.nestedTablixes || []) renderNested(child, childCellLeft, parentRowIndex, top);
+        for (const child of cell.nestedTablixes || []) renderNested(child, childCellLeft, parentRowIndex, top, nestedTop(cell, child));
       }
     }
   };
@@ -1776,7 +1828,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       applyFillFontAlignment(target, owner.style || {}, owner.context);
       if (hasNested) {
         applyRegionStyle(worksheet, range, owner.style || {}, owner.context, { includeBorders: false });
-        for (const nested of owner.cell.nestedTablixes || []) renderNested(nested, left, rowIndex);
+        for (const nested of owner.cell.nestedTablixes || []) renderNested(nested, left, rowIndex, 0, nestedTop(owner.cell, nested));
         // The child grid writes its own cells inside this region, so the enclosing cell's box goes on last
         // and only on the perimeter: applied first it would be overwritten by the child's first row, and
         // applied to the anchor cell it would draw this cell's bottom rule across its top physical row.

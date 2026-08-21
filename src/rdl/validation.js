@@ -607,7 +607,11 @@ export function needsAdvancedMaterialization(tablix) {
   // emit those once per group instance rather than once per source row.
   return (tablix.rowMemberPaths || []).some((path) => {
     const leaf = path[path.length - 1];
-    if (leaf?.group) return false;
+    // A leaf member that IS a group with GroupExpressions has no detail rows beneath it, so SSRS emits
+    // its template ONCE PER GROUP INSTANCE. The flat path walks the row stream and would repeat the
+    // template once per source row instead, multiplying the region by the group's rows-per-instance.
+    // Only the recursive walk partitions the rows into instances, so route this shape there too.
+    if (leaf?.group) return Boolean(leaf.group.expressions?.length);
     return path.some((member) => member.group?.expressions?.length);
   });
 }
