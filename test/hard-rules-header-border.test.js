@@ -42,6 +42,22 @@ const flatTablixRdl = `<?xml version="1.0"?>
 
 const request = (rowCount) => ({ parameters: {}, datasets: { D: Array.from({ length: rowCount }, (_, i) => ({ V: `Row ${i}` })) } });
 
+// SSRS renders a GROUPED leaf member once per group instance, so a grouped leaf can never vertically
+// merge its own row header. A vertical merge requires the group to own DETAIL rows: the group's header
+// cell then spans every physical row of that instance. Rebuild `groupMember` into that real RDL shape
+// (Group g -> Details) so the merge tests certify the construct SSRS actually produces.
+const withDetailRows = (tablix, groupMember) => {
+  const detailMember = structuredClone(tablix.rowMembers[0]);
+  detailMember.group = {
+    name: 'Details', expressions: [], pageBreak: 'None', filters: [], parent: null, variables: [], domainScope: null, naturalGroup: false,
+  };
+  detailMember.header = null;
+  detailMember.children = [];
+  groupMember.children = [detailMember];
+  tablix.rowMembers = [groupMember];
+  tablix.rowMemberPaths = [[groupMember, detailMember]];
+};
+
 test('a tablix static column-header row is marked to repeat, even without RepeatColumnHeaders in the RDL', () => {
   const m = parseRdl(flatTablixRdl);
   const tablix = m.body.items.find((item) => item.type === 'Tablix');
@@ -291,8 +307,7 @@ test('a vertical-merge owner reaching the last row carries the enforced bottom b
   const rowHeaderCell = structuredClone(detailRow.cells[0]);
   dynamicMember.header = { size: 72, cell: rowHeaderCell };
   tablix.rows = [detailRow];
-  tablix.rowMembers = [dynamicMember];
-  tablix.rowMemberPaths = [[dynamicMember]];
+  withDetailRows(tablix, dynamicMember);
   tablix.rowHeaderColumns = [72];
   tablix.columns = [72, ...tablix.bodyColumns];
   tablix.width += 72;
@@ -326,8 +341,7 @@ test('oversized tablix output uses one bordered native page table per canonical 
   rowHeaderTextbox.paragraphs = [[{ value: 'GROUP_HEADER_ONLY', markupType: 'None', style: rowHeaderTextbox.style }]];
   dynamicMember.header = { size: 72, cell: rowHeaderCell };
   tablix.rows = [detailRow];
-  tablix.rowMembers = [dynamicMember];
-  tablix.rowMemberPaths = [[dynamicMember]];
+  withDetailRows(tablix, dynamicMember);
   tablix.rowHeaderColumns = [72];
   tablix.columns = [72, ...tablix.bodyColumns];
   tablix.width += 72;

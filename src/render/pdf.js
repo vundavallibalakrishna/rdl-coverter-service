@@ -27,6 +27,17 @@ const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
 // standard typographic orphan minimum and matches Word's default widow/orphan control.
 const MINIMUM_FLOWED_TEXT_LINES = 2;
 
+// Two free-form canvas peers share a horizontal lane when their declared boxes overlap on the x axis.
+// Growth only displaces peers in the same lane, so items designed side by side stay side by side.
+function canvasLanesOverlap(left, right) {
+  const leftStart = left.left || 0;
+  const leftEnd = leftStart + (left.width || 0);
+  const rightStart = right.left || 0;
+  const rightEnd = rightStart + (right.width || 0);
+  return leftStart < rightEnd - COINCIDENT_EDGE_TOLERANCE_PT
+    && rightStart < leftEnd - COINCIDENT_EDGE_TOLERANCE_PT;
+}
+
 // PageBreak is a property of EVERY RDL report item, not only of a direct <Body> child: a rectangle nested
 // inside another rectangle, or a tablix inside one, carries the same property with the same meaning. RDL
 // makes BreakLocation a plain enum while Disabled is expression-capable, so only Disabled resolves through
@@ -1078,6 +1089,76 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     ));
     return layout.height;
   };
+  // Draw a nested data region that is taller than one printable page, continuing its rows on further
+  // pages instead of painting a single block through the footer band and off the sheet. The region's own
+  // leading header rows repeat above every fragment, exactly like a top-level tablix continuation.
+  // `screenY` is the page coordinate of the region's first row; the returned value is the page coordinate
+  // its last fragment ended at, on whatever page the walk finished on.
+  const drawNestedTablixAcrossPages = (nested, parentX, screenY, availableWidth) => {
+    const top = nested.item.top || 0;
+    const allRows = nested.rows || [];
+    const full = nestedLayout(nested, availableWidth);
+    const heightByRow = new Map(allRows.map((row, index) => [row, full.heights[index]]));
+    const leadingHeaders = [];
+    for (const row of allRows) {
+      if (!row.isHeader) break;
+      leadingHeaders.push(row);
+    }
+    const dataRows = allRows.slice(leadingHeaders.length);
+    const headerHeight = leadingHeaders.reduce((sum, row) => sum + (heightByRow.get(row) || 0), 0);
+    let cursor = screenY;
+    let offset = 0;
+    try {
+      while (true) {
+        const available = pageBottom - cursor;
+        // First estimate the slice from the whole-region row heights, then measure the slice itself. A
+        // fragment is a tablix in its own right: dropping rows changes which grid column each remaining
+        // cell occupies (a row-span from an earlier row no longer covers it), so its rows can measure
+        // taller than they did in the full region. Shrink until the measured fragment really fits.
+        const budget = Math.max(1, available - headerHeight);
+        let end = offset;
+        let used = 0;
+        while (end < dataRows.length) {
+          const next = heightByRow.get(dataRows[end]) || 0;
+          if (end > offset && used + next > budget) break;
+          used += next;
+          end += 1;
+          if (used >= budget) break;
+        }
+        if (end === offset) end = offset + 1;
+        let fragmentHeight = 0;
+        while (true) {
+          nested.rows = [...leadingHeaders, ...dataRows.slice(offset, end)];
+          fragmentHeight = nestedLayout(nested, availableWidth).height;
+          if (fragmentHeight <= available + 0.5 || end <= offset + 1) break;
+          end -= 1;
+        }
+        if (fragmentHeight > available + 0.5) {
+          // One child row plus the repeated headers does not fit here. Retry on an empty page; a row that
+          // does not fit even there cannot be represented by row-level continuation, so fail closed rather
+          // than drawing it through the footer band.
+          if (cursor > addPage.bodyTop + 0.5) {
+            addPage();
+            cursor = addPage.bodyTop;
+            continue;
+          }
+          throw new ServiceError(
+            'UNSUPPORTED_FEATURE',
+            `One row of nested tablix ${nested.item.name || 'unnamed'} exceeds one printable page`,
+          );
+        }
+        drawNestedTablix(nested, parentX, cursor - top, availableWidth);
+        cursor += fragmentHeight;
+        offset = end;
+        if (offset >= dataRows.length) break;
+        addPage();
+        cursor = addPage.bodyTop;
+      }
+    } finally {
+      nested.rows = allRows;
+    }
+    return cursor;
+  };
   let y = startY;
   let fragmentStartY = startY;
   let firstFragment = true;
@@ -1495,34 +1576,75 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const drawables = [];
     for (const canvasItem of cell.items || []) {
       if (canvasItem.type === 'Tablix' || canvasItem.type === 'Subreport') continue;
+      const declaredHeight = canvasItem.height || 0;
+      let actualHeight = declaredHeight;
+      let drawHeight;
+      // A CanGrow textbox on a canvas is sized by its content, exactly as it is inside a tablix cell.
+      // Measuring it here is what lets the displacement below push its later peers clear of the extra
+      // lines; drawing it at the declared height instead let long values run under the next item.
+      if (canvasItem.type === 'Textbox' && canvasItem.canGrow && !isHidden(canvasItem.hidden, canvasContext)) {
+        const text = textForItem(canvasItem, canvasContext);
+        const padding = styleSize(canvasItem.style?.paddingTop, canvasContext, 2)
+          + styleSize(canvasItem.style?.paddingBottom, canvasContext, 2);
+        actualHeight = Math.max(
+          declaredHeight,
+          measureTextboxHeight(doc, config, canvasItem, canvasContext, text, canvasItem.width) + padding,
+        );
+        drawHeight = actualHeight;
+      }
       drawables.push({
         top: canvasItem.top || 0,
-        declaredHeight: canvasItem.height || 0,
-        actualHeight: canvasItem.height || 0,
-        draw: (screenY) => drawSimpleItem(doc, config, model, canvasItem, x + (canvasItem.left || 0), screenY, canvasContext),
+        left: canvasItem.left || 0,
+        width: canvasItem.width || 0,
+        declaredHeight,
+        actualHeight,
+        draw: (screenY) => (drawHeight === undefined
+          ? drawSimpleItem(doc, config, model, canvasItem, x + (canvasItem.left || 0), screenY, canvasContext)
+          : drawTextbox(doc, config, canvasItem, x + (canvasItem.left || 0), screenY, canvasContext, { height: drawHeight })),
       });
     }
     for (const nested of cell.nestedTablixes || []) {
       const top = nested.item.top || 0;
+      const nestedGeometry = nestedLayout(nested, width);
       drawables.push({
         top,
+        left: nested.item.left || 0,
+        width: nestedGeometry.width,
         declaredHeight: nested.item.height || 0,
-        actualHeight: nestedLayout(nested, width).height,
+        actualHeight: nestedGeometry.height,
         // drawNestedTablix positions at parentY + item.top, so pass parentY = screenY - item.top.
         draw: (screenY) => drawNestedTablix(nested, x, screenY - top, width),
+        // A child data region is a flow, not an atomic report item: when it is taller than a printable
+        // page SSRS continues its rows on the next page. Expose that so the canvas loop can paginate it
+        // instead of drawing one over-long block past the body boundary.
+        paginate: (screenY) => drawNestedTablixAcrossPages(nested, x, screenY, width),
       });
     }
     drawables.sort((left, right) => left.top - right.top || (left.declaredHeight - right.declaredHeight));
-    // SSRS vertical displacement: when a region renders taller than its design height, items below it are
-    // pushed down by the growth so they do not overlap. Tracked as a running offset added to each later
-    // item's design top.
-    let displacement = 0;
+    // SSRS vertical displacement: an item that renders taller than its design height pushes the items
+    // BELOW it down by that growth, preserving their declared gap. Only a peer that shares its horizontal
+    // lane is pushed — two items side by side in disjoint left/right lanes stay side by side instead of
+    // being serialized. This is the same rule the section and container layouts apply.
+    for (const [index, drawable] of drawables.entries()) {
+      drawable.resolvedTop = drawable.top;
+      for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
+        const previous = drawables[previousIndex];
+        const previousDesignBottom = previous.top + previous.declaredHeight;
+        if (previousDesignBottom > drawable.top + COINCIDENT_EDGE_TOLERANCE_PT) continue;
+        if (!canvasLanesOverlap(previous, drawable)) continue;
+        const declaredGap = Math.max(0, drawable.top - previousDesignBottom);
+        drawable.resolvedTop = Math.max(
+          drawable.resolvedTop,
+          previous.resolvedTop + previous.actualHeight + declaredGap,
+        );
+      }
+    }
     let windowStart = 0;
     let pageTop = y;
     let windowBottom = windowStart + (pageBottom - pageTop);
     let cursor = y;
     for (const drawable of drawables) {
-      const displacedTop = drawable.top + displacement;
+      const displacedTop = drawable.resolvedTop;
       const itemBottom = displacedTop + drawable.actualHeight;
       const startsBelowWindow = displacedTop >= windowBottom - 0.5;
       const overflowsWindow = itemBottom > windowBottom + 0.5;
@@ -1534,10 +1656,20 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         windowBottom = windowStart + (pageBottom - pageTop);
       }
       const screenY = pageTop + (displacedTop - windowStart);
+      if (!canFitFreshPage && drawable.paginate) {
+        // The region is taller than an empty page, so it continues across pages by rows. Re-anchor the
+        // canvas window on the page and offset the last fragment ended at, so the following canvas items
+        // keep their design gaps relative to the region's real bottom instead of its off-page one.
+        const endY = drawable.paginate(screenY);
+        windowStart = displacedTop + drawable.actualHeight;
+        pageTop = endY;
+        windowBottom = windowStart + (pageBottom - pageTop);
+        cursor = endY;
+        continue;
+      }
       if (cellBackground) doc.save().fillColor(cellBackground).rect(x, screenY, width, Math.max(0, drawable.actualHeight)).fill().restore();
       drawable.draw(screenY);
       cursor = Math.max(cursor, screenY + drawable.actualHeight);
-      displacement += Math.max(0, drawable.actualHeight - drawable.declaredHeight);
     }
     y = cursor;
   };

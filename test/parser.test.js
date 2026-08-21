@@ -245,10 +245,13 @@ test('tablix materialization keeps RunningValue Nothing outside one-row nested g
     { Name: 'twenty-b', Amount: 20 },
   ];
 
+  // A leaf member that IS a group emits ONE row per group instance (SSRS), so the three distinct
+  // Amounts render as three rows in ascending sort order. RunningValue(..., Nothing) must still count
+  // across the whole region rather than restart inside each one-row nested group scope.
   const materialized = materializeTablixRows(tablix, source, {}, {}, { Sales: source });
   assert.deepEqual(
     materialized.filter((row) => !row.isHeader).map((row) => row.cells[0].values[0]),
-    ['1', '2', '2', '3'],
+    ['1', '2', '3'],
   );
 });
 
