@@ -1139,6 +1139,25 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const isCanvasCell = (cell) => (cell.items || []).some((entry) => (
     entry.type === 'Line' || entry.type === 'Chart' || entry.type === 'Image'
   ));
+  // RDL CellContents holds exactly ONE report item. A Textbox there fills the cell, so its declared
+  // Top/Left/Width/Height are irrelevant and the single-textbox fast path is exact. A Rectangle there is a
+  // CANVAS: the flattened children keep their own declared position and size inside it. Drawing one of those
+  // children stretched across the whole cell puts it in the wrong place and makes it swallow its positioned
+  // siblings — which the page-locked Word renderer must then refuse as overlapping regions. A textbox that
+  // shares its cell with a nested data region is therefore drawn item-by-item, like a Line/Chart/Image
+  // canvas. Row measurement is deliberately untouched: only free-form media cells take their height from
+  // the content extent, so this row keeps its declared height and pagination is unchanged.
+  const isFreeFormCell = (cell) => {
+    const items = cell.items || [];
+    if (isCanvasCell(cell)) return true;
+    const textboxes = items.filter((entry) => entry.type === 'Textbox');
+    // Every textbox must declare its own box on the canvas. RDL defaults an omitted Width/Height to zero,
+    // so drawing an undeclared one positioned would silently erase its text; such a cell keeps the
+    // fill-the-cell path and, if that genuinely overlaps, still fails closed rather than losing content.
+    return textboxes.length > 0
+      && textboxes.every((entry) => (entry.width || 0) > 0 && (entry.height || 0) > 0)
+      && items.some((entry) => entry.type === 'Tablix' || entry.type === 'Subreport');
+  };
   const canvasCellExtent = (cell, width) => Math.max(
     0,
     ...(cell.items || []).filter((entry) => entry.type !== 'Tablix' && entry.type !== 'Subreport')
@@ -1336,7 +1355,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       // than as one textbox filling the cell. Its nested tablixes are drawn by the loop below, so those are
       // excluded here. A plain data cell (one textbox) keeps the fast path unchanged.
       const cellItems = cell.items || [];
-      if (isCanvasCell(cell) && !cell.hidden) {
+      if (isFreeFormCell(cell) && !cell.hidden) {
         const cellStyle = textbox?.style || item.style || {};
         const cellBackground = styleColor(cellStyle.backgroundColor, cellContext, null);
         if (cellBackground) doc.save().fillColor(cellBackground).rect(x, y, width, renderedHeight).fill().restore();

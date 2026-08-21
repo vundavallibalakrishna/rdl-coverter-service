@@ -365,7 +365,13 @@ function visibleBorderWidth(border, context = {}) {
 // Record only sibling edges whose vertical spans overlap and whose horizontal difference is no greater
 // than the visible shared-edge stroke. Those two physical coordinates then become one native grid edge.
 // Larger/intentional overlaps remain distinct and still fail closed in mergeSafe.
-function collectEquivalentXEdges(items, target, context, parentLeft = 0, parentTop = 0) {
+//
+// Every vertically-overlapping sibling pair is examined, not only adjacent entries in the left-sorted
+// order. A sibling list interleaves items from different vertical bands — a report whose whole body is
+// hoisted into one list routinely puts an unrelated data region's left edge between two boxes that
+// genuinely share a rule — so the box that actually shares an edge is usually not the immediate
+// predecessor, and its shared stroke went unrecorded until the merge itself failed closed.
+function collectEquivalentXEdgePairs(items, pairs, context, parentLeft = 0, parentTop = 0) {
   const positioned = (items || []).map((item) => {
     // Match collectXBoundaries/renderFreeformItem exactly: round the positioned origin first, then add
     // dimensions. Rounding the combined expression instead creates a different quarter-point edge.
@@ -377,27 +383,91 @@ function collectEquivalentXEdges(items, target, context, parentLeft = 0, parentT
       right: point(left + (item.width || 0)),
       top,
       bottom: point(top + (item.height || 0)),
+      rightBorder: visibleBorderWidth(item.style?.borders?.right, context),
+      leftBorder: visibleBorderWidth(item.style?.borders?.left, context),
     };
   }).sort((left, right) => left.left - right.left || left.top - right.top);
 
-  for (let index = 1; index < positioned.length; index += 1) {
-    const previous = positioned[index - 1];
-    const current = positioned[index];
-    const verticallyOverlaps = previous.top < current.bottom && current.top < previous.bottom;
-    if (!verticallyOverlaps) continue;
-    const previousWidth = visibleBorderWidth(previous.item.style?.borders?.right, context);
-    const currentWidth = visibleBorderWidth(current.item.style?.borders?.left, context);
-    const tolerance = Math.max(1 / POINT_PRECISION, previousWidth, currentWidth);
-    if (Math.abs(previous.right - current.left) <= tolerance) {
-      const canonical = point((previous.right + current.left) / 2);
-      target.set(previous.right, canonical);
-      target.set(current.left, canonical);
+  // No pair can be equivalent once the gap exceeds the widest stroke any sibling declares, so the forward
+  // scan stops there instead of comparing every item with every other one.
+  const reach = Math.max(
+    1 / POINT_PRECISION,
+    ...positioned.map((entry) => Math.max(entry.rightBorder, entry.leftBorder)),
+  );
+  for (let index = 0; index < positioned.length; index += 1) {
+    const previous = positioned[index];
+    for (let other = index + 1; other < positioned.length; other += 1) {
+      const current = positioned[other];
+      if (current.left - previous.right > reach) break;
+      const verticallyOverlaps = previous.top < current.bottom && current.top < previous.bottom;
+      if (!verticallyOverlaps) continue;
+      const tolerance = Math.max(1 / POINT_PRECISION, previous.rightBorder, current.leftBorder);
+      if (Math.abs(previous.right - current.left) <= tolerance) {
+        pairs.push({ from: previous.right, to: current.left, tolerance });
+      }
     }
   }
 
   for (const entry of positioned) {
-    collectEquivalentXEdges(entry.item.items, target, context, entry.left, entry.top);
+    collectEquivalentXEdgePairs(entry.item.items, pairs, context, entry.left, entry.top);
   }
+}
+
+// Resolves the recorded pairs into one canonical coordinate per equivalence cluster. Clustering rather
+// than writing each pair straight into the map keeps the result independent of the order the pairs were
+// discovered in: three boxes meeting at one rule contribute two pairs sharing a coordinate, and
+// last-write-wins would otherwise let the second pair strand the first one on a stale canonical edge.
+function resolveEquivalentXEdges(pairs) {
+  const parent = new Map();
+  const extent = new Map();
+  const find = (value) => {
+    let root = value;
+    while (parent.get(root) !== root) root = parent.get(root);
+    let cursor = value;
+    while (parent.get(cursor) !== root) {
+      const next = parent.get(cursor);
+      parent.set(cursor, root);
+      cursor = next;
+    }
+    return root;
+  };
+  const add = (value) => {
+    if (parent.has(value)) return;
+    parent.set(value, value);
+    extent.set(value, [value, value]);
+  };
+  for (const { from, to, tolerance } of pairs) {
+    add(from);
+    add(to);
+    const fromRoot = find(from);
+    const toRoot = find(to);
+    if (fromRoot === toRoot) continue;
+    const [fromLow, fromHigh] = extent.get(fromRoot);
+    const [toLow, toHigh] = extent.get(toRoot);
+    const low = Math.min(fromLow, toLow);
+    const high = Math.max(fromHigh, toHigh);
+    // Chaining is legitimate — three boxes really can share one rule — but a cluster may never grow wider
+    // than the stroke that justified joining it, or an edge would move further than the border it hides.
+    if (high - low > tolerance) continue;
+    const root = Math.min(fromRoot, toRoot);
+    const merged = Math.max(fromRoot, toRoot);
+    parent.set(merged, root);
+    extent.set(root, [low, high]);
+    extent.delete(merged);
+  }
+  const clusters = new Map();
+  for (const value of parent.keys()) {
+    const root = find(value);
+    if (!clusters.has(root)) clusters.set(root, []);
+    clusters.get(root).push(value);
+  }
+  const aliases = new Map();
+  for (const members of clusters.values()) {
+    if (members.length < 2) continue;
+    const canonical = point((Math.min(...members) + Math.max(...members)) / 2);
+    for (const value of members) aliases.set(value, canonical);
+  }
+  return aliases;
 }
 
 function visiblePageBreak(item, context) {
@@ -646,10 +716,13 @@ function reportGrid(model, section, request, globals, tablixCache) {
   const spans = new Set();
   collectXBoundaries(model.page.header?.items || [], request, globals, model, tablixCache, boundaries, spans);
   collectXBoundaries(section, request, globals, model, tablixCache, boundaries, spans);
-  const aliases = new Map();
   const context = { parameters: request.parameters || {}, globals, fields: {} };
-  collectEquivalentXEdges(model.page.header?.items || [], aliases, context);
-  collectEquivalentXEdges(section, aliases, context);
+  // Header and body edges are resolved together: they address the same worksheet column grid, so a rule
+  // shared across the band boundary has to land on one coordinate.
+  const equivalentEdgePairs = [];
+  collectEquivalentXEdgePairs(model.page.header?.items || [], equivalentEdgePairs, context);
+  collectEquivalentXEdgePairs(section, equivalentEdgePairs, context);
+  const aliases = resolveEquivalentXEdges(equivalentEdgePairs);
   const maximum = Math.max(...boundaries, point(model.page.width - model.page.marginLeft - model.page.marginRight));
   boundaries.add(maximum);
   const values = [...new Set([...boundaries]
