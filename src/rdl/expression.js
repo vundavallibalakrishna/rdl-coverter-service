@@ -168,11 +168,49 @@ function scopeRows(scopeArgument, context) {
   return context.dataset || [];
 }
 
+// A running aggregate accumulates in the order the DATA REGION processes its rows. That is the grouped and
+// sorted sequence the tablix emits, which is not the order the dataset arrived in: grouping alone reorders
+// rows without any SortExpression. Accumulating in arrival order gave every row the rank it held in the
+// raw dataset, so the classic `RunningValue(Fields!Id.Value, CountDistinct, Nothing)` serial-number column
+// rendered scrambled (…7, 8, 9, 3, 2…) instead of counting down the visible column. Materialization records
+// the emitted sequence; rank the resolved scope by it so ordinary aggregates keep the untouched row set and
+// only the order-sensitive ones move.
+const regionRankCache = new WeakMap();
+
+function regionRowRank(order) {
+  if (!Array.isArray(order) || order.length === 0) return null;
+  const cached = regionRankCache.get(order);
+  if (cached) return cached;
+  const rank = new Map();
+  order.forEach((row, index) => {
+    if (row && typeof row === 'object' && !rank.has(row)) rank.set(row, index);
+  });
+  regionRankCache.set(order, rank);
+  return rank;
+}
+
+function inRegionProcessingOrder(rows, context) {
+  const rank = regionRowRank(context.regionRowOrder);
+  if (!rank || !Array.isArray(rows) || rows.length < 2) return rows;
+  // Rows the region never emitted (an unrendered scope, or direct evaluator use) sort last in their
+  // existing order, so an incomplete record can only leave the sequence as it already was.
+  const rankOf = (row) => (rank.has(row) ? rank.get(row) : Number.MAX_SAFE_INTEGER);
+  if (rows.every((row) => !rank.has(row))) return rows;
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((left, right) => rankOf(left.row) - rankOf(right.row) || left.index - right.index)
+    .map((entry) => entry.row);
+}
+
 // RunningValue/RowNumber give Nothing a different meaning from an omitted aggregate scope: it is the
 // outermost containing scope and therefore does not reset at each nested group. Materialization exposes
 // that processed (filtered/sorted) data-region row sequence through the dataset/data-region scope map.
 // Falling back to context.dataset preserves direct evaluator use where there is no tablix context.
 function runningScopeRows(scopeArgument, context) {
+  return inRegionProcessingOrder(resolvedRunningScopeRows(scopeArgument, context), context);
+}
+
+function resolvedRunningScopeRows(scopeArgument, context) {
   const scope = scopeArgument ? evaluateArgument(scopeArgument, context) : null;
   if (scope !== null && scope !== undefined && scope !== '') {
     if (context.scopes && Object.prototype.hasOwnProperty.call(context.scopes, scope)) return context.scopes[scope];

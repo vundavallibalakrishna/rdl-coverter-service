@@ -236,6 +236,10 @@ export function materializedCellContext(cell, row, {
     globals,
     dataset: cell?.scopeDataset ?? row?.scopeDataset ?? dataset,
     outermostDataset: cell?.regionDataset ?? row?.regionDataset ?? undefined,
+    // The data region's emitted row sequence, which is what a running aggregate accumulates over. Without
+    // it a re-evaluated RowNumber/RunningValue falls back to dataset arrival order and disagrees with the
+    // value materialization already produced for the same cell.
+    regionRowOrder: cell?.regionRowOrder ?? row?.regionRowOrder ?? undefined,
     datasets,
     scopes: cell?.scopes ?? row?.scopes ?? {},
     tablixDatasetName: cell?.tablixDatasetName ?? row?.tablixDatasetName ?? undefined,

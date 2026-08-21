@@ -512,6 +512,9 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     // rows and the data-region scope names, RowNumber(Nothing)/RunningValue(..., Nothing) silently
     // collapsed to the innermost group at render time and returned 1 for every row.
     regionDataset: context.outermostDataset || context.dataset || [],
+    // The data region's emitted row sequence, so a re-evaluated running aggregate accumulates in the same
+    // processing order materialization used rather than in dataset arrival order.
+    regionRowOrder: context.regionRowOrder ?? null,
     tablixDatasetName: context.tablixDatasetName ?? null,
     tablixName: context.tablixName ?? null,
     previousInstance: context.previousInstance,
@@ -978,6 +981,27 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
   walkMembers(tablix.rowMembers, sourceRows, dataRegionScopes(tablix, sourceRows), [], 0);
 
+  // The order this walk emitted rows in IS the order the data region processes them: grouping reorders
+  // rows relative to the dataset even with no SortExpression, and a member sort reorders them again.
+  // Running aggregates (RowNumber, RunningValue) accumulate in that processing order, so record it here.
+  //
+  // Only the finest leaf kind the region actually emits defines the sequence. A coarser leaf carries a
+  // whole scope at once — a static leaf outside every group carries the entire region in dataset arrival
+  // order — so mixing kinds would let the coarsest one claim every row first and reinstate exactly the
+  // arrival order this exists to replace.
+  const ORDERING_ROLES = ['detail', 'group', 'header', 'footer'];
+  const orderingRole = ORDERING_ROLES.find((role) => units.some((unit) => unit.role === role)) || null;
+  const regionRowOrder = [];
+  const recordedRows = new Set();
+  for (const unit of orderingRole ? units : []) {
+    if (unit.role !== orderingRole) continue;
+    for (const row of (orderingRole === 'detail' ? unit.nestedDataset : unit.dataset) || []) {
+      if (!row || typeof row !== 'object' || recordedRows.has(row)) continue;
+      recordedRows.add(row);
+      regionRowOrder.push(row);
+    }
+  }
+
   // Visibility changes the physical row sequence, so remove hidden units before calculating vertical
   // spans. Counting a hidden unit and then dropping it later makes an ancestor span one row too far and
   // overlap the first row of the next group instance.
@@ -990,6 +1014,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       globals,
       dataset: unit.dataset,
       outermostDataset: sourceRows,
+      regionRowOrder,
       nestedDataset: unit.nestedDataset,
       datasets,
       scopes: unit.scopes,
@@ -1022,6 +1047,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       globals,
       dataset: unit.dataset,
       outermostDataset: sourceRows,
+      regionRowOrder,
       datasets,
       scopes: unit.scopes,
       previousInstance: unit.previousInstance,
@@ -1074,6 +1100,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           globals,
           dataset: intersection,
           outermostDataset: sourceRows,
+          regionRowOrder,
           nestedDataset: intersection,
           datasets,
           scopes: { ...unit.scopes, ...column.scopes },
@@ -1111,6 +1138,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       scopeDataset: unit.dataset,
       scopes: unit.scopes,
       regionDataset: sourceRows,
+      regionRowOrder,
       tablixDatasetName: tablix.datasetName,
       tablixName: tablix.name,
       previousInstance: unit.previousInstance,
@@ -1138,6 +1166,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           globals,
           dataset: sourceRows,
           outermostDataset: sourceRows,
+          regionRowOrder,
           datasets,
           scopes: dataRegionScopes(tablix, sourceRows),
           tablixDatasetName: tablix.datasetName,
@@ -1160,6 +1189,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
           globals,
           dataset: header.rows,
           outermostDataset: sourceRows,
+          regionRowOrder,
           datasets,
           scopes: header.scopes,
           tablixDatasetName: tablix.datasetName,
@@ -1183,6 +1213,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
         fields: {},
         scopeDataset: sourceRows,
         regionDataset: sourceRows,
+        regionRowOrder,
         tablixDatasetName: tablix.datasetName,
         tablixName: tablix.name,
         height: tablix.rows[0]?.height || 18,
