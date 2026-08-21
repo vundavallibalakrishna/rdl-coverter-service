@@ -1005,7 +1005,15 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           dataset: nestedDatasets[nested.item.datasetName] || [],
           datasets: nestedDatasets,
         });
-        const style = textbox?.style || nested.item.style || {};
+        // A nested data region's container style supplies defaults for its cells. Textboxes commonly
+        // carry the foreground/font/border declarations but omit BackgroundColor, so selecting the
+        // textbox style wholesale drops a declared tablix fill (for example a merged blue header) and
+        // makes the span look like several unmerged white cells. Preserve textbox overrides while
+        // inheriting omitted container properties from the nested tablix.
+        const style = { ...(nested.item.style || {}), ...(textbox?.style || {}) };
+        if (textbox?.style?.backgroundColor === null || textbox?.style?.backgroundColor === undefined) {
+          style.backgroundColor = nested.item.style?.backgroundColor;
+        }
         const borderStyle = cellBorderStyle(cell, nested.item) || {};
         const background = styleColor(style.backgroundColor, context, null);
         if (background) doc.save().rect(x, cellY, width, height).fill(background).restore();

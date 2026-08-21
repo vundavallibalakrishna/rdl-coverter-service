@@ -426,16 +426,33 @@ function parseItem(type, value, defaultFontFamily) {
     };
   }
   if (type === 'Tablix') {
-    const rows = asArray(value.TablixBody?.TablixRows?.TablixRow).map((row) => ({
-      height: toPoints(textValue(row.Height, '18pt'), 18),
-      hidden: textValue(row.Visibility?.Hidden, 'false'),
-      cells: dropCoveredPlaceholders(asArray(row.TablixCells?.TablixCell).map((cell) => parseCell(cell, defaultFontFamily))),
-    }));
-    const bodyColumns = asArray(value.TablixBody?.TablixColumns?.TablixColumn).map((column) => toPoints(textValue(column.Width, '72pt'), 72));
+    const rawRows = asArray(value.TablixBody?.TablixRows?.TablixRow);
+    const rawBodyColumns = asArray(value.TablixBody?.TablixColumns?.TablixColumn)
+      .map((column) => toPoints(textValue(column.Width, '72pt'), 72));
     const rowMembers = asArray(value.TablixRowHierarchy?.TablixMembers?.TablixMember).map((member) => parseMember(member, defaultFontFamily));
     const columnMembers = asArray(value.TablixColumnHierarchy?.TablixMembers?.TablixMember).map((member) => parseMember(member, defaultFontFamily));
     const rowMemberPaths = leafMemberPaths(rowMembers);
     const columnMemberPaths = leafMemberPaths(columnMembers);
+    // A static hidden column is removed from the physical grid, as SSRS does. Keeping its tiny declared
+    // width creates a phantom right edge (often a doubled border) and prevents merged cells from closing
+    // at the visible table boundary. Expression-backed visibility remains in the model for render-time
+    // handling; only literal Hidden=true is safe to eliminate during normalization.
+    const hiddenColumn = (index) => {
+      const path = columnMemberPaths.length === rawBodyColumns.length
+        ? columnMemberPaths[index]
+        : (columnMemberPaths.length === 1 ? columnMemberPaths[0] : null);
+      return Boolean(path?.length && path.every((member) => String(member.hidden).trim().toLowerCase() === 'true'));
+    };
+    const visibleColumnIndexes = rawBodyColumns.map((_, index) => index).filter((index) => !hiddenColumn(index));
+    const bodyColumns = visibleColumnIndexes.map((index) => rawBodyColumns[index]);
+    const rows = rawRows.map((row) => ({
+      height: toPoints(textValue(row.Height, '18pt'), 18),
+      hidden: textValue(row.Visibility?.Hidden, 'false'),
+      cells: dropCoveredPlaceholders(visibleColumnIndexes
+        .map((index) => asArray(row.TablixCells?.TablixCell)[index])
+        .filter(Boolean)
+        .map((cell) => parseCell(cell, defaultFontFamily))),
+    }));
     const headerColumns = rowHeaderColumns(rowMemberPaths);
     // Dynamic column groups (matrix / cross-tab) are detected here so the whole downstream pipeline
     // (column expansion, intersection scoping, renderers) can gate on it and leave static-column

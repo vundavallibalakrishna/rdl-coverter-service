@@ -466,6 +466,29 @@ test('dropCoveredPlaceholders removes only the empty cells a preceding span cove
   assert.deepEqual(result.map((cell) => cell.items.length), [1, 1, 0]);
 });
 
+test('removes a literal-hidden tablix body column from the physical grid', () => {
+  const hiddenColumnRdl = `<?xml version="1.0"?>
+    <Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+      <ReportSections><ReportSection><Body><ReportItems><Tablix Name="HiddenBodyColumn">
+        <TablixBody><TablixColumns><TablixColumn><Width>0.03125in</Width></TablixColumn></TablixColumns>
+          <TablixRows><TablixRow><Height>0.2in</Height><TablixCells><TablixCell><CellContents>
+            <Textbox Name="HiddenCell"><Value>not visible</Value></Textbox>
+          </CellContents></TablixCell></TablixCells></TablixRow></TablixRows>
+        </TablixBody>
+        <TablixColumnHierarchy><TablixMembers><TablixMember><Visibility><Hidden>true</Hidden></Visibility></TablixMember></TablixMembers></TablixColumnHierarchy>
+        <TablixRowHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixRowHierarchy>
+        <Width>0.03125in</Width><Height>0.2in</Height>
+      </Tablix></ReportItems><Height>1in</Height></Body>
+      <Width>3in</Width><Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth>
+        <LeftMargin>0.5in</LeftMargin><RightMargin>0.5in</RightMargin><TopMargin>0.5in</TopMargin><BottomMargin>0.5in</BottomMargin>
+      </Page></ReportSection></ReportSections>
+    </Report>`;
+  const tablix = parseRdl(hiddenColumnRdl).body.items[0];
+  assert.deepEqual(tablix.bodyColumns, []);
+  assert.deepEqual(tablix.columns, []);
+  assert.equal(tablix.rows[0].cells.length, 0);
+});
+
 test('the Combined Assurance Table 2 keeps every visible leaf header on a distinct grid column', {
   skip: hasSamples(COMBINED_ASSURANCE) ? false : MISSING_SAMPLES,
 }, () => {

@@ -1094,7 +1094,16 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
     const descriptors = unitDescriptors[index];
     const rowHeaders = [];
-    const staticSpans = unit.role === 'static' ? headerSpans(descriptors, rowHeaderColumns) : [];
+    // A group header/footer can be a full-width static band (its declared header size equals the whole
+    // row-header grid), even though the recursive walk labels it `header`/`footer`. Only promote that
+    // explicit geometry; ordinary nested group headers retain their hierarchy-column span.
+    const rowHeaderWidth = rowHeaderColumns.reduce((sum, width) => sum + width, 0);
+    const fullWidthBand = ['header', 'footer'].includes(unit.role)
+      && descriptors.length === 1
+      && descriptors[0].header.size >= rowHeaderWidth - 0.5;
+    const staticSpans = unit.role === 'static' || fullWidthBand
+      ? headerSpans(descriptors, rowHeaderColumns)
+      : [];
     descriptors.forEach((descriptor, descriptorIndex) => {
       const key = descriptorValue(unit, descriptors, descriptor);
       const previous = index > 0 ? unitDescriptors[index - 1].find((entry) => entry.member === descriptor.member) : null;
@@ -1120,7 +1129,7 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
     // Materialize the unowned tail as a real blank grid cell so body cells always begin after the complete
     // row-header grid. Active ancestor row spans occupy the earlier columns and are skipped by placement.
     const rowHeaderTail = Math.max(0, rowHeaderColumns.length - descriptors.length);
-    if (rowHeaderTail > 0 && unit.role !== 'static') {
+    if (rowHeaderTail > 0 && unit.role !== 'static' && !fullWidthBand) {
       rowHeaders.push({ colSpan: rowHeaderTail, rowSpan: 1, items: [], values: [], hidden: false, isRowHeader: true });
     }
 

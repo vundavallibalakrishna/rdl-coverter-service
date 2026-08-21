@@ -1261,9 +1261,13 @@ async function renderFreeformBand({
 
 function cellStyle(item, cell, context) {
   const textbox = cellTextbox(cell);
+  const style = { ...(item.style || {}), ...(textbox?.style || {}) };
+  if (textbox?.style?.backgroundColor === null || textbox?.style?.backgroundColor === undefined) {
+    style.backgroundColor = item.style?.backgroundColor;
+  }
   return {
     textbox,
-    style: textbox?.style || item.style,
+    style,
     borderStyle: cellBorderStyle(cell, item),
     context,
   };
