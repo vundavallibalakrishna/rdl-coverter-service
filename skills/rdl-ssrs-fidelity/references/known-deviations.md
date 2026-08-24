@@ -56,6 +56,34 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
 
 ## Verified fixed (kept for regression awareness)
 
+- **XLSX columns were ~5 px narrow each, so dates rendered as `#####`.** `excelWidthFromPoints` converted a
+  point width with the widely-quoted `width = (pixels − 5) / maxDigitWidth`, subtracting Excel's per-cell
+  inset. Excel does not add that inset back: it renders a stored width `w` at exactly `w * 7` device pixels
+  (verified through Excel COM — stored 10 → 70 px, stored 20 → 140 px). Every grid column therefore came out
+  5 px (3.75 pt) short, and an RDL column that the shared grid slices into N columns came out 5N px short.
+  Text merely clipped so nobody noticed; a date or number is never clipped by Excel — it becomes `#####`, so
+  a "Due Date" column declared at 53.17 pt arrived as 45 pt and its value disappeared. Fixed by converting
+  `points → pixels / maxDigitWidth` with no inset; the inset stays where it belongs, in text measurement
+  (`EXCEL_CELL_TEXT_INSET_PT`). Impact is whole-sheet: on the client report the detail sheet went from
+  704 pt wide to 829 pt, against a printable report width of ~828 pt, and Excel now reports the Due Date
+  merge at 53.25 pt against the RDL's 53.171 pt. PDF/DOCX are unaffected (they never used this conversion);
+  the corpus PDFs are byte-identical. Regression: `test/excel-column-geometry.test.js`.
+  Ref: `sizing-and-growth.md`.
+
+- **Chart picture silently lost slices in Word/Excel (PDF looked fine).** A chart's strings are absolutely
+  positioned, never flowed, but `fillText` called `doc.text(..., { width })` without a `height`. PDFKit
+  treats a string that reaches the bottom of the page as overflowing body copy: its `LineWrapper` calls
+  `continueOnNewPage()`, so that label **and everything drawn after it** move to a new page. `renderChartPng`
+  draws each chart onto a one-page document exactly the size of the chart and rasterizes with
+  `-singlefile`, so the spill was discarded — a pie whose bottom outside label touched the page edge lost
+  its remaining slice and embedded as a half-circle in DOCX_EDITABLE and XLSX, while the same chart on a
+  tall PDF report page was correct. (The same hazard could have injected a stray page into the report PDF
+  itself.) Fixed in `fillText` (`chart.js`): an explicit `height` bounds the wrapper, which then clips at
+  the chart edge — what SSRS does — instead of paginating. `renderChartPng` also asserts its document
+  stayed one page and fails with `RENDER_FAILED` rather than embedding an incomplete chart. Reproduced from
+  the client's own pre-fix DOCX (identical media SHA-1s) and still reachable under current geometry for
+  short shape charts. Regression: `test/chart-image-single-page.test.js`. Ref: `charts-and-axes.md`.
+
 - **Shape-chart empty points took a legend entry and a palette colour.** SSRS calls a data point whose value
   is `Nothing`/null an EMPTY POINT. On a shape chart (pie/doughnut) it draws no slice, takes **no legend
   entry**, and consumes **no palette colour**, so the points after it keep the colours they would have had
