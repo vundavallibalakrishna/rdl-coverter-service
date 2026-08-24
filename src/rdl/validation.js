@@ -495,6 +495,10 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
           datasets: childDatasets,
           globals: childGlobals,
           subreport: true,
+          // SSRS honours KeepTogether from the invoking Subreport item, not from the child report body's
+          // own tablix. Record it here so pagination can tell "keep this subreport on one page" apart from
+          // whatever the child definition declares.
+          keepTogether: item.keepTogether,
         });
         continue;
       }
@@ -524,6 +528,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
         datasets: childDatasets,
         globals: childGlobals,
         subreport: true,
+        keepTogether: item.keepTogether,
       });
     }
   }

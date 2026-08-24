@@ -1620,6 +1620,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         width: nestedGeometry.width,
         declaredHeight: nested.item.height || 0,
         actualHeight: nestedGeometry.height,
+        // A bundled subreport records the invoking Subreport's KeepTogether; a native nested tablix
+        // declares it on the tablix itself.
+        keepTogether: Boolean(nested.keepTogether === undefined ? nested.item.keepTogether : nested.keepTogether),
         // drawNestedTablix positions at parentY + item.top, so pass parentY = screenY - item.top.
         draw: (screenY) => drawNestedTablix(nested, x, screenY - top, width),
         // A child data region is a flow, not an atomic report item: when it is taller than a printable
@@ -1657,17 +1660,22 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const startsBelowWindow = displacedTop >= windowBottom - 0.5;
       const overflowsWindow = itemBottom > windowBottom + 0.5;
       const canFitFreshPage = drawable.actualHeight <= (pageBottom - addPage.bodyTop) + 0.5;
-      if ((startsBelowWindow || overflowsWindow) && canFitFreshPage && cursor > addPage.bodyTop + 0.5) {
+      // A child data region on the canvas is a flow, not an atomic report item: SSRS breaks between its
+      // rows so the current page is filled. Only a region that declares KeepTogether (or an item that
+      // starts past this page entirely, where nothing of it could be drawn here) moves whole.
+      const splittableRegion = Boolean(drawable.paginate) && !drawable.keepTogether;
+      const movesWhole = startsBelowWindow || (overflowsWindow && !splittableRegion);
+      if (movesWhole && canFitFreshPage && cursor > addPage.bodyTop + 0.5) {
         addPage();
         windowStart = displacedTop;
         pageTop = addPage.bodyTop;
         windowBottom = windowStart + (pageBottom - pageTop);
       }
       const screenY = pageTop + (displacedTop - windowStart);
-      if (!canFitFreshPage && drawable.paginate) {
-        // The region is taller than an empty page, so it continues across pages by rows. Re-anchor the
-        // canvas window on the page and offset the last fragment ended at, so the following canvas items
-        // keep their design gaps relative to the region's real bottom instead of its off-page one.
+      if (drawable.paginate && screenY + drawable.actualHeight > pageBottom + 0.5) {
+        // The region does not fit the space left below it, so it continues across pages by rows. Re-anchor
+        // the canvas window on the page and offset the last fragment ended at, so the following canvas
+        // items keep their design gaps relative to the region's real bottom instead of its off-page one.
         const endY = drawable.paginate(screenY);
         windowStart = displacedTop + drawable.actualHeight;
         pageTop = endY;
@@ -1701,81 +1709,104 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // use their existing pagination path and must not recursively request a continuation page themselves.
     const atFreshContentStart = y <= addPage.bodyTop + repeatedHeaderHeight + 0.5;
     const hasNestedTablix = row.cells.some((cell) => (cell.nestedTablixes || []).length > 0);
-    // A nested data region is a complete child grid. Move the containing row intact when it fits on a fresh
-    // page; splitting it as if it were plain textbox characters would lose child rows and shared borders.
-    // If the complete child grid is itself taller than a page, fail closed until recursive child pagination
-    // can preserve both grids rather than emitting a misleading partial table.
+    // SSRS breaks a page at the deepest boundary that can still fill it. A parent row holding a child data
+    // region (nested tablix or bundled subreport) is therefore NOT atomic: the break falls between the
+    // child region's own rows and the remainder continues on the next page. The whole row moves only when
+    // something declares KeepTogether (the owning tablix member, or the child region itself) and the row
+    // still fits a fresh page, or when the child grid cannot be split — it has no data rows, or two
+    // children would have to be split in step, which would need synchronized child grids.
     if (hasNestedTablix && y + measured > pageBottom) {
-      if (!atFreshContentStart) {
-        startContinuationPage();
-        measured = measureRow(row, remainingTexts);
-      }
-      if (y + measured > pageBottom) {
-        const nestedOwners = row.cells.flatMap((cell, cellIndex) => (cell.nestedTablixes || [])
-          .map((nested) => ({ cell, cellIndex, nested })));
-        const oversized = nestedOwners.filter(({ nested, cellIndex }) => (
-          (nested.item.top || 0) + nestedLayout(
-            nested,
-            layoutsForRow(row)[cellIndex]?.width || totalWidth,
-          ).height > freshPageCapacity
-        ));
-        // A bundled subreport is an independent child data region and may legitimately exceed one parent
-        // page. Split its physical child rows across parent page fragments. Multiple independently tall
-        // children in one parent row require synchronized grids and remain fail-closed.
-        if (oversized.length !== 1 || !oversized[0].nested.subreport) {
+      const nestedOwners = row.cells.flatMap((cell, cellIndex) => (cell.nestedTablixes || [])
+        .map((nested) => ({ cell, cellIndex, nested })));
+      const childExtent = ({ nested, cellIndex }) => (nested.item.top || 0) + nestedLayout(
+        nested,
+        layoutsForRow(row)[cellIndex]?.width || totalWidth,
+      ).height;
+      // A child data region carries its own KeepTogether. For a bundled subreport that property belongs to
+      // the invoking Subreport item, so the materialized entry records it separately from the child report
+      // body's own tablix; a native nested tablix declares it on the tablix itself.
+      const childKeepsTogether = ({ nested }) => Boolean(
+        nested.keepTogether === undefined ? nested.item.keepTogether : nested.keepTogether,
+      );
+      const splitOwnerFor = (available, honorKeepTogether) => {
+        const overflowing = nestedOwners.filter((owner) => childExtent(owner) > available);
+        if (overflowing.length !== 1) return null;
+        const [candidate] = overflowing;
+        if (!(candidate.nested.rows || []).some((nestedRow) => !nestedRow.isHeader)) return null;
+        if (honorKeepTogether && childKeepsTogether(candidate)) return null;
+        return candidate;
+      };
+      const keepRowTogether = row.keepSpanTogether || nestedOwners.some(childKeepsTogether);
+      let owner = keepRowTogether ? null : splitOwnerFor(pageBottom - y, true);
+      if (!owner) {
+        if (!atFreshContentStart) {
+          startContinuationPage();
+          measured = measureRow(row, remainingTexts);
+        }
+        if (y + measured <= pageBottom) {
+          drawRowContent(row, measured, remainingTexts);
+          return;
+        }
+        // Taller than an empty page: KeepTogether is best-effort, so the child grid must split anyway.
+        owner = splitOwnerFor(freshPageCapacity, false);
+        if (!owner) {
           throw new ServiceError('UNSUPPORTED_FEATURE', `Nested tablix in ${item.name || 'unnamed'} exceeds one printable page`);
         }
-        const owner = oversized[0];
-        const ownerLayout = layoutsForRow(row)[owner.cellIndex];
-        const nested = owner.nested;
-        const originalRows = nested.rows;
-        const leadingHeaders = [];
-        for (const nestedRow of originalRows) {
-          if (!nestedRow.isHeader) break;
-          leadingHeaders.push(nestedRow);
-        }
-        const dataRows = originalRows.slice(leadingHeaders.length);
-        const fullLayout = nestedLayout(nested, ownerLayout.width);
-        const heightByRow = new Map(originalRows.map((nestedRow, index) => [nestedRow, fullLayout.heights[index]]));
-        const headerHeight = leadingHeaders.reduce((sum, nestedRow) => sum + (heightByRow.get(nestedRow) || 0), 0);
-        let offset = 0;
-        let firstChildFragment = true;
-        try {
-          while (offset < dataRows.length || (dataRows.length === 0 && firstChildFragment)) {
-            const available = pageBottom - y;
-            const childBudget = Math.max(1, available - (nested.item.top || 0) - headerHeight);
-            let end = offset;
-            let used = 0;
-            while (end < dataRows.length) {
-              const next = heightByRow.get(dataRows[end]) || dataRows[end].height || 0;
-              if (end > offset && used + next > childBudget) break;
-              used += next;
-              end += 1;
-              if (used >= childBudget) break;
-            }
-            if (end === offset && offset < dataRows.length) end += 1;
-            nested.rows = [...leadingHeaders, ...dataRows.slice(offset, end)];
-            const fragmentTexts = firstChildFragment ? remainingTexts : remainingTexts.map(() => '');
-            const fragmentHeight = measureRow(row, fragmentTexts);
-            if (fragmentHeight > available + 0.5) {
-              throw new ServiceError(
-                'UNSUPPORTED_FEATURE',
-                `One nested subreport row in ${item.name || 'unnamed'} exceeds one printable page`,
-              );
-            }
-            const complete = end >= dataRows.length;
-            drawRowContent(row, fragmentHeight, fragmentTexts, complete);
-            offset = end;
-            firstChildFragment = false;
-            if (!complete) startContinuationPage(row);
-            if (dataRows.length === 0) break;
-          }
-        } finally {
-          nested.rows = originalRows;
-        }
-        return;
       }
-      drawRowContent(row, measured, remainingTexts);
+      const ownerLayout = layoutsForRow(row)[owner.cellIndex];
+      const nested = owner.nested;
+      const originalRows = nested.rows;
+      const leadingHeaders = [];
+      for (const nestedRow of originalRows) {
+        if (!nestedRow.isHeader) break;
+        leadingHeaders.push(nestedRow);
+      }
+      const dataRows = originalRows.slice(leadingHeaders.length);
+      const fullLayout = nestedLayout(nested, ownerLayout.width);
+      const heightByRow = new Map(originalRows.map((nestedRow, index) => [nestedRow, fullLayout.heights[index]]));
+      const headerHeight = leadingHeaders.reduce((sum, nestedRow) => sum + (heightByRow.get(nestedRow) || 0), 0);
+      let offset = 0;
+      let firstChildFragment = true;
+      try {
+        while (offset < dataRows.length || (dataRows.length === 0 && firstChildFragment)) {
+          const available = pageBottom - y;
+          const childBudget = Math.max(1, available - (nested.item.top || 0) - headerHeight);
+          let end = offset;
+          let used = 0;
+          while (end < dataRows.length) {
+            const next = heightByRow.get(dataRows[end]) || dataRows[end].height || 0;
+            if (end > offset && used + next > childBudget) break;
+            used += next;
+            end += 1;
+            if (used >= childBudget) break;
+          }
+          if (end === offset && offset < dataRows.length) end += 1;
+          nested.rows = [...leadingHeaders, ...dataRows.slice(offset, end)];
+          const fragmentTexts = firstChildFragment ? remainingTexts : remainingTexts.map(() => '');
+          const fragmentHeight = measureRow(row, fragmentTexts);
+          if (fragmentHeight > available + 0.5) {
+            // The smallest fragment (the child's headers plus one child row, beside the parent row's own
+            // text) does not fit what is left of this page. SSRS moves it to the next page rather than
+            // drawing into the footer band; only a fragment that cannot fit an empty page is unsupported.
+            if (y > addPage.bodyTop + headerMeasurements().total + 0.5) {
+              startContinuationPage(firstChildFragment ? null : row);
+              continue;
+            }
+            throw new ServiceError(
+              'UNSUPPORTED_FEATURE',
+              `One nested subreport row in ${item.name || 'unnamed'} exceeds one printable page`,
+            );
+          }
+          const complete = end >= dataRows.length;
+          drawRowContent(row, fragmentHeight, fragmentTexts, complete);
+          offset = end;
+          firstChildFragment = false;
+          if (!complete) startContinuationPage(row);
+          if (dataRows.length === 0) break;
+        }
+      } finally {
+        nested.rows = originalRows;
+      }
       return;
     }
     if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart) {
