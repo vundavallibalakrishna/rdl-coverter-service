@@ -41,6 +41,24 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
 
 ## Verified fixed (kept for regression awareness)
 
+- **Parent row holding a child data region was treated as atomic (large blank page tail).** SSRS breaks a
+  page at the deepest boundary that can still fill it: a tablix row whose cell holds a child data region
+  (nested tablix or bundled subreport) is *not* atomic — the break falls between the **child** region's own
+  rows, so the current page is filled and the remainder continues on the next page. A whole-row move is
+  correct only when KeepTogether is declared on the child region (`Subreport`/`Tablix`) or on the owning
+  tablix member, and the row still fits a fresh page. The engine moved the row to a fresh page whenever it
+  did not fit the remainder, and split the child only when the child grid exceeded an *entire* page — so a
+  child region a little taller than what remained stranded up to a full page of white space (observed: 74%
+  of a page blank, and one extra page in the document). Fixed in `renderTablix`/`drawRow` (`pdf.js`): the
+  overflowing child region is now split at a child-row boundary in place, with the fresh-page move reserved
+  for the KeepTogether/unsplittable cases; the same rule was applied to the List/canvas cell path
+  (`drawCanvasRow`), which had the identical "move the whole region" behavior. `validation.js` now carries
+  the invoking `Subreport`'s `KeepTogether` onto the materialized nested entry, since that — not the child
+  report body's own tablix — is the property SSRS honors for subreport content. Shared-layer fix: PDF owns
+  pagination, `DOCX_EDITABLE` and `DOCX_VISUAL` inherit it from the canonical trace/raster, and XLSX has no
+  pagination. Regression: `test/nested-region-page-fill.test.js` (split + KeepTogether counterexamples for
+  both nested tablix and bundled subreport, plus DOCX_EDITABLE and XLSX coverage). Ref: `page-and-flow.md`.
+
 - **Row-span group header duplicated across a page break (DOCX overlap).** A row-span (merged) group-header
   cell whose group crossed a page boundary could be emitted twice at one origin, so DOCX_EDITABLE failed
   with "Overlapping editable PDF regions" (native Word cells cannot overlap; PDF and XLSX tolerate it). Root
