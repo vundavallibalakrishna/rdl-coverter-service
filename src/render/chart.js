@@ -5,6 +5,12 @@ import { color as resolveColor, isHidden, styleColor, styleSize, styleText, styl
 const AXIS_COLOR = '#d9d9d9';
 const TICK_LABEL_COLOR = '#595959';
 const LABEL_COLOR = '#000000';
+// SSRS shape-chart callout geometry: the radial stub and the horizontal elbow are each this fraction of
+// the shape radius, and the label starts this far past the elbow.
+const PIE_CALLOUT_SEGMENT_RATIO = 0.2;
+const PIE_CALLOUT_TEXT_GAP_PT = 3.5;
+// A bisector pointing straight up or down has a cosine of ±1e-16; treat that as pointing right.
+const COINCIDENT_ANGLE_TOLERANCE = 1e-9;
 
 // Rounds an axis maximum up to a readable value and picks a tick interval, matching how SSRS lays out
 // a numeric value axis (0-based, "nice" 1/2/5·10ⁿ steps).
@@ -329,7 +335,15 @@ function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
   if (total <= 0) return;
   const explosionRatio = chart.exploded && points.length > 1 ? 0.1 : 0;
   const outerLimit = Math.max(10, Math.min(plot.width, plot.height) / 2 - 8);
-  const radius = Math.max(10, outerLimit / (1 + explosionRatio));
+  // SSRS draws an outside shape-chart label as a callout — a radial stub off the slice edge, then a
+  // horizontal elbow, with the label starting at the elbow. It shrinks the shape so the whole callout
+  // (both segments plus the gap before the text) stays inside the plot rectangle; only the label text
+  // itself may reach past it. Reserve that band here instead of letting the callout run over the edge.
+  const hasOutsideLabels = points.some((point) => point.label && /outside/i.test(point.labelPosition || ''));
+  const calloutBudget = hasOutsideLabels
+    ? Math.max(10, (outerLimit - PIE_CALLOUT_TEXT_GAP_PT) / (1 + 2 * PIE_CALLOUT_SEGMENT_RATIO))
+    : outerLimit;
+  const radius = Math.max(10, calloutBudget / (1 + explosionRatio));
   const explosion = radius * explosionRatio;
   const inner = radius * innerRatio;
   const centerX = plot.x + plot.width / 2;
@@ -357,16 +371,30 @@ function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
     for (let step = steps; step >= 0; step -= 1) doc.lineTo(...at(angle + (sweep * step) / steps, inner, offsetX, offsetY));
     doc.fill().restore();
     if (point.label) {
+      // The label box is measured from the text itself. A fixed-width box wraps a value that is merely
+      // a few points wider than the guess ("1 (50.0%)" became two lines), which SSRS never does.
+      const labelWidth = doc.widthOfString(String(point.label)) + 1;
+      const labelHalfHeight = doc.currentLineHeight() / 2;
       if (/outside/i.test(point.labelPosition || '')) {
-        const [lineStartX, lineStartY] = at(middle, radius * 0.92, offsetX, offsetY);
-        const [lineEndX, lineEndY] = at(middle, radius + 9, offsetX, offsetY);
+        const segment = radius * PIE_CALLOUT_SEGMENT_RATIO;
+        const [stubX, stubY] = at(middle, radius, offsetX, offsetY);
+        const [elbowX, elbowY] = at(middle, radius + segment, offsetX, offsetY);
+        // The elbow follows the horizontal direction of the bisector. A bisector that is vertical has a
+        // cosine of ±1e-16, so compare against a tolerance: a floating-point sign must not decide which
+        // side of the shape the label sits on (SSRS puts a straight-up/straight-down callout on the right).
+        const right = Math.cos(middle) >= -COINCIDENT_ANGLE_TOLERANCE;
+        const elbowEndX = elbowX + (right ? segment : -segment);
         const calloutColor = styleColor(chart.seriesDefs?.[0]?.customProperties?.PieLineColor, context, '#000000');
-        doc.save().lineWidth(0.75).strokeColor(calloutColor).moveTo(lineStartX, lineStartY).lineTo(lineEndX, lineEndY).stroke().restore();
-        const right = Math.cos(middle) >= 0;
-        fillText(doc, point.label, right ? lineEndX + 2 : lineEndX - 42, lineEndY - 4, { width: 40, align: right ? 'left' : 'right' });
+        doc.save().lineWidth(0.75).strokeColor(calloutColor)
+          .moveTo(stubX, stubY).lineTo(elbowX, elbowY).lineTo(elbowEndX, elbowY)
+          .stroke().restore();
+        const textX = right
+          ? elbowEndX + PIE_CALLOUT_TEXT_GAP_PT
+          : elbowEndX - PIE_CALLOUT_TEXT_GAP_PT - labelWidth;
+        fillText(doc, point.label, textX, elbowY - labelHalfHeight, { width: labelWidth, align: right ? 'left' : 'right' });
       } else {
         const [labelX, labelY] = at(middle, inner + (radius - inner) * 0.55, offsetX, offsetY);
-        fillText(doc, point.label, labelX - 12, labelY - 4, { width: 24, align: 'center' });
+        fillText(doc, point.label, labelX - labelWidth / 2, labelY - labelHalfHeight, { width: labelWidth, align: 'center' });
       }
     }
     angle += sweep;

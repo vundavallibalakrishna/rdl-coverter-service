@@ -6,6 +6,21 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
 
 ## Open
 
+- **Shape-chart radius is smaller than SSRS's.** With outside labels, SSRS sized a 335×229.5 pt pie chart's
+  radius to 69.8 pt; this engine now produces 59.4 pt for the same chart. The callout reservation itself
+  matches SSRS (`1.4·r + gap ≈ half of the plot's smaller dimension`, verified against two SSRS charts), so
+  the difference is the *plot rectangle*: `drawChart` insets the chart by 8 pt horizontally and 6 pt
+  vertically, adds another 6 pt above the plot, and reserves 8 pt between the plot and the legend, where
+  SSRS reserves ≈0 and lets the legend sit flush. Fix: derive the chart content box and legend gutter from
+  SSRS's own metrics, with a corpus diff over every chart type before landing (the insets are shared by
+  bar/column/line/area/scatter). Ref: `charts-and-axes.md`.
+
+- **`Format` = `d`/`g` use `Intl` short patterns, not the .NET ones.** `d` under en-US renders `5/15/26`
+  where .NET/SSRS render `5/15/2026`; `formatNet` does not implement the single-letter *date* specifiers at
+  all (`NUMERIC_HINT_RE` claims them first), so only the `formatValue` path handles them. Fix: implement the
+  .NET standard date/time specifiers (`d D f F g G m M o R s t T u U y`) from the culture's own patterns.
+  Ref: `value-formatting.md`.
+
 - **No-format date order is not culture-reordered.** The no-format DateTime default is a fixed
   `dd/MM/yyyy HH:mm:ss` regardless of culture, so an en-US report shows `dd/MM` order for a *no-format*
   DateTime instead of `M/d`. Explicit formats and standard specifiers (`d`,`D`,`g`,`G`) already reorder by
@@ -40,6 +55,40 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
   single precedence winner in the edge-flush layer. Ref: `border-resolution.md`.
 
 ## Verified fixed (kept for regression awareness)
+
+- **Shape-chart empty points took a legend entry and a palette colour.** SSRS calls a data point whose value
+  is `Nothing`/null an EMPTY POINT. On a shape chart (pie/doughnut) it draws no slice, takes **no legend
+  entry**, and consumes **no palette colour**, so the points after it keep the colours they would have had
+  without it. A zero is a real value and keeps both. The engine allocated `palette[categoryIndex]` and built
+  the legend from every category, so one `=IIF(x > 0, Count(x), Nothing)` point shifted every later slice by
+  one palette colour and added a phantom legend row. Fixed in `materializeChart` (`chartData.js`), the layer
+  all four renderers share. Verified against a real SSRS 2019 export of the same report: legend and slice
+  colours now match exactly. Ref: `charts-and-axes.md`.
+
+- **Outside shape-chart labels had no callout elbow.** SSRS draws an outside pie/doughnut label as a
+  callout: a radial stub off the slice edge, then a **horizontal elbow**, with the label starting past the
+  elbow and vertically centred on it; and it shrinks the shape so the whole callout stays inside the plot.
+  The engine drew a single short radial tick and placed the text beside it, with the side chosen by
+  `Math.cos(middle) >= 0` — which flips on the ±1e-16 cosine of a vertical bisector, so two equal slices put
+  their labels on opposite sides. Fixed in `drawPieChart` (`chart.js`): two-segment callout, a
+  tolerance-based side test, and a radius budget that reserves the callout band. Measured from the SSRS
+  raster: stub ≈ elbow ≈ 0.20·r, label gap ≈ 3.5 pt. Ref: `charts-and-axes.md`.
+
+- **Shape-chart data labels wrapped inside a fixed-width box.** Inside labels were drawn into a hardcoded
+  24 pt box and outside labels into a 40 pt box, so `1 (50.0%)` broke across two lines. The box is now the
+  measured width of the text. Ref: `charts-and-axes.md`.
+
+- **Unzoned DateTime values rendered the previous day.** An RDL DateTime is a wall-clock value: SSRS renders
+  exactly what it was given and never converts time zones. Every formatter here reads a Date through its UTC
+  accessors, but `new Date('2026-05-15T00:00:00')` — a date-time with no offset — is parsed by JavaScript as
+  **local** time, so on any host east of UTC midnight became the previous day in UTC (`15/05/2026` rendered
+  as `14/05/2026`) and the same inputs rendered differently on different servers, breaking determinism.
+  Fixed with one shared parser, `parseDateValue` (`src/rdl/dateValue.js`): an ISO-like value with no `Z` or
+  `±HH:MM` is built from UTC components; a value that names a real instant keeps the standard parse. Applied
+  in `format.js` (`coerceDate`), `expression.js` (`toDate` and the no-format date path),
+  `functions/shared.js` (`toDate`), `validation.js` (DateTime parameter validation and canonicalization),
+  and `excel.js` (typed date cells). Regression: `test/datetime-wall-clock.test.js`, including a sweep over
+  four host time zones so a UTC build machine cannot hide the defect. Ref: `value-formatting.md`.
 
 - **Parent row holding a child data region was treated as atomic (large blank page tail).** SSRS breaks a
   page at the deepest boundary that can still fill it: a tablix row whose cell holds a child data region

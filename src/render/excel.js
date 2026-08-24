@@ -6,6 +6,7 @@ import path from 'node:path';
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression, resolveReportCulture } from '../rdl/expression.js';
+import { parseDateValue } from '../rdl/dateValue.js';
 import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleText, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
@@ -115,7 +116,7 @@ function excelCellValue(cell, context) {
   }
   // A DateTime value (a Date, or an ISO-8601 string from parameter/field coercion) becomes a live typed
   // Excel date so the workbook carries a real date, matching the PDF/DOCX text treatment of the same value.
-  const asDate = raw instanceof Date ? raw : (isDateLikeValue(raw) ? new Date(raw) : null);
+  const asDate = raw instanceof Date ? raw : (isDateLikeValue(raw) ? parseDateValue(raw) : null);
   if (asDate && !Number.isNaN(asDate.getTime())) {
     // No format resolves to general date/time (date and time) to match SSRS and the PDF/DOCX text default.
     if (!format) return { value: asDate, numFmt: DEFAULT_EXCEL_DATETIME_FORMAT };

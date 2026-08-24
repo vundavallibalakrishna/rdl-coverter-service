@@ -3,6 +3,7 @@ import { FUNCTION_REGISTRY } from './functions/index.js';
 import { CUSTOM_CODE_FUNCTION_REGISTRY } from './functions/customCode.js';
 import { formatNet } from './format.js';
 import { canonicalizeCulture, currencyForCulture } from './culture.js';
+import { parseDateValue } from './dateValue.js';
 
 // The report's effective culture for `globals.culture`: a literal Language canonicalized at parse time, or
 // an `=expression` Language resolved here against the render context. Null when no Language is declared.
@@ -102,8 +103,8 @@ export function formatValue(value, format, culture = null) {
     return new Intl.NumberFormat(numericLocale, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(Number(value));
   }
   if (value instanceof Date || /^\d{4}-\d{2}-\d{2}/.test(String(value))) {
-    const date = new Date(value);
-    if (!Number.isNaN(date.getTime())) {
+    const date = parseDateValue(value);
+    if (date) {
       // No Format on a DateTime resolves to .NET's general date/time long pattern (date AND time, with
       // seconds) — the value's default ToString under the report culture, exactly what SSRS renders. A bare
       // date would drop the time SSRS shows (e.g. a footer =Globals!ExecutionTime). Explicit formats below
@@ -231,10 +232,8 @@ function resolvedRunningScopeRows(scopeArgument, context) {
 }
 
 function toDate(value) {
-  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
   if (value === null || value === undefined || value === '') return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
+  return parseDateValue(value);
 }
 
 // VB.NET DateAdd: add `count` of the given interval to a date. Uses UTC to match formatValue().

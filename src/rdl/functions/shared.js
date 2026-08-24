@@ -1,4 +1,5 @@
 import { ServiceError } from '../../errors.js';
+import { parseDateValue } from '../dateValue.js';
 
 // Shared, dependency-light coercion helpers for the expression-function registry. These must NOT import
 // from expression.js (that module imports the registry, so importing back would create a cycle). Each
@@ -30,8 +31,6 @@ export function toText(value) {
 
 // Parse a value to a Date (UTC-safe) or null. Mirrors expression.js toDate so date functions agree.
 export function toDate(value) {
-  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
   if (isBlank(value)) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
+  return parseDateValue(value);
 }

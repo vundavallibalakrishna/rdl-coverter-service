@@ -12,6 +12,7 @@
 //   timezone.
 
 import { currencyForCulture } from './culture.js';
+import { parseDateValue } from './dateValue.js';
 
 const DATE_TOKEN_RE = /(yyyy|yyy|yy|y|MMMM|MMM|MM|M|dddd|ddd|dd|d|HH|H|hh|h|mm|m|ss|s|tt)/;
 const NUMERIC_HINT_RE = /[#0]|^[CcNnPpFfDdEeGgRrXx]\d*$/;
@@ -94,8 +95,7 @@ function coerceDate(value) {
     if (trimmed === '') return null;
     // Avoid treating bare numeric strings as dates.
     if (/^-?\d+(\.\d+)?$/.test(trimmed)) return null;
-    const d = new Date(trimmed);
-    return Number.isNaN(d.getTime()) ? null : d;
+    return parseDateValue(trimmed);
   }
   return null;
 }
