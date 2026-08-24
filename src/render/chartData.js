@@ -99,12 +99,18 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
     : rows;
   const seriesGroups = grouped ? groupsFor(chart.series, seriesRows, base) : [{ label: seriesDef.name, rows: seriesRows }];
 
+  // A shape chart (pie/doughnut) consumes one palette colour and one legend entry PER DATA POINT, so an
+  // empty point changes what every later point looks like. Other chart types key the legend/palette off
+  // the series, where an empty cell only leaves a gap in that series' own line of points.
+  const shapeChart = chart.chartType === 'pie' || chart.chartType === 'doughnut';
+
   const series = seriesGroups.map((group, seriesIndex) => {
     const groupSet = new Set(group.rows);
     // For a grouped chart the colour is a property of the SERIES (e.g. Incident Type), so evaluate it
     // once from a row of this series. Evaluating per-cell would mis-colour empty cells, whose fallback
     // row belongs to a different series.
     const seriesColor = grouped ? pointColor(seriesDef.color, group.rows[0] || rows[0] || {}, base, seriesIndex, palette) : null;
+    let palettePosition = 0;
     const points = categories.map((category, categoryIndex) => {
       const cellRows = category.rows.filter((row) => groupSet.has(row));
       const first = cellRows[0] || category.rows[0] || rows[0] || {};
@@ -112,9 +118,17 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
       const raw = evaluateExpression(seriesDef.y, context);
       const numeric = raw === null || raw === undefined || raw === '' ? null : Number(raw);
       const y = Number.isFinite(numeric) ? numeric : null;
-      const color = grouped ? seriesColor : pointColor(seriesDef.color, first, base, categoryIndex, palette);
+      // SSRS calls a point whose value is Nothing/null an EMPTY POINT. On a shape chart it draws no
+      // slice, takes no legend entry, and consumes no palette colour, so the points after it keep the
+      // colours they would have had if the empty point had never been in the category list. A zero is a
+      // real value, not an empty point: it keeps its colour and legend entry and draws a zero-width slice.
+      const empty = y === null;
+      const paletteIndex = shapeChart ? palettePosition : categoryIndex;
+      const color = grouped ? seriesColor : pointColor(seriesDef.color, first, base, paletteIndex, palette);
+      if (!(shapeChart && empty)) palettePosition += 1;
       return {
         y,
+        empty,
         color,
         label: pointLabel(seriesDef.dataLabel, y, first, base),
         labelPosition: seriesDef.dataLabel?.position || 'Auto',
@@ -125,7 +139,12 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
 
   const legend = grouped
     ? series.map((entry) => ({ label: entry.label, color: entry.color || palette[0] }))
-    : categories.map((category, index) => ({ label: category.label, color: series[0]?.points[index]?.color || palette[index % palette.length] }));
+    : categories.reduce((entries, category, index) => {
+      const point = series[0]?.points[index];
+      if (shapeChart && point?.empty) return entries;
+      entries.push({ label: category.label, color: point?.color || palette[index % palette.length] });
+      return entries;
+    }, []);
 
   const maxY = Math.max(0, ...series.flatMap((entry) => entry.points.map((point) => point.y || 0)));
   return {

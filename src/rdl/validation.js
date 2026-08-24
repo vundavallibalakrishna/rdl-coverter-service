@@ -3,6 +3,7 @@ import { evaluateExpression, formatValue } from './expression.js';
 import { isBoundField, normalizeRowFields, rowKeyFor } from './fields.js';
 import { flattenCellItems, RENDERABLE_CELL_ITEMS } from './helpers.js';
 import { normalizeDisplayText, renderMarkupText } from './text.js';
+import { parseDateValue } from './dateValue.js';
 
 function hasValue(value) {
   return value !== undefined && value !== null && value !== '' && (!Array.isArray(value) || value.length > 0);
@@ -16,7 +17,7 @@ function validateParameterType(parameter, value) {
     if (parameter.dataType === 'Integer' && !Number.isInteger(Number(item))) throw new ServiceError('PARAMETER_INVALID', `Parameter ${parameter.name} must be an integer`);
     if (parameter.dataType === 'Float' && !Number.isFinite(Number(item))) throw new ServiceError('PARAMETER_INVALID', `Parameter ${parameter.name} must be numeric`);
     if (parameter.dataType === 'Boolean' && !['true', 'false'].includes(String(item).toLowerCase())) throw new ServiceError('PARAMETER_INVALID', `Parameter ${parameter.name} must be boolean`);
-    if (parameter.dataType === 'DateTime' && Number.isNaN(new Date(item).getTime())) throw new ServiceError('PARAMETER_INVALID', `Parameter ${parameter.name} must be an ISO date`);
+    if (parameter.dataType === 'DateTime' && !parseDateValue(item)) throw new ServiceError('PARAMETER_INVALID', `Parameter ${parameter.name} must be an ISO date`);
   }
 }
 
@@ -65,7 +66,7 @@ function canonicalParameterValue(parameter, value) {
   if (value === null || value === undefined) return null;
   if (parameter.dataType === 'Integer' || parameter.dataType === 'Float') return Number(value);
   if (parameter.dataType === 'Boolean') return String(value).toLowerCase() === 'true';
-  if (parameter.dataType === 'DateTime') return new Date(value).toISOString();
+  if (parameter.dataType === 'DateTime') return (parseDateValue(value)?.toISOString()) ?? String(value);
   return String(value);
 }
 
