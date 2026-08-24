@@ -20,7 +20,6 @@ const DEFAULT_ROW_POINTS = 15;
 const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
 const EXCEL_LAYOUT_DPI = 96;
 const EXCEL_MAX_DIGIT_WIDTH_PX = 7;
-const EXCEL_CELL_PADDING_PX = 5;
 const EXCEL_TEXT_CLEARANCE_PT = 2;
 // OOXML stores column widths in units derived from the workbook's maximum digit width. Excel then rounds
 // those widths again for the active viewer/font metrics. Reserving one standard 7-pixel digit cell during
@@ -618,14 +617,15 @@ function firstVisibleText(items, model, request, globals) {
   return '';
 }
 
+// Excel renders a stored column width `w` at exactly `w * maxDigitWidth` device pixels — it does NOT add
+// the per-cell inset back. (Verified against Excel itself: stored 10 renders 70 px, stored 20 renders
+// 140 px.) Subtracting the inset here therefore made every grid column ~5 px narrower than the RDL asked
+// for, and an RDL column that the shared grid splits into N slices lost 5N px. Text merely clipped, but a
+// date or number is never clipped by Excel — it becomes `#####`, so the value vanished entirely. The
+// per-cell inset belongs to text measurement (EXCEL_CELL_TEXT_INSET_PT), not to the column geometry.
 function excelWidthFromPoints(points) {
   const pixels = Math.max(1, points * (EXCEL_LAYOUT_DPI / 72));
-  return Math.max(
-    0.2,
-    pixels <= 12
-      ? pixels / 12
-      : (pixels - EXCEL_CELL_PADDING_PX) / EXCEL_MAX_DIGIT_WIDTH_PX,
-  );
+  return Math.max(0.05, pixels / EXCEL_MAX_DIGIT_WIDTH_PX);
 }
 
 function tablixLayout(item, request, globals, model, cache) {

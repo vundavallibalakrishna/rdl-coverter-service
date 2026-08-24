@@ -37,8 +37,20 @@ function setFont(doc, config, { size = 8, bold = false, italic = false, family =
   doc.font(pdfFont(config, family, bold, italic)).fontSize(size);
 }
 
+// Every string a chart draws is absolutely positioned, never flowed. Without an explicit `height` PDFKit
+// treats a string that reaches the bottom of the page as overflowing body copy: its line wrapper calls
+// `continueOnNewPage()`, so that label AND everything drawn after it land on a page nobody asked for. In
+// the chart-image document — one page exactly the size of the chart — that silently dropped whole slices
+// from the Word/Excel picture while the same chart drawn on a tall report page looked fine. Passing a
+// height bounds the wrapper (`LineWrapper` refuses to paginate once `height != null`) so chart text clips
+// at the chart edge, which is what SSRS does, instead of paginating.
+const CHART_TEXT_BLOCK_LINES = 4;
+
 function fillText(doc, text, x, y, options = {}) {
-  doc.save().fillColor(options.color || LABEL_COLOR).text(String(text), x, y, { lineBreak: false, ...options }).restore();
+  const height = options.height ?? Math.max(1, doc.currentLineHeight(true) * CHART_TEXT_BLOCK_LINES);
+  doc.save().fillColor(options.color || LABEL_COLOR)
+    .text(String(text), x, y, { lineBreak: false, ...options, height })
+    .restore();
 }
 
 function styleFont(doc, config, style, context, fallbackSize = 8) {
