@@ -395,6 +395,25 @@ export function cellTextbox(cell) {
 // leaving the neighbouring cells' shared edges to define the grid there, exactly as SSRS renders it.
 // Only a cell with no content at all falls back to the tablix style, which keeps synthesized blank grid
 // cells closed.
+// A tablix CellContents holds exactly ONE report item. A Textbox there fills the cell, so its declared
+// Top/Left/Width/Height are irrelevant. A Rectangle there is a CANVAS: the flattened children keep their
+// own declared position and size inside it, and each must be placed at that position rather than merged
+// into one cell value. Shared so PDF and Excel agree on which cells are canvases — Excel joined a canvas'
+// textboxes into a single (usually invisible) cell value until it used the same rule.
+export function isCanvasCell(cell) {
+  return (cell?.items || []).some((entry) => entry.type === 'Line' || entry.type === 'Chart' || entry.type === 'Image');
+}
+
+export function isFreeFormCell(cell) {
+  const items = cell?.items || [];
+  if (isCanvasCell(cell)) return true;
+  const textboxes = items.filter((entry) => entry.type === 'Textbox');
+  // Every textbox must declare its own box on the canvas. RDL defaults an omitted Width/Height to zero,
+  // so placing an undeclared one would silently erase its text; such a cell keeps the fill-the-cell path.
+  return textboxes.length > 0
+    && textboxes.every((entry) => (entry.width || 0) > 0 && (entry.height || 0) > 0)
+    && items.some((entry) => entry.type === 'Tablix' || entry.type === 'Subreport');
+}
 export function cellBorderStyle(cell, tablix) {
   const tablixStyle = tablix?.style;
   if (!cell) return tablixStyle;

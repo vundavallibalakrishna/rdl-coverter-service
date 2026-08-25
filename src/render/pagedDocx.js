@@ -733,7 +733,11 @@ async function pictureForItem(
       variables: model.variables || {},
       culture: resolveReportCulture(model, { parameters: request.parameters || {} }),
     };
-    const chartData = materializeChart(chart, datasets, request.parameters || {}, globals);
+    // Prefer the series the canonical PDF pass already resolved: it was materialized in the chart's own
+    // scope (a List/canvas cell or group instance sees only that instance's rows). Re-materializing here
+    // from the report-level datasets draws a different chart — every category in the dataset — so Word and
+    // the PDF disagreed. Fall back only for a trace written before charts carried their data.
+    const chartData = item.chartData || materializeChart(chart, datasets, request.parameters || {}, globals);
     const rendered = await renderChartPng(
       chart,
       chartData,

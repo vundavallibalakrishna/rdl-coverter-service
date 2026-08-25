@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleText, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isCanvasCell, isFreeFormCell, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleText, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -609,6 +609,11 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
       y,
       width: item.width,
       height: item.height,
+      // The chart's SCOPE lives in this context: inside a List/canvas cell or a group instance the chart
+      // sees that instance's rows, not the whole dataset. Word rasterizes charts from the canonical trace,
+      // so carry the resolved series here — re-materializing downstream from the report-level datasets
+      // redraws a different chart (every category in the dataset instead of the group's own).
+      chartData: data,
     });
     drawChart(doc, config, item, data, x, y, item.width, item.height, context);
   } else if (item.type === 'Image') drawImage(doc, model, item, x, y, context);
@@ -694,7 +699,7 @@ function splitTextForHeight(doc, config, textbox, context, text, width, height) 
   };
 }
 
-function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage, globals, statistics }) {
+function renderTablix({ doc, config, model, item, request, startX, startY, pageBottom, addPage: advancePage, globals, statistics }) {
   const tablixStartedAt = performance.now();
   const { rows, columns } = tablixRows(item, request, globals, model);
   const materializedAt = performance.now();
@@ -733,9 +738,15 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     return { style, context, fontSize, height: Math.max(10, fontSize * 1.5) };
   };
 
-  const drawContinuationMarker = (label, row) => {
+  const drawContinuationMarker = (label, row, options = {}) => {
     const { style, context, fontSize, height } = markerDetails(row);
-    const markerY = y;
+    // The marker is drawn for whichever region continued. A top-level tablix uses its own geometry and
+    // advances the shared cursor; a paginated CHILD region passes its own box and cursor instead, and
+    // takes the height back so it can advance its own.
+    const markerX = options.x ?? startX;
+    const markerWidth = options.width ?? totalWidth;
+    const markerTablixName = options.tablixName ?? (item.name || null);
+    const markerY = options.top ?? y;
     const markerStyle = {
       ...style,
       fontSize,
@@ -746,14 +757,14 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       verticalAlign: 'Middle',
     };
     doc.save();
-    doc.rect(startX, markerY, totalWidth, height).fill('#FFFFFF');
+    doc.rect(markerX, markerY, markerWidth, height).fill('#FFFFFF');
     const family = styleText(style.fontFamily, context, 'Arial');
     const fontFile = pdfFont(config, family, false, true, label);
     doc.font(fontFile)
       .fontSize(fontSize)
       .fillColor('#000000')
-      .text(label, startX + 2, markerY + Math.max(0, (height - fontSize) / 2 - 1), {
-        width: Math.max(1, totalWidth - 4), height, align: 'right', lineBreak: false,
+      .text(label, markerX + 2, markerY + Math.max(0, (height - fontSize) / 2 - 1), {
+        width: Math.max(1, markerWidth - 4), height, align: 'right', lineBreak: false,
       });
     // The marker already occupies this exact PDF region and advances `y` below. Trace the resolved native
     // text into that existing region so page-locked Word fills the canonical gap instead of inserting a
@@ -767,18 +778,18 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       family: String(family),
       file: fontFile,
     };
-    const textX = startX + totalWidth - 2 - textWidth;
+    const textX = markerX + markerWidth - 2 - textWidth;
     const baseline = font.metrics ? textY + font.metrics.ascender : textY;
     recordLayoutItem(doc, {
       kind: 'textbox',
       itemName: null,
-      tablixName: item.name || null,
+      tablixName: markerTablixName,
       traceRole: 'continuationMarker',
       continuation: true,
       zIndex: item.zIndex || 0,
-      x: startX,
+      x: markerX,
       y: markerY,
-      width: totalWidth,
+      width: markerWidth,
       height,
       text: label,
       lines: [{
@@ -805,8 +816,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       borders: { top: null, right: null, bottom: null, left: null },
     });
     doc.restore();
-    y += height;
-    addedHeight += height;
+    if (options.top === undefined) {
+      y += height;
+      addedHeight += height;
+    }
+    return height;
   };
 
   // Grid occupancy map: which cell (and its owning row) covers each grid position, so a cell can find
@@ -938,10 +952,74 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
     pendingEdges = [];
   };
+  // Collected edges belong to the page they were measured on, and they are stroked wherever the document
+  // happens to be when the flush runs. Only startContinuationPage used to flush, so every page break taken
+  // by the other pagination paths in this renderer — the List/canvas reflow and the nested-region
+  // continuation, which call addPage directly — carried a page's worth of borders forward. The result was
+  // a table with NO borders on the pages it actually occupies and a stray grid of them, at the previous
+  // pages' coordinates, painted over whatever content sat on the page where the flush finally landed.
+  // Wrapping the page advance keeps the invariant in one place: a page never closes with edges pending.
+  const addPage = (...args) => {
+    flushEdges();
+    return advancePage(...args);
+  };
+  addPage.bodyTop = advancePage.bodyTop;
   const drawEdges = (x, y, width, height, edges) => {
     for (const side of ['top', 'right', 'bottom', 'left']) {
       if (edges[side]) collectEdge(x, y, width, height, side, edges[side].border, edges[side].context);
     }
+  };
+  // Cell placement walks a data region's rows in order, carrying each row-span's occupancy forward. A page
+  // fragment of a child region is a SLICE of those rows, so recomputing placement from the slice alone
+  // loses every span that started in an earlier fragment: the cells to the right of a spanned row header
+  // shift left into the header's own columns — the child's grid silently re-flows mid-table. Placement is
+  // a property of the whole region, so resolve it once over the canonical rows and let every fragment read
+  // its own rows out of that map.
+  const canonicalPlacements = (nested, columnCount) => {
+    if (!nested.canonicalPlacements || nested.canonicalPlacements.columnCount !== columnCount) {
+      const canonical = nested.canonicalRows || [];
+      const computed = computeCellPlacements(canonical, columnCount);
+      const byRow = new Map(canonical.map((row, index) => [row, computed[index]]));
+      byRow.columnCount = columnCount;
+      nested.canonicalPlacements = byRow;
+    }
+    return nested.canonicalPlacements;
+  };
+  const nestedPlacements = (nested, rows, columnCount) => {
+    if (!nested.canonicalRows) return computeCellPlacements(rows, columnCount);
+    const byRow = canonicalPlacements(nested, columnCount);
+    let fallback = null;
+    return rows.map((row, index) => {
+      const placement = byRow.get(row);
+      if (placement) return placement;
+      fallback = fallback || computeCellPlacements(rows, columnCount);
+      return fallback[index];
+    });
+  };
+  // SSRS repeats a row header that spans into a continuation fragment: it keeps its value and its column,
+  // clipped to the rows the fragment shows. A slice that simply drops the spanning row leaves those columns
+  // empty and unruled for the rest of the region. Re-attach each still-open span to the fragment's first
+  // row, and register that row's placement so the carried cells keep the columns they hold in the region.
+  const carryOpenSpans = (nested, sliceStart, slice, columnCount) => {
+    const canonical = nested.canonicalRows;
+    if (!canonical || sliceStart <= 0 || slice.length === 0) return slice;
+    const byRow = canonicalPlacements(nested, columnCount);
+    const carried = [];
+    const carriedColumns = [];
+    for (let index = 0; index < sliceStart && index < canonical.length; index += 1) {
+      const placement = byRow.get(canonical[index]);
+      if (!placement) continue;
+      (canonical[index].cells || []).forEach((cell, cellIndex) => {
+        const span = Math.max(1, cell.rowSpan || 1);
+        if (index + span <= sliceStart) return;
+        carried.push({ ...cell, rowSpan: index + span - sliceStart });
+        carriedColumns.push(placement[cellIndex]);
+      });
+    }
+    if (carried.length === 0) return slice;
+    const merged = { ...slice[0], cells: [...carried, ...(slice[0].cells || [])] };
+    byRow.set(merged, [...carriedColumns, ...(byRow.get(slice[0]) || [])]);
+    return [merged, ...slice.slice(1)];
   };
   const nestedLayout = (nested, availableWidth) => {
     const nestedParameters = nested.parameters || request.parameters || {};
@@ -953,7 +1031,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const width = Math.min(naturalWidth, usableWidth);
     const scale = width / naturalWidth;
     const columns = naturalColumns.map((value) => value * scale);
-    const placements = computeCellPlacements(nested.rows || [], columns.length);
+    const placements = nestedPlacements(nested, nested.rows || [], columns.length);
     const heights = (nested.rows || []).map((row, rowIndex) => row.cells.reduce((maximum, cell, cellIndex) => {
       const textbox = cellTextbox(cell);
       const columnIndex = placements[rowIndex][cellIndex];
@@ -1105,6 +1183,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const drawNestedTablixAcrossPages = (nested, parentX, screenY, availableWidth) => {
     const top = nested.item.top || 0;
     const allRows = nested.rows || [];
+    nested.canonicalRows = allRows;
     const full = nestedLayout(nested, availableWidth);
     const heightByRow = new Map(allRows.map((row, index) => [row, full.heights[index]]));
     const leadingHeaders = [];
@@ -1136,7 +1215,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         if (end === offset) end = offset + 1;
         let fragmentHeight = 0;
         while (true) {
-          nested.rows = [...leadingHeaders, ...dataRows.slice(offset, end)];
+          nested.rows = [...leadingHeaders, ...carryOpenSpans(nested, leadingHeaders.length + offset, dataRows.slice(offset, end), (nested.columns || nested.item.columns || []).length)];
           fragmentHeight = nestedLayout(nested, availableWidth).height;
           if (fragmentHeight <= available + 0.5 || end <= offset + 1) break;
           end -= 1;
@@ -1161,6 +1240,18 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         if (offset >= dataRows.length) break;
         addPage();
         cursor = addPage.bodyTop;
+        // The "continued from previous page" annotation belongs to whichever region actually crossed the
+        // boundary. Only the top-level tablix's continuation path used to emit it, so a report whose tables
+        // are all CHILD regions — every table inside one body-level canvas — carried no marker at all even
+        // with pagination.continuationMarkers enabled. Label the child's own fragment, over its own box.
+        if (showContinuationMarkers) {
+          cursor += drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, allRows[leadingHeaders.length + offset] || null, {
+            x: parentX + (nested.item.left || 0),
+            width: full.width,
+            top: cursor,
+            tablixName: nested.item.name || null,
+          });
+        }
       }
     } finally {
       nested.rows = allRows;
@@ -1225,28 +1316,6 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // Gated to cells that carry a Line, Chart, or Image — content that previously could not render in a cell
   // at all (it was refused at analyze time). A cell with only textboxes keeps its existing single-textbox
   // path, so ordinary multi-textbox cells are unchanged and no existing report regresses.
-  const isCanvasCell = (cell) => (cell.items || []).some((entry) => (
-    entry.type === 'Line' || entry.type === 'Chart' || entry.type === 'Image'
-  ));
-  // RDL CellContents holds exactly ONE report item. A Textbox there fills the cell, so its declared
-  // Top/Left/Width/Height are irrelevant and the single-textbox fast path is exact. A Rectangle there is a
-  // CANVAS: the flattened children keep their own declared position and size inside it. Drawing one of those
-  // children stretched across the whole cell puts it in the wrong place and makes it swallow its positioned
-  // siblings — which the page-locked Word renderer must then refuse as overlapping regions. A textbox that
-  // shares its cell with a nested data region is therefore drawn item-by-item, like a Line/Chart/Image
-  // canvas. Row measurement is deliberately untouched: only free-form media cells take their height from
-  // the content extent, so this row keeps its declared height and pagination is unchanged.
-  const isFreeFormCell = (cell) => {
-    const items = cell.items || [];
-    if (isCanvasCell(cell)) return true;
-    const textboxes = items.filter((entry) => entry.type === 'Textbox');
-    // Every textbox must declare its own box on the canvas. RDL defaults an omitted Width/Height to zero,
-    // so drawing an undeclared one positioned would silently erase its text; such a cell keeps the
-    // fill-the-cell path and, if that genuinely overlaps, still fails closed rather than losing content.
-    return textboxes.length > 0
-      && textboxes.every((entry) => (entry.width || 0) > 0 && (entry.height || 0) > 0)
-      && items.some((entry) => entry.type === 'Tablix' || entry.type === 'Subreport');
-  };
   const canvasCellExtent = (cell, width) => Math.max(
     0,
     ...(cell.items || []).filter((entry) => entry.type !== 'Tablix' && entry.type !== 'Subreport')
@@ -1756,6 +1825,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const ownerLayout = layoutsForRow(row)[owner.cellIndex];
       const nested = owner.nested;
       const originalRows = nested.rows;
+      nested.canonicalRows = originalRows;
       const leadingHeaders = [];
       for (const nestedRow of originalRows) {
         if (!nestedRow.isHeader) break;
@@ -1781,7 +1851,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
             if (used >= childBudget) break;
           }
           if (end === offset && offset < dataRows.length) end += 1;
-          nested.rows = [...leadingHeaders, ...dataRows.slice(offset, end)];
+          nested.rows = [...leadingHeaders, ...carryOpenSpans(nested, leadingHeaders.length + offset, dataRows.slice(offset, end), (nested.columns || nested.item.columns || []).length)];
           const fragmentTexts = firstChildFragment ? remainingTexts : remainingTexts.map(() => '');
           const fragmentHeight = measureRow(row, fragmentTexts);
           if (fragmentHeight > available + 0.5) {
