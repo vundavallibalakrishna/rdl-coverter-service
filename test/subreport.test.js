@@ -78,6 +78,10 @@ const freeformChildRdl = childRdl.replace(
     + '<Paragraphs><Paragraph><TextRuns><TextRun><Value>SUBREPORT_FREEFORM</Value></TextRun></TextRuns></Paragraph></Paragraphs>'
     + '<Style><FontFamily>Arial</FontFamily><Border><Style>Solid</Style></Border></Style></Textbox>',
 );
+const dormantGrandchildRdl = childRdl.replace(
+  '<Textbox Name="ChildLabel">',
+  '<Subreport Name="DormantGrandchild"><ReportName>/Children/Grandchild</ReportName><Height>0.25in</Height><Width>2in</Width></Subreport><Textbox Name="ChildLabel">',
+);
 
 function bundledRequest(instances) {
   return {
@@ -182,6 +186,36 @@ test('fails closed when an invoked subreport instance is missing', async (contex
       ]),
     }),
     (error) => error.code === 'DATASET_MISSING',
+  );
+});
+
+test('does not require a nested definition when its empty parent tablix emits no invocation', async (context) => {
+  const converter = await createConverter({
+    env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
+  });
+  context.after(() => converter.close());
+  const request = bundledRequest([
+    { parameters: { EntityID: 1 }, datasets: { ChildData: [] } },
+    { parameters: { EntityID: 2 }, datasets: { ChildData: [] } },
+  ]);
+  request.subreports['/Children/Child'].rdlBase64 = Buffer.from(dormantGrandchildRdl).toString('base64');
+  const result = await converter.render({ rdl: parentRdl, ...request, output: 'XLSX' });
+  assert.equal(result.layoutMode, 'report-sections');
+});
+
+test('fails closed when a materialized nested subreport has no bundled definition', async (context) => {
+  const converter = await createConverter({
+    env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
+  });
+  context.after(() => converter.close());
+  const request = bundledRequest([
+    { parameters: { EntityID: 1 }, datasets: { ChildData: [{ EntityID: 1, Label: 'CALL_GRANDCHILD' }] } },
+    { parameters: { EntityID: 2 }, datasets: { ChildData: [{ EntityID: 2, Label: 'CALL_GRANDCHILD' }] } },
+  ]);
+  request.subreports['/Children/Child'].rdlBase64 = Buffer.from(dormantGrandchildRdl).toString('base64');
+  await assert.rejects(
+    converter.render({ rdl: parentRdl, ...request, output: 'XLSX' }),
+    (error) => error.code === 'UNSUPPORTED_FEATURE',
   );
 });
 

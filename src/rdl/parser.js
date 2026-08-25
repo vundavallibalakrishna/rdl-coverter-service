@@ -327,6 +327,7 @@ function parseChart(value, defaultFontFamily) {
   const parseAxis = (axis) => ({
     interval: textValue(axis.Interval, null),
     labelsAutoFitDisabled: textValue(axis.LabelsAutoFitDisabled, 'false'),
+    allowLabelRotation: textValue(axis.AllowLabelRotation, 'None'),
     style: styleOf(axis.Style, defaultFontFamily),
   });
   const customProperties = (series) => Object.fromEntries(asArray(series.CustomProperties?.CustomProperty)

@@ -131,6 +131,44 @@ function axisFont(doc, config, axis, context, labels, slot, fallback = 8) {
   return { ...appearance, color: styleColor(style.color, context, TICK_LABEL_COLOR), size };
 }
 
+function categoryLabelRotation(doc, axis, context, labels, slot) {
+  if (!(slot > 0) || !labels?.length) return 0;
+  const widest = Math.max(0, ...labels.map((label) => doc.widthOfString(String(label ?? ''))));
+  if (widest <= slot) return 0;
+  const declared = String(styleValue(axis?.allowLabelRotation, context, 'None')).toLowerCase();
+  if (declared === 'rotate90') return 90;
+  if (declared === 'rotate45') return 45;
+  if (declared === 'rotate30') return 30;
+  if (declared === 'rotate15') return 15;
+  return 0;
+}
+
+function categoryLabelBand(doc, config, axis, context, labels, slot, fallback = 7) {
+  const appearance = axisFont(doc, config, axis, context, labels, slot, fallback);
+  const rotation = categoryLabelRotation(doc, axis, context, labels, slot);
+  const lineHeight = doc.currentLineHeight(true);
+  const tallest = Math.max(0, ...labels.map((label) => {
+    const width = doc.widthOfString(String(label ?? ''));
+    if (!rotation) return doc.heightOfString(String(label ?? ''), { width: Math.max(1, slot) });
+    const radians = rotation * Math.PI / 180;
+    return Math.abs(width * Math.sin(radians)) + Math.abs(lineHeight * Math.cos(radians));
+  }));
+  return { appearance, rotation, height: tallest };
+}
+
+function drawBottomCategoryLabel(doc, label, slotX, slot, y, appearance, rotation) {
+  if (!rotation) {
+    fillText(doc, label, slotX, y, { width: slot, align: 'center', color: appearance.color });
+    return;
+  }
+  const centerX = slotX + slot / 2;
+  const width = doc.widthOfString(String(label ?? ''));
+  doc.save().fillColor(appearance.color || TICK_LABEL_COLOR)
+    .rotate(-rotation, { origin: [centerX, y] })
+    .text(String(label ?? ''), centerX - width / 2, y, { lineBreak: false, height: doc.currentLineHeight(true) })
+    .restore();
+}
+
 function legendLayout(doc, config, legend, entries, maxWidth, maxHeight, context, orientation) {
   const appearance = styleFont(doc, config, legend.style || {}, context, 8);
   const padding = 4;
@@ -302,12 +340,13 @@ function drawColumnChart(doc, config, chart, data, plot, stacked, context) {
   const categoryCount = data.categories.length || 1;
   const seriesCount = data.series.length || 1;
   const slot = plot.width / categoryCount;
-  const categoryAppearance = axisFont(doc, config, chart.categoryAxis, context, data.categories.map((entry) => entry.label), slot, 7);
+  const categoryLabels = data.categories.map((entry) => entry.label);
+  const categoryLayout = categoryLabelBand(doc, config, chart.categoryAxis, context, categoryLabels, slot, 7);
   const configuredWidth = Number(styleValue(chart.seriesDefs?.[0]?.customProperties?.PointWidth, context, 0.8));
   const pointWidth = Math.min(1, Math.max(0.05, Number.isFinite(configuredWidth) ? configuredWidth : 0.8));
   data.categories.forEach((category, categoryIndex) => {
     const slotX = plot.x + categoryIndex * slot;
-    fillText(doc, category.label ?? '', slotX, plot.y + plot.height + 4, { width: slot, align: 'center', color: categoryAppearance.color });
+    drawBottomCategoryLabel(doc, category.label ?? '', slotX, slot, plot.y + plot.height + 4, categoryLayout.appearance, categoryLayout.rotation);
     if (stacked === 'none') {
       const groupWidth = slot * pointWidth;
       const barWidth = groupWidth / seriesCount;
@@ -428,9 +467,10 @@ function seriesLines(data, scale, plot) {
 
 function drawCategoryLabels(doc, config, chart, data, plot, context) {
   const slot = plot.width / (data.categories.length || 1);
-  const appearance = axisFont(doc, config, chart.categoryAxis, context, data.categories.map((entry) => entry.label), slot, 7);
+  const labels = data.categories.map((entry) => entry.label);
+  const layout = categoryLabelBand(doc, config, chart.categoryAxis, context, labels, slot, 7);
   data.categories.forEach((category, index) => {
-    fillText(doc, category.label ?? '', plot.x + index * slot, plot.y + plot.height + 4, { width: slot, align: 'center', color: appearance.color });
+    drawBottomCategoryLabel(doc, category.label ?? '', plot.x + index * slot, slot, plot.y + plot.height + 4, layout.appearance, layout.rotation);
   });
 }
 
@@ -620,9 +660,8 @@ export function drawChart(doc, config, chart, data, x, y, width, height, context
     const estimatedPlotWidth = Math.max(1, content.right - content.left - leftGutter - 24);
     const slot = estimatedPlotWidth / data.categories.length;
     const labels = data.categories.map((entry) => String(entry.label ?? ''));
-    axisFont(doc, config, chart.categoryAxis, context, labels, slot, 7);
-    const labelHeight = Math.max(0, ...labels.map((label) => doc.heightOfString(label, { width: Math.max(1, slot) })));
-    bottomGutter = Math.max(16, Math.ceil(labelHeight) + 6);
+    const labelBand = categoryLabelBand(doc, config, chart.categoryAxis, context, labels, slot, 7);
+    bottomGutter = Math.max(16, Math.ceil(labelBand.height) + 6);
   }
   const plot = {
     x: content.left + leftGutter,

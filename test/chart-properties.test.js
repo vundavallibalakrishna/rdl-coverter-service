@@ -15,7 +15,7 @@ import { renderPdf } from '../src/render/pdf.js';
 import { rasterizePdf } from '../src/render/raster.js';
 import { renderVisualDocx } from '../src/render/visualDocx.js';
 
-const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1 }) => `
+const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1, allowLabelRotation = null }) => `
 <Chart Name="${name}">
   <ChartCategoryHierarchy><ChartMembers><ChartMember><Group Name="${name}Category"><GroupExpressions>
     <GroupExpression>=Fields!Category.Value</GroupExpression>
@@ -30,7 +30,7 @@ const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1 }
   </ChartSeries></ChartSeriesCollection></ChartData>
   <ChartAreas><ChartArea Name="Default">
     <ChartCategoryAxes><ChartAxis Name="Primary"><Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize></Style>
-      <LabelsAutoFitDisabled>true</LabelsAutoFitDisabled></ChartAxis></ChartCategoryAxes>
+      <LabelsAutoFitDisabled>true</LabelsAutoFitDisabled>${allowLabelRotation ? `<AllowLabelRotation>${allowLabelRotation}</AllowLabelRotation>` : ''}</ChartAxis></ChartCategoryAxes>
     <ChartValueAxes><ChartAxis Name="Primary"><Style><FontFamily>Arial</FontFamily><FontSize>8pt</FontSize></Style>
       <LabelsAutoFitDisabled>true</LabelsAutoFitDisabled></ChartAxis></ChartValueAxes>
   </ChartArea></ChartAreas>
@@ -143,6 +143,17 @@ test('parses documented axis and series chart properties into the normalized mod
   assert.equal(pie.seriesDefs[0].dataLabel.position, 'Outside');
   const data = materializeChart(pie, normalizeDatasets(model, request), {}, {});
   assert.equal(data.series[0].points[0].labelPosition, 'Outside');
+});
+
+test('parses and renders declared category-axis label rotation', async () => {
+  const rotated = rdl().replace(
+    '<LabelsAutoFitDisabled>true</LabelsAutoFitDisabled></ChartAxis></ChartCategoryAxes>',
+    '<LabelsAutoFitDisabled>true</LabelsAutoFitDisabled><AllowLabelRotation>Rotate45</AllowLabelRotation></ChartAxis></ChartCategoryAxes>',
+  );
+  const model = parseRdl(rotated);
+  assert.equal(model.body.items[0].categoryAxis.allowLabelRotation, 'Rotate45');
+  const result = await renderPdf(model, request, config);
+  assert.equal(result.buffer.subarray(0, 4).toString(), '%PDF');
 });
 
 test('an unknown chart custom property remains fail-closed', () => {

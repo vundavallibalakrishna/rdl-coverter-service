@@ -49,7 +49,7 @@ const SUPPORTED_ELEMENTS = new Set([
   'ChartData', 'ChartSeriesCollection', 'ChartSeries', 'ChartDataPoints', 'ChartDataPoint',
   'ChartDataPointValues', 'Y', 'ChartDataLabel', 'UseValueAsLabel', 'Visible',
   'ChartAreas', 'ChartArea', 'ChartCategoryAxes', 'ChartValueAxes', 'ChartAxis',
-  'LabelsAutoFitDisabled',
+  'LabelsAutoFitDisabled', 'AllowLabelRotation',
   'ChartLegends', 'ChartLegend', 'Position', 'Layout',
   'ChartTitles', 'ChartTitle', 'Caption',
   'Palette', 'ChartCustomPaletteColors', 'ChartCustomPaletteColor',
@@ -157,6 +157,7 @@ export const EXPRESSION_PROPERTIES = Object.freeze({
   'Image.Value': { valueType: 'String', handled: true },
   'Image.Sizing': { valueType: 'Enum', handled: true },
   'ChartAxis.LabelsAutoFitDisabled': { valueType: 'Boolean', handled: true },
+  'ChartAxis.AllowLabelRotation': { valueType: 'Enum', handled: true },
   'CustomProperty.Value': { valueType: 'String', handled: true },
   ...Object.fromEntries(BORDER_OWNERS.flatMap((owner) => [
     [`${owner}.Style`, { valueType: 'Enum', handled: true }],

@@ -67,7 +67,7 @@ function stripResolvedSubreportBlockers(model) {
     ...(model.page.header?.items || []),
     ...(model.page.footer?.items || []),
   ], (item) => {
-    if (item.type === 'Subreport' && !item.resolvedSubreport) unresolved.push(item);
+    if (item.type === 'Subreport' && !item.resolvedSubreport && !item.resolveBundledSubreport) unresolved.push(item);
   });
   if (unresolved.length > 0) return;
   model.unsupported = model.unsupported.filter((feature) => (
@@ -185,8 +185,14 @@ export function resolveBundledSubreports(model, request, config) {
     ], (item) => {
       if (item.type !== 'Subreport') return;
       const childCanonical = canonicalReportName(item.reportName);
-      const nested = resolveDefinition(childCanonical, [...lineage, canonical]);
-      item.resolvedSubreport = nested;
+      // A child Subreport is evaluated only after its containing region emits a visible instance. SSRS
+      // does not need a nested definition for a dormant call in an empty or hidden parent region, but a
+      // call that does materialize must still fail closed when the caller omitted its bundle.
+      item.resolveBundledSubreport = () => {
+        const nested = resolveDefinition(childCanonical, [...lineage, canonical]);
+        item.resolvedSubreport = nested;
+        return nested;
+      };
     });
     stripResolvedSubreportBlockers(child);
 
