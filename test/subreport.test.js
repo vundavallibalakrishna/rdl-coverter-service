@@ -22,6 +22,10 @@ const growingParentRdl = parentRdl.replace(
   '<Textbox Name="NameCell">',
   '<Textbox Name="NameCell"><CanGrow>true</CanGrow>',
 );
+const hiddenSubreportParentRdl = parentRdl.replace(
+  '<Height>0.25in</Height><Width>2in</Width>\n</Subreport>',
+  '<Height>0.25in</Height><Width>2in</Width><Visibility><Hidden>true</Hidden></Visibility>\n</Subreport>',
+);
 const rowSpanParentRdl = parentFixture.replace(
   '<TablixRowHierarchy><TablixMembers><TablixMember/><TablixMember><Group Name="Details"/></TablixMember></TablixMembers></TablixRowHierarchy>',
   `<TablixRowHierarchy><TablixMembers>
@@ -179,6 +183,19 @@ test('fails closed when an invoked subreport instance is missing', async (contex
     }),
     (error) => error.code === 'DATASET_MISSING',
   );
+});
+
+test('does not validate a bundled instance for a subreport hidden by SSRS visibility', async (context) => {
+  const converter = await createConverter({
+    env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
+  });
+  context.after(() => converter.close());
+  const result = await converter.render({
+    rdl: hiddenSubreportParentRdl,
+    ...bundledRequest([{ parameters: { EntityID: null }, datasets: { ChildData: [] } }]),
+    output: 'XLSX',
+  });
+  assert.equal(result.layoutMode, 'report-sections');
 });
 
 test('fails closed when the parent references an unbundled subreport', async (context) => {

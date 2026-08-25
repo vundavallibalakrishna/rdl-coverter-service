@@ -468,6 +468,14 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
         `Subreport invocation data is missing: ${item.reportName || item.name || 'unnamed'}`,
       );
     }
+    // Bundle resolution deliberately defers validation until an invocation is actually visible. A hidden
+    // SSRS subreport does not need concrete parameters or rows; a visible one still receives the full
+    // parameter, dataset, field, and limit validation before any child content is materialized.
+    const instanceValidation = validateRenderInput(resolved.model, instance, resolved.limits);
+    instance.parameters = instanceValidation.parameters;
+    Object.defineProperty(instance.parameters, '__rdlParameterLabels', {
+      value: instanceValidation.parameterLabels || {}, enumerable: false, configurable: true,
+    });
     const childDatasets = Object.fromEntries(resolved.model.datasets.map((dataset) => [
       dataset.name,
       (instance.datasets[dataset.name] || []).map((row) => normalizeFields(row, dataset.fields)),
