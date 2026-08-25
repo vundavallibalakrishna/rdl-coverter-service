@@ -451,7 +451,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
   });
   for (const item of cell.items.filter((candidate) => candidate.type === 'Subreport')) {
     if (evalHidden(item.hidden, context)) continue;
-    const resolved = item.resolvedSubreport;
+    const resolved = item.resolvedSubreport || item.resolveBundledSubreport?.();
     if (!resolved?.model || !resolved.instancesBySignature) {
       throw new ServiceError('UNSUPPORTED_FEATURE', `Subreport is not bundled: ${item.reportName || item.name || 'unnamed'}`);
     }

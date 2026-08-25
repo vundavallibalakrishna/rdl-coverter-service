@@ -277,7 +277,7 @@ this invocation.”
 ## Nested child and grandchild reports
 
 All definitions live in the same top-level `subreports` map. If `/Reports/Child` contains a subreport whose
-`ReportName` is `/Reports/Grandchild`, supply both:
+`ReportName` is `/Reports/Grandchild`, supply both whenever that nested call can materialize:
 
 ```json
 {
@@ -314,7 +314,7 @@ The resolver fails closed:
 
 | Condition | Error |
 | --- | --- |
-| Referenced `ReportName` has no bundle definition | `UNSUPPORTED_FEATURE` |
+| Materialized `ReportName` has no bundle definition | `UNSUPPORTED_FEATURE` |
 | PDF/visual-DOCX invocation has no matching instance | `DATASET_MISSING` |
 | Required child dataset is absent | `DATASET_MISSING` |
 | A child row omits an exact `DataField` | `FIELD_MISSING` |
