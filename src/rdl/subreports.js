@@ -1,7 +1,7 @@
 import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { parseRdl } from './parser.js';
-import { parameterSignature, validateRenderInput } from './validation.js';
+import { parameterSignature, resolveParameterValues } from './validation.js';
 
 const MAX_SUBREPORT_DEFINITIONS = 32;
 const MAX_SUBREPORT_DEPTH = 8;
@@ -111,6 +111,12 @@ function bundleMap(raw, config) {
   return result;
 }
 
+function bundledRenderingRowCount(model, datasets) {
+  return model.renderingDatasets.reduce((total, datasetName) => (
+    total + (Array.isArray(datasets?.[datasetName]) ? datasets[datasetName].length : 0)
+  ), 0);
+}
+
 /**
  * Resolves every Subreport item against caller-supplied definitions without executing report-server paths
  * or child queries. Each child invocation carries its own concrete parameters and exact DataField rows.
@@ -170,6 +176,7 @@ export function resolveBundledSubreports(model, request, config) {
       maxXmlDepth: config.maxXmlDepth,
     });
     definition.model = child;
+    definition.limits = config;
     for (const font of child.fonts) fonts.add(font);
     visitItems([
       ...child.body.items,
@@ -192,16 +199,23 @@ export function resolveBundledSubreports(model, request, config) {
         parameters: instance.parameters || {},
         datasets: instance.datasets || {},
       };
-      const validation = validateRenderInput(child, childRequest, config);
-      bundledRows += validation.totalRows;
+      // SSRS does not evaluate a subreport's parameters or datasets when the invoking item is hidden.
+      // Defer full input validation until materialization, after the parent item's Visibility expression
+      // has been evaluated. This also lets callers carry a harmless placeholder instance for a hidden
+      // invocation. Keep counting declared rendering rows here so a hidden bundle cannot bypass limits.
+      bundledRows += bundledRenderingRowCount(child, childRequest.datasets);
       if (bundledRows > config.maxRows) {
         throw new ServiceError('RDL_INVALID', `Dataset rows exceed the ${config.maxRows} row limit`, 413);
       }
-      childRequest.parameters = validation.parameters;
-      Object.defineProperty(childRequest.parameters, '__rdlParameterLabels', {
-        value: validation.parameterLabels || {}, enumerable: false, configurable: true,
-      });
-      const signature = parameterSignature(child.parameters, childRequest.parameters);
+      let signature;
+      try {
+        // Defaults are part of an invocation identity. Invalid parameters remain representable here so
+        // hidden calls stay inert; a visible call is rejected by validateRenderInput during materialization.
+        signature = parameterSignature(child.parameters, resolveParameterValues(child.parameters, childRequest.parameters));
+      } catch (error) {
+        if (!(error instanceof ServiceError) || error.code !== 'PARAMETER_INVALID') throw error;
+        signature = parameterSignature(child.parameters, childRequest.parameters);
+      }
       if (signatures.has(signature)) {
         throw new ServiceError(
           'RDL_INVALID',
