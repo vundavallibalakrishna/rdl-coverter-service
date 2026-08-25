@@ -56,6 +56,105 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
 
 ## Verified fixed (kept for regression awareness)
 
+- **A free-form tablix cell collapsed into one Excel cell value.** A cell whose CellContents Rectangle was
+  flattened is a CANVAS: its children keep their own declared position and size. `pdf.js` places each one
+  (`isFreeFormCell` / `drawCanvasRow`); `renderReportTablix` joined them with `cellText()` into a single
+  merged cell, so a report whose whole body is one canvas cell put 2,468 characters — every heading and
+  paragraph — into `A3:A4`, a range 0.14 characters wide. The prose was in the workbook and invisible in
+  it. Fixed in `excel.js`: `isCanvasCell`/`isFreeFormCell` moved to `common.js` so both renderers agree
+  what a canvas is; a free-form cell now writes no value, merge or region paint of its own and instead
+  emits each child through `renderFreeformItem` at its own section coordinates, with SSRS vertical
+  displacement (`nestedTopsFor` now resolves canvas peers too) and the row profile extended to reserve the
+  canvas extent. Three supporting corrections were needed: `applyRegionBorder` no longer marks every cell
+  of a region as styled with an all-undefined border object (which `copyPlannedTablix` then materialized
+  as a merge per column); the row profile records the regions' MEASURED, displaced boundaries rather than
+  their declared ones; and a child whose resolved rows still meet an occupied range steps below it, which
+  is the same displacement rule applied where the point model and the row grid disagree by one interval.
+  Verified through Excel COM on the client report: all ten numbered sections plus the prose land on their
+  own rows at the RDL's declared widths (555 pt full-width, 140 pt for "1. INTRODUCTION"), alongside the
+  13 pictures. Regression: `test/canvas-cell-chart.test.js`. Ref: `page-and-flow.md`.
+
+- **A canvas-cell chart drew the whole report in Word, and nothing at all in Excel.** A chart on an SSRS
+  List / canvas cell is scoped to its group instance — it sees that instance's rows, not the dataset.
+  **Word**: the canonical trace recorded only the chart's geometry, so `pagedDocx` re-materialized it from
+  the report-level datasets with an empty row scope; one chart carrying every category in the report
+  replaced the per-instance ones (the client report showed a 6-slice pie where the PDF drew a single
+  slice). Fixed by recording the resolved series on the chart's trace item (`chartData`, materialized in
+  the PDF pass with the chart's own context) and consuming it in `pagedDocx`, so Word rasterizes exactly
+  the chart the PDF drew — which is what the renderer-parity contract already required.
+  **Excel**: only BODY-level charts were embedded, so a report that puts every chart inside a List cell
+  produced no chart at all. Fixed in `excel.js`: a tablix cell's canvas media (`Chart`/`Image`) is
+  collected while the grid is written, its left/right edges join the section column grid
+  (`collectXBoundaries`) and its top/bottom the row grid, and it is anchored as a floating picture over
+  that region in the CELL's scope. Verified through Excel COM on the client report: 12 chart shapes at
+  459.8 x 156.8 pt against the RDL's declared 459.3 x 157.5. Only pictures are placed this way; a canvas
+  cell's text is placed the same way (see the entry above).
+  Regression: `test/canvas-cell-chart.test.js`.
+  Ref: `charts-and-axes.md`.
+
+- **"Continued from previous page" was never emitted for a child region.** The annotation
+  (`pagination.continuationMarkers`) was drawn only by the top-level tablix's `startContinuationPage`, so a
+  report whose tables are all CHILD regions — every table inside one body-level canvas — produced no marker
+  at all even with the option on, while an ordinary report produced them normally. Fixed in `pdf.js`:
+  `drawContinuationMarker` now takes the box and cursor to draw at (defaulting to the top-level tablix's own
+  geometry and cursor) and returns its height, and `drawNestedTablixAcrossPages` labels each of its own
+  continuation fragments over the child's box. Verified on the client report: 10 markers in the PDF, the
+  same 10 in DOCX_EDITABLE through the layout trace, page count unchanged at 42; XLSX has no pagination and
+  correctly has none. Regression: `test/nested-region-fragment-grid.test.js`, which also pins the option as
+  opt-in. Ref: `page-and-flow.md`.
+
+- **A child region's column grid re-flowed on its continuation pages.** Cell placement walks a data region's
+  rows in order, carrying each row-span's occupancy forward. A page fragment of a child region is a SLICE of
+  those rows, and both slicing loops recomputed placement from the slice alone — so every span that began in
+  an earlier fragment was lost and the cells to the right of a spanned row header shifted left into the
+  header's own columns. In the client report the per-audit findings, which belong in the last column, were
+  drawn in the second column from the continuation page onwards, with the right-hand columns left empty and
+  unruled — reported as "this tablix is still missing borders". Fixed in `pdf.js` by pinning the region's
+  canonical row order before slicing and resolving placement once over it (`nestedPlacements`), so every
+  fragment reads its own rows out of that map. Ref: `sizing-and-growth.md`.
+
+- **A row header spanning into a continuation fragment vanished.** SSRS repeats it there, clipped to the
+  rows the fragment shows; dropping it leaves the header columns empty and unruled for the rest of the
+  region. Fixed in `pdf.js` (`carryOpenSpans`): each fragment re-attaches the still-open spans to its first
+  row with the span clipped, and registers that row's placement so the carried cells keep the columns they
+  hold in the whole region. PDF owns the fragmenting; DOCX_EDITABLE inherits both fixes through the layout
+  trace (verified: the continuation Word row carries `1 | Test New | … | Findings`, fully bordered), and
+  XLSX is unaffected because it has no pagination. Regression:
+  `test/nested-region-fragment-grid.test.js`. Ref: `page-and-flow.md`.
+
+- **Tablix borders landed on the wrong page (no borders here, a stray grid there).** Borders are collected
+  as edges and stroked as merged runs when a page closes, but only the tablix's own `startContinuationPage`
+  flushed them. Every page break taken by the OTHER pagination paths in `renderTablix` — the SSRS
+  List/canvas reflow (`drawCanvasRow`) and the nested-region continuation (`drawNestedTablixAcrossPages`),
+  both of which call `addPage` directly — therefore carried a page's worth of edges forward. A report whose
+  whole body is a canvas cell (a 1×1 tablix holding a Rectangle with the report's items) rendered its tables
+  with **no borders at all**, and the accumulated runs were painted, at the earlier pages' coordinates, over
+  whatever content sat on the page where the flush finally landed. Fixed in `renderTablix` (`pdf.js`) by
+  wrapping the injected page advance so a page can never close with edges pending. PDF-only: DOCX_EDITABLE
+  and XLSX resolve borders per cell and always had them, so this also removed a PDF↔Word disagreement.
+  Regression: `test/canvas-page-break-borders.test.js`. Ref: `border-resolution.md`.
+
+- **Row-header band collapsed into one column.** Every `TablixHeader` is as wide as its declared `Size`, so
+  a row-header cell spans as many leaf hierarchy columns as that size covers — the flat materializer already
+  sized its headers this way. The advanced materializer only honored it for `static` units and for a
+  single-descriptor full-width band, so a group's own header branch (shallower than the detail branch) got
+  `colSpan: 1` plus a synthesized blank tail: a quarter band that SSRS draws across the whole table rendered
+  as a narrow wrapped cell in the second column. Fixed in `materializeAdvancedRows` (`validation.js`) by
+  deriving the spans from the declared sizes in every case, with the tail sized from what those spans leave
+  uncovered; `headerSpans` no longer short-circuits a single descriptor to the whole grid, so a narrow
+  one-column band stays one column. Shared layer — PDF, DOCX_EDITABLE and XLSX all inherit it.
+  Regression: `test/tablix-row-header-band.test.js`. Ref: `sizing-and-growth.md`.
+
+- **Running aggregates numbered the unsorted rows.** `RowNumber`/`RunningValue` accumulate in the order the
+  data region processes rows, which the recursive walk records. Role alone did not separate the coarse unit
+  from the fine ones: a group's own header band and the per-instance rows under it are both static leaves
+  inside that group, so both are labelled `header`. The band sits at a shallower hierarchy depth and carries
+  the WHOLE group scope in dataset arrival order, so it recorded first and reinstated exactly the arrival
+  order a member `SortExpression` had just replaced — a `RunningValue(..., CountDistinct, "Group")` column
+  numbered the sorted rows 2, 1, 3. Fixed by restricting the ordering pass to the deepest units of the
+  ordering role. Shared layer. Regression: `test/tablix-row-header-band.test.js`.
+  Ref: `page-and-flow.md`.
+
 - **XLSX columns were ~5 px narrow each, so dates rendered as `#####`.** `excelWidthFromPoints` converted a
   point width with the widely-quoted `width = (pixels − 5) / maxDigitWidth`, subtracting Excel's per-cell
   inset. Excel does not add that inset back: it renders a stored width `w` at exactly `w * 7` device pixels

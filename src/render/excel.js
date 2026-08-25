@@ -7,7 +7,7 @@ import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression, resolveReportCulture } from '../rdl/expression.js';
 import { parseDateValue } from '../rdl/dateValue.js';
-import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleText, styleValue, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isFreeFormCell, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleText, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
@@ -20,6 +20,9 @@ const DEFAULT_ROW_POINTS = 15;
 const COINCIDENT_EDGE_TOLERANCE_PT = 0.25;
 const EXCEL_LAYOUT_DPI = 96;
 const EXCEL_MAX_DIGIT_WIDTH_PX = 7;
+// Cell content that is a picture rather than a cell value. A tablix cell whose CellContents Rectangle was
+// flattened is a free-form canvas and can carry these alongside its textbox.
+
 const EXCEL_TEXT_CLEARANCE_PT = 2;
 // OOXML stores column widths in units derived from the workbook's maximum digit width. Excel then rounds
 // those widths again for the active viewer/font metrics. Reserving one standard 7-pixel digit cell during
@@ -663,6 +666,20 @@ function collapsedBoundaries(values, spans, existingAliases = new Map()) {
 }
 
 function collectXBoundaries(items, request, globals, model, tablixCache, target, spans, parentLeft = 0) {
+  // A Chart or Image sitting on a tablix cell's flattened canvas is anchored as a floating picture at its
+  // own left and width, so those edges have to be grid lines. Cell TEXT needs none: it is written into the
+  // cell and inherits the cell's own columns.
+  const collectCellCanvas = (cell, cellLeft) => {
+    if (!isFreeFormCell(cell)) return;
+    for (const child of cell.items || []) {
+      if (child.type === 'Tablix' || child.type === 'Subreport') continue;
+      const childLeft = point(cellLeft + (child.left || 0));
+      const childRight = point(childLeft + (child.width || 0));
+      target.add(childLeft);
+      target.add(childRight);
+      if (childRight > childLeft) spans.add(`${childLeft}|${childRight}`);
+    }
+  };
   const collectNested = (nested, cellLeft) => {
     const left = point(cellLeft + (nested.item.left || 0));
     target.add(left);
@@ -679,6 +696,7 @@ function collectXBoundaries(items, request, globals, model, tablixCache, target,
         const columnIndex = placements[rowIndex][cellIndex];
         const nestedCellLeft = left + (nested.columns || []).slice(0, columnIndex).reduce((sum, width) => sum + width, 0);
         for (const child of cell.nestedTablixes || []) collectNested(child, nestedCellLeft);
+        collectCellCanvas(cell, nestedCellLeft);
       }
     }
   };
@@ -705,6 +723,7 @@ function collectXBoundaries(items, request, globals, model, tablixCache, target,
           const columnIndex = placements[rowIndex][cellIndex];
           const cellLeft = left + offsets[columnIndex];
           for (const nested of cell.nestedTablixes || []) collectNested(nested, cellLeft);
+          collectCellCanvas(cell, cellLeft);
         }
       }
     }
@@ -879,7 +898,9 @@ function applyRegionBorder(worksheet, range, border = {}) {
       for (const side of ['top', 'bottom', 'left', 'right']) {
         if (border[side] && onPerimeter[side](row, column)) merged[side] = border[side];
       }
-      cell.border = merged;
+      // Only mark the cell when an edge is actually set: an all-undefined border object still makes the
+      // cell look styled, and the copy step then materializes the whole region as a merge per column.
+      if (Object.values(merged).some(Boolean)) cell.border = merged;
     }
   }
 }
@@ -1106,12 +1127,13 @@ async function renderFreeformItem({
   measureDoc,
   parentLeft = 0,
   parentTop = 0,
+  rowsOverride = null,
 }) {
   if (isHidden(item.hidden, context)) return;
   const left = point(parentLeft + (item.left || 0));
   const top = point(parentTop + (item.top || 0));
   const columns = gridRange(xGrid, left, item.width || 0);
-  const rows = rowRange(yGrid, startRow, top, item.height || 0);
+  const rows = rowsOverride || rowRange(yGrid, startRow, top, item.height || 0);
   const range = { ...columns, ...rows };
   if (item.type === 'Chart') {
     const data = materializeChart(item, context.datasets, context.parameters, context.globals);
@@ -1501,6 +1523,8 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   const enforceBottomClosure = shouldEnforceTablixBottom(rows, item);
   const gridOwners = rows.map(() => new Array(columns.length).fill(null));
   const owners = [];
+  // Pictures a cell carries on its canvas, collected while the grid is written and anchored later.
+  const canvasPlacements = [];
   const columnOffsets = [0];
   columns.forEach((width) => columnOffsets.push(point(columnOffsets[columnOffsets.length - 1] + width)));
   const addNestedYBoundaries = (nested, baseTop, target) => {
@@ -1647,7 +1671,9 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       }
     }
     const tops = new WeakMap();
-    for (const peer of peers) if (peer.nested) tops.set(peer.nested, peer.resolvedTop);
+    // A canvas peer is displaced by the same rule, so record its resolved top too: a heading or a chart
+    // that follows a grown child region has to move down with it, exactly as the PDF places it.
+    for (const peer of peers) tops.set(peer.nested || peer.item, peer.resolvedTop);
     resolvedNestedTops.set(cell, tops);
     return tops;
   };
@@ -1731,11 +1757,58 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     }
     rowProfiles[rowIndex] = splitTallRowIntervals(profile);
   });
+  // A canvas cell's children sit at their own displaced tops and can extend past the height the nested
+  // regions alone imply. Fold their extents into the row profile: the row then reserves the full canvas,
+  // and every child lands on an exact boundary instead of being snapped onto a neighbour's row — which
+  // is what let one group instance's heading collide with the previous instance's trailing paragraphs.
+  rows.forEach((row, rowIndex) => {
+    for (const cell of row.cells || []) {
+      if (!isFreeFormCell(cell)) continue;
+      const displaced = nestedTopsFor(cell);
+      const profile = new Set(rowProfiles[rowIndex]);
+      for (const child of cell.items || []) {
+        if (child.type === 'Tablix' || child.type === 'Subreport') continue;
+        const childTop = point(displaced.get(child) ?? (child.top || 0));
+        profile.add(childTop);
+        profile.add(point(childTop + (child.height || 0)));
+      }
+      // The regions themselves are displaced, and they RENDER at their measured (grown) row heights, not
+      // their declared ones. Record the boundaries the renderer will actually use, so a canvas child that
+      // follows a grown region is measured against the same extent the displacement gave it.
+      const addMeasuredBoundaries = (nested, baseTop) => {
+        let cursor = point(baseTop);
+        profile.add(cursor);
+        const heights = measureNestedTablix(nested).heights;
+        (nested.rows || []).forEach((nestedRow, nestedIndex) => {
+          const rowTop = cursor;
+          cursor = point(cursor + (heights[nestedIndex] ?? nestedRow.height ?? DEFAULT_ROW_POINTS));
+          profile.add(cursor);
+          for (const nestedCell of nestedRow.cells || []) {
+            for (const grandchild of nestedCell.nestedTablixes || []) {
+              addMeasuredBoundaries(grandchild, rowTop + (grandchild.item.top || 0));
+            }
+          }
+        });
+      };
+      for (const nested of cell.nestedTablixes || []) {
+        addMeasuredBoundaries(nested, point(displaced.get(nested) ?? (nested.item.top || 0)));
+      }
+      rowProfiles[rowIndex] = [...profile].sort((left, right) => left - right);
+    }
+  });
+
   const physicalStarts = [];
   let physicalCursor = startRow;
   rowProfiles.forEach((profile) => {
     physicalStarts.push(physicalCursor);
     physicalCursor += Math.max(1, profile.length - 1);
+  });
+  // The point offset of each logical row from the tablix top, for anchoring cell pictures.
+  const rowTops = [];
+  let rowTopCursor = 0;
+  rowProfiles.forEach((profile) => {
+    rowTops.push(point(rowTopCursor));
+    rowTopCursor += profile.at(-1) || 0;
   });
   rowProfiles.forEach((profile, rowIndex) => {
     for (let index = 0; index < profile.length - 1; index += 1) {
@@ -1824,22 +1897,52 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       // physical Excel columns even when its ColSpan is 1. Merge the occupied Excel region, not merely RDL
       // spans, or the extra grid slices appear as blank gaps inside the table.
       const hasNested = (owner.cell.nestedTablixes || []).length > 0;
-      if (!hasNested && (range.startRow !== range.endRow || range.startCol !== range.endCol)) mergeSafe(worksheet, range, merges);
-      const target = worksheet.getCell(excelRow, range.startCol);
-      const { value, numFmt } = excelCellValue(owner.cell, owner.context);
-      const display = cellText(owner.cell);
-      target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
-      if (numFmt) target.numFmt = numFmt;
-      applyFillFontAlignment(target, owner.style || {}, owner.context);
+      // A free-form cell is a flattened CellContents Rectangle: its children keep their own declared
+      // position and size. Joining them into one cell value — right for every ordinary cell — collapsed a
+      // whole page of headings and prose into a single, usually invisible, merged cell. Place each child
+      // at its own coordinates instead, exactly as the canonical PDF pass does.
+      const freeForm = isFreeFormCell(owner.cell);
+      let target = null;
+      if (!freeForm) {
+        if (!hasNested && (range.startRow !== range.endRow || range.startCol !== range.endCol)) mergeSafe(worksheet, range, merges);
+        target = worksheet.getCell(excelRow, range.startCol);
+        const { value, numFmt } = excelCellValue(owner.cell, owner.context);
+        const display = cellText(owner.cell);
+        target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
+        if (numFmt) target.numFmt = numFmt;
+        applyFillFontAlignment(target, owner.style || {}, owner.context);
+      }
+      if (freeForm) {
+        for (const child of owner.cell.items || []) {
+          // Tablix/Subreport entries are the design-time source of the materialized nested regions,
+          // which the child-region path below already renders.
+          if (child.type === 'Tablix' || child.type === 'Subreport') continue;
+          if (isHidden(child.hidden, owner.context)) continue;
+          canvasPlacements.push({
+            item: child,
+            // A chart on a canvas cell is scoped to that group instance: point the region dataset at the
+            // cell's own rows, as the canonical PDF pass does, or it aggregates the whole report.
+            context: item.datasetName
+              ? { ...owner.context, datasets: { ...owner.context.datasets, [item.datasetName]: owner.context.dataset } }
+              : owner.context,
+            left: point(left + (child.left || 0)),
+            // Points from the tablix top. A child that follows a grown nested region is displaced by the
+            // same SSRS rule the regions use, so it moves down with it exactly as the PDF places it.
+            top: point(rowTops[rowIndex] + (nestedTopsFor(owner.cell).get(child) ?? (child.top || 0))),
+          });
+        }
+      }
       if (hasNested) {
-        applyRegionStyle(worksheet, range, owner.style || {}, owner.context, { includeBorders: false });
+        if (!freeForm) applyRegionStyle(worksheet, range, owner.style || {}, owner.context, { includeBorders: false });
         for (const nested of owner.cell.nestedTablixes || []) renderNested(nested, left, rowIndex, 0, nestedTop(owner.cell, nested));
         // The child grid writes its own cells inside this region, so the enclosing cell's box goes on last
         // and only on the perimeter: applied first it would be overwritten by the child's first row, and
         // applied to the anchor cell it would draw this cell's bottom rule across its top physical row.
         applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
       } else {
-        target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+        // A free-form cell wrote no anchor cell of its own; its box goes on the region it occupies.
+        if (target) target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+        else applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
       }
       columnIndex += span;
     }
@@ -1860,6 +1963,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     : 0;
   return {
     rowsConsumed: physicalCursor - startRow,
+    canvasPlacements,
     startRow,
     endRow: physicalCursor - 1,
     headerRows,
@@ -1959,6 +2063,9 @@ function copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges }) {
     endRow: mappedEnd,
     rowsConsumed: mappedEnd - mappedStart + 1,
     headerRows: Math.max(0, mappedHeaderEnd - mappedStart + 1),
+    // Cell pictures carry point offsets from the tablix top; the caller resolves them against the section
+    // row grid, so they float over the table instead of occupying its rows.
+    canvasPlacements: plan.region.canvasPlacements || [],
   };
 }
 
@@ -2085,6 +2192,15 @@ async function renderCoordinateScheduledSection({
         if (value > previous) spans.add(`${previous}|${value}`);
         previous = value;
       }
+      // A picture on a tablix cell's canvas floats at its own top and height, so those two coordinates
+      // have to exist on the section grid for the anchor to resolve. They add boundaries only.
+      for (const placed of plan.region?.canvasPlacements || []) {
+        const from = point(plan.resolvedTop + placed.top);
+        const to = point(from + (placed.item.height || 0));
+        boundaries.add(from);
+        boundaries.add(to);
+        if (to > from) spans.add(`${from}|${to}`);
+      }
     } else {
       collectYBoundaries([{ ...plan.item, top: plan.resolvedTop }], boundaries, spans);
     }
@@ -2106,6 +2222,41 @@ async function renderCoordinateScheduledSection({
     if (plan.item.containerPaintShell) continue;
     if (plan.item.type === 'Tablix') {
       const region = copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges });
+      // A free-form cell's children are placed at their own coordinates, through the same path a
+      // section-level free-form item takes, so a canvas textbox, chart, image or line behaves in the
+      // worksheet exactly as it would sitting directly on the body.
+      for (const placed of region.canvasPlacements || []) {
+        // The point model and the worksheet row grid can disagree by one interval where a grown child
+        // region ends and the next canvas item begins. SSRS resolves exactly that case by displacement —
+        // a later item moves below what grew — so apply the same rule against the rows already taken.
+        const placedTop = point(plan.resolvedTop + placed.top);
+        const placedColumns = gridRange(xGrid, placed.left, placed.item.width || 0);
+        let placedRows = rowRange(yGrid, startRow, placedTop, placed.item.height || 0);
+        for (let guard = 0; guard < 64; guard += 1) {
+          const clash = findIndexedMergeOverlap(merges, { ...placedColumns, ...placedRows });
+          if (!clash) break;
+          const height = placedRows.endRow - placedRows.startRow;
+          placedRows = { startRow: clash.endRow + 1, endRow: clash.endRow + 1 + height };
+        }
+        await renderFreeformItem({
+          workbook,
+          worksheet,
+          model,
+          item: { ...placed.item, left: placed.left, top: placedTop },
+          context: placed.context,
+          config,
+          tempDir,
+          chartCounter,
+          xGrid,
+          yGrid,
+          startRow,
+          merges,
+          measureDoc,
+          parentLeft: 0,
+          parentTop: 0,
+          rowsOverride: placedRows,
+        });
+      }
       if (region.dynamic) detailRegions.push(region);
       continue;
     }

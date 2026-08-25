@@ -330,7 +330,6 @@ function descriptorKey(descriptor, fields, parameters, globals, dataset, dataset
 
 function headerSpans(descriptors, widths) {
   if (descriptors.length === 0 || widths.length === 0) return [];
-  if (descriptors.length === 1) return [widths.length];
   // When the deepest row-header path has exactly one descriptor per header column, each maps 1:1.
   // Assign span 1 deterministically instead of relying on the width-tolerance heuristic, which is
   // brittle when adjacent header sizes are close.
@@ -1032,10 +1031,20 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
   // arrival order this exists to replace.
   const ORDERING_ROLES = ['detail', 'group', 'header', 'footer'];
   const orderingRole = ORDERING_ROLES.find((role) => units.some((unit) => unit.role === role)) || null;
+  // Role alone does not always separate the coarse unit from the fine ones: a group's own header band and
+  // the per-instance rows beneath it are both static leaves inside that group, so both are labelled
+  // `header`. The band sits at a shallower hierarchy depth and carries the WHOLE group scope in dataset
+  // arrival order, so letting it record first reinstates the arrival order that a member SortExpression
+  // just replaced — every running aggregate below it then numbers the sorted rows out of sequence. The
+  // deepest units of the ordering role are the finest ones the region emits, so only they define it.
+  const orderingDepth = units.reduce(
+    (deepest, unit) => (unit.role === orderingRole ? Math.max(deepest, unit.path.length) : deepest),
+    0,
+  );
   const regionRowOrder = [];
   const recordedRows = new Set();
   for (const unit of orderingRole ? units : []) {
-    if (unit.role !== orderingRole) continue;
+    if (unit.role !== orderingRole || unit.path.length !== orderingDepth) continue;
     for (const row of (orderingRole === 'detail' ? unit.nestedDataset : unit.dataset) || []) {
       if (!row || typeof row !== 'object' || recordedRows.has(row)) continue;
       recordedRows.add(row);
@@ -1100,16 +1109,13 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
 
     const descriptors = unitDescriptors[index];
     const rowHeaders = [];
-    // A group header/footer can be a full-width static band (its declared header size equals the whole
-    // row-header grid), even though the recursive walk labels it `header`/`footer`. Only promote that
-    // explicit geometry; ordinary nested group headers retain their hierarchy-column span.
-    const rowHeaderWidth = rowHeaderColumns.reduce((sum, width) => sum + width, 0);
-    const fullWidthBand = ['header', 'footer'].includes(unit.role)
-      && descriptors.length === 1
-      && descriptors[0].header.size >= rowHeaderWidth - 0.5;
-    const staticSpans = unit.role === 'static' || fullWidthBand
-      ? headerSpans(descriptors, rowHeaderColumns)
-      : [];
+    // Every TablixHeader is as wide as its declared Size, so a row-header cell spans as many leaf
+    // hierarchy columns as that size covers — the flat materializer already sizes its headers this way.
+    // A group header/footer whose branch is shallower than the deepest detail path therefore carries one
+    // WIDE cell (e.g. a quarter band across "Audit".."Comment"), not a narrow cell in the first column
+    // with a blank tail beside it. Only a dynamic group owner keeps a single hierarchy column: its size
+    // covers just that column, so the size-driven spans give it span 1 without a special case.
+    const staticSpans = headerSpans(descriptors, rowHeaderColumns);
     descriptors.forEach((descriptor, descriptorIndex) => {
       const key = descriptorValue(unit, descriptors, descriptor);
       const previous = index > 0 ? unitDescriptors[index - 1].find((entry) => entry.member === descriptor.member) : null;
@@ -1131,11 +1137,12 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
       });
     });
 
-    // Advanced group header/footer rows often have fewer header descriptors than the deepest detail path.
-    // Materialize the unowned tail as a real blank grid cell so body cells always begin after the complete
-    // row-header grid. Active ancestor row spans occupy the earlier columns and are skipped by placement.
-    const rowHeaderTail = Math.max(0, rowHeaderColumns.length - descriptors.length);
-    if (rowHeaderTail > 0 && unit.role !== 'static' && !fullWidthBand) {
+    // Whatever the sized spans do not cover is still part of the row-header grid. Materialize that tail as
+    // a real blank grid cell so body cells always begin after the complete row-header grid. Active ancestor
+    // row spans occupy the earlier columns and are skipped by placement.
+    const coveredHeaderColumns = descriptors.reduce((sum, _, position) => sum + (staticSpans[position] || 1), 0);
+    const rowHeaderTail = Math.max(0, rowHeaderColumns.length - coveredHeaderColumns);
+    if (rowHeaderTail > 0 && unit.role !== 'static') {
       rowHeaders.push({ colSpan: rowHeaderTail, rowSpan: 1, items: [], values: [], hidden: false, isRowHeader: true });
     }
 
