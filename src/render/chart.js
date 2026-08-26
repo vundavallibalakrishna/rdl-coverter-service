@@ -172,13 +172,16 @@ function drawBottomCategoryLabel(doc, label, slotX, slot, y, appearance, rotatio
 function legendLayout(doc, config, legend, entries, maxWidth, maxHeight, context, orientation) {
   const appearance = styleFont(doc, config, legend.style || {}, context, 8);
   const padding = 4;
-  const swatch = Math.max(8, appearance.size);
+  // SSRS' default series-key is a horizontal rectangle, not a text-sized square. Keep its height tied
+  // to the legend font while reserving the wider symbol in both horizontal and vertical layouts.
+  const swatchHeight = Math.max(6, appearance.size * 0.75);
+  const swatchWidth = Math.max(12, appearance.size * 1.5);
   const gap = Math.max(3, appearance.size * 0.5);
   const spacing = Math.max(8, appearance.size * 1.5);
-  const lineHeight = Math.max(swatch, appearance.size * 1.25) + 4;
+  const lineHeight = Math.max(swatchHeight, appearance.size * 1.25) + 4;
   const chips = entries.map((entry) => ({
     ...entry,
-    width: swatch + gap + doc.widthOfString(String(entry.label)) + spacing,
+    width: swatchWidth + gap + doc.widthOfString(String(entry.label)) + spacing,
   }));
   if (orientation === 'vertical') {
     const rowsPerColumn = Math.max(1, Math.floor(Math.max(lineHeight, maxHeight - padding * 2) / lineHeight));
@@ -188,7 +191,7 @@ function legendLayout(doc, config, legend, entries, maxWidth, maxHeight, context
       columns.push({ chips: values, width: Math.max(0, ...values.map((chip) => chip.width)) });
     }
     return {
-      appearance, chips, columns, orientation, padding, swatch, gap, spacing, lineHeight,
+      appearance, chips, columns, orientation, padding, swatchWidth, swatchHeight, gap, spacing, lineHeight,
       width: Math.min(maxWidth, padding * 2 + columns.reduce((sum, column) => sum + column.width, 0)),
       height: Math.min(maxHeight, padding * 2 + Math.min(rowsPerColumn, chips.length) * lineHeight),
     };
@@ -202,7 +205,7 @@ function legendLayout(doc, config, legend, entries, maxWidth, maxHeight, context
     rowWidth += chip.width;
   }
   return {
-    appearance, chips, rows, orientation, padding, swatch, gap, spacing, lineHeight,
+    appearance, chips, rows, orientation, padding, swatchWidth, swatchHeight, gap, spacing, lineHeight,
     width: Math.min(maxWidth, padding * 2 + Math.max(0, ...rows.map((row) => row.reduce((sum, chip) => sum + chip.width, 0) - spacing))),
     height: Math.min(maxHeight, padding * 2 + rows.length * lineHeight),
   };
@@ -218,8 +221,9 @@ function drawLegend(doc, config, layout, legend, x, y, context, alignment = 'cen
     for (const column of layout.columns) {
       column.chips.forEach((chip, rowIndex) => {
         const rowY = y + layout.padding + rowIndex * layout.lineHeight;
-        doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(columnX, rowY, layout.swatch, layout.swatch).fill().restore();
-        fillText(doc, chip.label, columnX + layout.swatch + layout.gap, rowY + 1, { color: textColor });
+        const swatchY = rowY + (layout.lineHeight - layout.swatchHeight) / 2;
+        doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(columnX, swatchY, layout.swatchWidth, layout.swatchHeight).fill().restore();
+        fillText(doc, chip.label, columnX + layout.swatchWidth + layout.gap, rowY + 1, { color: textColor });
       });
       columnX += column.width;
     }
@@ -231,8 +235,9 @@ function drawLegend(doc, config, layout, legend, x, y, context, alignment = 'cen
     let cursor = x + layout.padding + Math.max(0, offset);
     const rowY = y + layout.padding + rowIndex * layout.lineHeight;
     for (const chip of row) {
-      doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(cursor, rowY, layout.swatch, layout.swatch).fill().restore();
-      fillText(doc, chip.label, cursor + layout.swatch + layout.gap, rowY + 1, { color: textColor });
+      const swatchY = rowY + (layout.lineHeight - layout.swatchHeight) / 2;
+      doc.save().fillColor(resolveColor(chip.color, '#808080')).rect(cursor, swatchY, layout.swatchWidth, layout.swatchHeight).fill().restore();
+      fillText(doc, chip.label, cursor + layout.swatchWidth + layout.gap, rowY + 1, { color: textColor });
       cursor += chip.width;
     }
   });
@@ -325,10 +330,28 @@ function drawBarChart(doc, config, chart, data, plot, stacked, context) {
     const total = stackTotal(data, index) || 1;
     let cursorX = plot.x;
     for (const series of data.series) {
-      const raw = Math.max(0, series.points[index]?.y ?? 0);
+      const point = series.points[index];
+      const raw = Math.max(0, point?.y ?? 0);
       if (raw <= 0) continue;
       const width = ((stacked === 'percent' ? (raw / total) * 100 : raw) / scale.max) * plot.width;
       doc.save().fillColor(resolveColor(series.color, '#808080')).rect(cursorX, centerY - barHeight / 2, width, barHeight).fill().restore();
+      // SSRS renders an enabled data-point label inside its own stacked segment.  The series loop used
+      // to discard the materialized label here, so stacked bars lost labels while columns, lines and pies
+      // retained theirs.  Suppress only labels that cannot fit in the declared segment rather than letting
+      // a label overlap the adjacent series.
+      if (point?.label) {
+        const label = String(point.label);
+        const labelWidth = doc.widthOfString(label);
+        const lineHeight = doc.currentLineHeight(true);
+        if (width >= labelWidth + 4 && barHeight >= lineHeight + 2) {
+          fillText(doc, label, cursorX, centerY - lineHeight / 2, {
+            width,
+            height: lineHeight,
+            align: 'center',
+            color: LABEL_COLOR,
+          });
+        }
+      }
       cursorX += width;
     }
   });
@@ -393,7 +416,24 @@ function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
   // horizontal elbow, with the label starting at the elbow. It shrinks the shape so the whole callout
   // (both segments plus the gap before the text) stays inside the plot rectangle; only the label text
   // itself may reach past it. Reserve that band here instead of letting the callout run over the edge.
-  const hasOutsideLabels = points.some((point) => point.label && /outside/i.test(point.labelPosition || ''));
+  // WHERE a shape-chart label goes is decided by the series' PieLabelStyle custom property, not by how
+  // much room the wedge has: SSRS defaults to Inside and keeps drawing at the label radius however narrow
+  // the slice becomes (a 0% sliver still prints "0%" inside the pie, overlapping its neighbour if need
+  // be). Only PieLabelStyle=Outside — or an explicitly Outside data-label Position — moves labels out to
+  // callouts, and Disabled suppresses them. Auto-promoting a label that "does not fit" invented callouts
+  // SSRS never draws.
+  const pieLabelStyle = String(styleValue(chart.seriesDefs?.[0]?.customProperties?.PieLabelStyle, context, 'Inside'));
+  const labelsDisabled = /^disabled$/i.test(pieLabelStyle);
+  const labelsOutside = /^outside$/i.test(pieLabelStyle);
+  const labelPlacement = (point) => {
+    const appearance = styleFont(doc, config, point.labelStyle || {}, context, 8);
+    const labelWidth = doc.widthOfString(String(point.label ?? '')) + 1;
+    const lineHeight = doc.currentLineHeight(true);
+    const outside = Boolean(point.label)
+      && (labelsOutside || /outside/i.test(String(point.labelPosition || 'Auto')));
+    return { outside, appearance, labelWidth, lineHeight };
+  };
+  const hasOutsideLabels = points.some((point) => labelPlacement(point).outside);
   const calloutBudget = hasOutsideLabels
     ? Math.max(10, (outerLimit - PIE_CALLOUT_TEXT_GAP_PT) / (1 + 2 * PIE_CALLOUT_SEGMENT_RATIO))
     : outerLimit;
@@ -406,52 +446,86 @@ function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
     centerX + offsetX + Math.cos(angle) * r,
     centerY + offsetY + Math.sin(angle) * r,
   ];
-  setFont(doc, config, { size: 8 });
+  // A ChartBorderSkin is a decorative FRAME around the chart image (Emboss, Raised, FrameThin…), and it
+  // is inert unless the RDL declares a BorderSkinType — which defaults to None. It is not a slice outline:
+  // the BI designer emits <ChartBorderSkin><Style><BackgroundColor>Gray</BackgroundColor><Color>White…
+  // into practically every chart, and SSRS still draws pie slices as bare adjacent fills, so painting the
+  // skin colour around each slice added a white radial rule SSRS never draws. A slice outline would come
+  // from the data point's own Style/Border, which these reports do not declare.
   // SSRS pie and doughnut charts use PieStartAngle=0 by default, which places the first value at
   // 3 o'clock (90 degrees clockwise from the top). A declared PieStartAngle rotates clockwise in
   // degrees; 270 therefore places the first value at 12 o'clock.
   const rawStartAngle = styleValue(chart.seriesDefs?.[0]?.customProperties?.PieStartAngle, context, 0);
   const startAngleDegrees = Number(rawStartAngle);
   let angle = (Number.isFinite(startAngleDegrees) ? startAngleDegrees : 0) * (Math.PI / 180);
-  for (const point of points) {
+  // Geometry first, then every slice, then every label. Labels belong to the shape as a whole: a label
+  // that sits inside a hairline slice is drawn at the label radius and therefore lands on the NEXT
+  // slice's fill, which would paint over it if slices and labels were interleaved in one pass.
+  const slices = points.map((point) => {
     const sweep = (point.y / total) * Math.PI * 2;
     const middle = angle + sweep / 2;
-    const offsetX = Math.cos(middle) * explosion;
-    const offsetY = Math.sin(middle) * explosion;
+    const slice = {
+      point,
+      sweep,
+      middle,
+      start: angle,
+      offsetX: Math.cos(middle) * explosion,
+      offsetY: Math.sin(middle) * explosion,
+      placement: labelPlacement(point),
+    };
+    angle += sweep;
+    return slice;
+  });
+  for (const { point, start, sweep, offsetX, offsetY } of slices) {
     const steps = Math.max(2, Math.ceil((sweep / (Math.PI * 2)) * 120));
     doc.save().fillColor(resolveColor(point.color, '#808080'));
-    doc.moveTo(...at(angle, radius, offsetX, offsetY));
-    for (let step = 1; step <= steps; step += 1) doc.lineTo(...at(angle + (sweep * step) / steps, radius, offsetX, offsetY));
-    for (let step = steps; step >= 0; step -= 1) doc.lineTo(...at(angle + (sweep * step) / steps, inner, offsetX, offsetY));
-    doc.fill().restore();
-    if (point.label) {
-      // The label box is measured from the text itself. A fixed-width box wraps a value that is merely
-      // a few points wider than the guess ("1 (50.0%)" became two lines), which SSRS never does.
-      const labelWidth = doc.widthOfString(String(point.label)) + 1;
-      const labelHalfHeight = doc.currentLineHeight() / 2;
-      if (/outside/i.test(point.labelPosition || '')) {
-        const segment = radius * PIE_CALLOUT_SEGMENT_RATIO;
-        const [stubX, stubY] = at(middle, radius, offsetX, offsetY);
-        const [elbowX, elbowY] = at(middle, radius + segment, offsetX, offsetY);
-        // The elbow follows the horizontal direction of the bisector. A bisector that is vertical has a
-        // cosine of ±1e-16, so compare against a tolerance: a floating-point sign must not decide which
-        // side of the shape the label sits on (SSRS puts a straight-up/straight-down callout on the right).
-        const right = Math.cos(middle) >= -COINCIDENT_ANGLE_TOLERANCE;
-        const elbowEndX = elbowX + (right ? segment : -segment);
-        const calloutColor = styleColor(chart.seriesDefs?.[0]?.customProperties?.PieLineColor, context, '#000000');
-        doc.save().lineWidth(0.75).strokeColor(calloutColor)
-          .moveTo(stubX, stubY).lineTo(elbowX, elbowY).lineTo(elbowEndX, elbowY)
-          .stroke().restore();
-        const textX = right
-          ? elbowEndX + PIE_CALLOUT_TEXT_GAP_PT
-          : elbowEndX - PIE_CALLOUT_TEXT_GAP_PT - labelWidth;
-        fillText(doc, point.label, textX, elbowY - labelHalfHeight, { width: labelWidth, align: right ? 'left' : 'right' });
-      } else {
-        const [labelX, labelY] = at(middle, inner + (radius - inner) * 0.55, offsetX, offsetY);
-        fillText(doc, point.label, labelX - labelWidth / 2, labelY - labelHalfHeight, { width: labelWidth, align: 'center' });
-      }
+    doc.moveTo(...at(start, radius, offsetX, offsetY));
+    for (let step = 1; step <= steps; step += 1) doc.lineTo(...at(start + (sweep * step) / steps, radius, offsetX, offsetY));
+    for (let step = steps; step >= 0; step -= 1) doc.lineTo(...at(start + (sweep * step) / steps, inner, offsetX, offsetY));
+    doc.fill();
+    doc.restore();
+  }
+  if (labelsDisabled) return;
+  for (const { point, middle, offsetX, offsetY, placement } of slices) {
+    if (!point.label) continue;
+    // The label box is measured from the text itself. A fixed-width box wraps a value that is merely
+    // a few points wider than the guess ("1 (50.0%)" became two lines), which SSRS never does.
+    const { labelWidth, lineHeight, outside, appearance } = placement;
+    // Measurement happened in the geometry pass, so the point's own data-label font has to be re-applied
+    // before the text is drawn: fillText paints with whatever face is current on the document.
+    setFont(doc, config, appearance);
+    const labelHalfHeight = lineHeight / 2;
+    if (outside) {
+      const segment = radius * PIE_CALLOUT_SEGMENT_RATIO;
+      const [stubX, stubY] = at(middle, radius, offsetX, offsetY);
+      const [elbowX, elbowY] = at(middle, radius + segment, offsetX, offsetY);
+      // The elbow follows the horizontal direction of the bisector. A bisector that is vertical has a
+      // cosine of ±1e-16, so compare against a tolerance: a floating-point sign must not decide which
+      // side of the shape the label sits on (SSRS puts a straight-up/straight-down callout on the right).
+      const right = Math.cos(middle) >= -COINCIDENT_ANGLE_TOLERANCE;
+      const elbowEndX = elbowX + (right ? segment : -segment);
+      const calloutColor = styleColor(chart.seriesDefs?.[0]?.customProperties?.PieLineColor, context, '#000000');
+      doc.save().lineWidth(0.75).strokeColor(calloutColor)
+        .moveTo(stubX, stubY).lineTo(elbowX, elbowY).lineTo(elbowEndX, elbowY)
+        .stroke().restore();
+      const textX = right
+        ? elbowEndX + PIE_CALLOUT_TEXT_GAP_PT
+        : elbowEndX - PIE_CALLOUT_TEXT_GAP_PT - labelWidth;
+      fillText(doc, point.label, textX, elbowY - labelHalfHeight, {
+        width: labelWidth,
+        height: lineHeight,
+        align: right ? 'left' : 'right',
+        color: appearance.color,
+      });
+    } else {
+      const [labelX, labelY] = at(middle, inner + (radius - inner) * 0.55, offsetX, offsetY);
+      fillText(doc, point.label, labelX - labelWidth / 2, labelY - labelHalfHeight, {
+        width: labelWidth,
+        height: lineHeight,
+        align: 'center',
+        color: appearance.color,
+      });
     }
-    angle += sweep;
   }
 }
 

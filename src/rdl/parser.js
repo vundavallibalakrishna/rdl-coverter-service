@@ -336,7 +336,7 @@ function parseChart(value, defaultFontFamily) {
     .filter(([name]) => name));
   const propertyAllowed = (name) => {
     if (/^PointWidth$/i.test(name)) return chartType === 'bar' || chartType === 'column';
-    if (/^(?:PieLineColor|PieStartAngle)$/i.test(name)) return chartType === 'pie' || chartType === 'doughnut';
+    if (/^(?:PieLabelStyle|PieLineColor|PieStartAngle)$/i.test(name)) return chartType === 'pie' || chartType === 'doughnut';
     return false;
   };
   return {
@@ -377,6 +377,9 @@ function parseChart(value, defaultFontFamily) {
     // Chart2 here) rely on a manual legend built from separate report items, so a synthetic legend
     // would duplicate it.
     chartArea: { style: styleOf(area.Style, defaultFontFamily) },
+    // A border skin supplies the outline treatment for shape-chart slices.  Keep it distinct from the
+    // chart area's rectangular border because SSRS applies it to the rendered chart shape instead.
+    borderSkin: value.ChartBorderSkin ? { style: styleOf(value.ChartBorderSkin.Style, defaultFontFamily) } : null,
     legend: {
       visible: Boolean(legend),
       hidden: textValue(legend?.Hidden, 'false'),

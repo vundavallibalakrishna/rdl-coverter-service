@@ -763,12 +763,20 @@ async function pictureForItem(
     // from the report-level datasets draws a different chart — every category in the dataset — so Word and
     // the PDF disagreed. Fall back only for a trace written before charts carried their data.
     const chartData = item.chartData || materializeChart(chart, datasets, request.parameters || {}, globals);
+    // The chart's own expressions — title, axis titles, legend title, expression-backed styles — resolve
+    // in the chart's data scope, which for a canvas cell, group instance or bundled subreport is not the
+    // invoking report's dataset set. Reuse the scope the canonical pass recorded so Word evaluates the
+    // same captions the PDF drew; only the page globals are this page's. Fall back to the report scope
+    // for a trace written before charts carried theirs.
+    const chartContext = item.chartContext
+      ? { ...item.chartContext, globals: { ...(item.chartContext.globals || {}), ...globals } }
+      : { datasets, parameters: request.parameters || {}, globals, fields: {}, dataset: [] };
     const rendered = await renderChartPng(
       chart,
       chartData,
       config,
       tempDir,
-      { datasets, parameters: request.parameters || {}, globals, fields: {}, dataset: [] },
+      chartContext,
       chartIndex,
     );
     if (!rendered?.data) unsupported('A PDF-traced chart could not be rendered for native Word', {
