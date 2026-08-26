@@ -619,6 +619,12 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
       // that came from a bundled subreport cannot be found by name in the invoking report — and a name it
       // happens to share with a parent chart would silently rebuild the wrong one.
       chartItem: item,
+      // The scope the chart's own expressions were evaluated in. A chart title, axis title, legend title
+      // or expression-backed style resolves against the chart's dataset — and for a bundled subreport
+      // that dataset belongs to the child report, so it is absent from the invoking report's datasets.
+      // Word rasterizes charts from this trace: without the recorded scope every field-backed caption
+      // re-renders empty there while the PDF shows it, so carry the resolved scope with the series.
+      chartContext: context,
     });
     drawChart(doc, config, item, data, x, y, item.width, item.height, context);
   } else if (item.type === 'Image') drawImage(doc, model, item, x, y, context);
@@ -1041,6 +1047,22 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const width = nested.subreport ? naturalWidth : Math.min(naturalWidth, usableWidth);
     const scale = width / naturalWidth;
     const columns = naturalColumns.map((value) => value * scale);
+    // The invoking Subreport's own box. It has no rows of its own: its extent is the rendered extent of
+    // the sibling regions this invocation produced, floored at the placeholder and child-body geometry,
+    // which is what SSRS frames. Measuring it here keeps the cell tall enough for the box on every path
+    // that sizes a row from its nested regions.
+    if (nested.subreportFrame) {
+      const frameLeft = nested.item.left || 0;
+      const frameTop = nested.item.top || 0;
+      const extent = nested.subreportFrame.reduce((box, sibling) => {
+        const siblingLayout = nestedLayout(sibling, availableWidth);
+        return {
+          width: Math.max(box.width, (sibling.item.left || 0) - frameLeft + siblingLayout.width),
+          height: Math.max(box.height, (sibling.item.top || 0) - frameTop + siblingLayout.height),
+        };
+      }, { width, height: nested.item.height || 0 });
+      return { columns, placements: [], heights: [], width: extent.width, height: extent.height };
+    }
     const placements = nestedPlacements(nested, nested.rows || [], columns.length);
     const heights = (nested.rows || []).map((row, rowIndex) => row.cells.reduce((maximum, cell, cellIndex) => {
       const textbox = cellTextbox(cell);
@@ -1073,6 +1095,25 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       x: parentX + (nested.item.left || 0),
       y: parentY + (nested.item.top || 0),
     };
+    if (nested.subreportFrame) {
+      // A content-free box: record it exactly like the body-level Subreport container so the trace-driven
+      // editable DOCX materializes the same frame, then let the outer-border pass below stroke it.
+      recordLayoutItem(doc, {
+        kind: 'rectangle',
+        itemName: nested.item.name || null,
+        zIndex: nested.item.zIndex || 0,
+        x: start.x,
+        y: start.y,
+        width: layout.width,
+        height: layout.height,
+        backgroundColor: styleColor(nested.item.style?.backgroundColor, {
+          parameters: nestedParameters, globals: nestedGlobals, datasets: nestedDatasets, dataset: [], fields: {},
+        }, null),
+        borders: resolvedTraceBorders(nested.item.style, {
+          parameters: nestedParameters, globals: nestedGlobals, datasets: nestedDatasets, dataset: [], fields: {},
+        }),
+      });
+    }
     const rowOffsets = [0];
     layout.heights.forEach((height) => rowOffsets.push(rowOffsets[rowOffsets.length - 1] + height));
     const columnOffsets = [0];
