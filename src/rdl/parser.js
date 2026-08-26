@@ -312,7 +312,8 @@ function parseChart(value, defaultFontFamily) {
   const chartType = chartTypeFor(rawType, rawSubtype);
   const stacked = chartStackMode(rawType, rawSubtype);
   const exploded = chartExploded(rawType, rawSubtype);
-  const seriesMember = parseChartMember(asArray(value.ChartSeriesHierarchy?.ChartMembers?.ChartMember)[0]);
+  const seriesMembers = asArray(value.ChartSeriesHierarchy?.ChartMembers?.ChartMember);
+  const seriesMember = parseChartMember(seriesMembers[0]);
   const area = asArray(value.ChartAreas?.ChartArea)[0] || {};
   const valueAxis = asArray(area.ChartValueAxes?.ChartAxis)[0] || {};
   const categoryAxis = asArray(area.ChartCategoryAxes?.ChartAxis)[0] || {};
@@ -349,6 +350,9 @@ function parseChart(value, defaultFontFamily) {
     unsupportedType: chartType ? null : rawType,
     category: parseChartMember(asArray(value.ChartCategoryHierarchy?.ChartMembers?.ChartMember)[0]),
     series: seriesMember?.group ? seriesMember : null,
+    // Static series use the hierarchy member labels, while the ChartSeries Name is an internal RDL
+    // identifier (often underscored) and is not what SSRS displays in the legend.
+    staticSeriesLabels: seriesMembers.map((member) => textValue(member.Label, null)),
     seriesDefs: seriesCollection.map((series) => {
       const point = asArray(series.ChartDataPoints?.ChartDataPoint)[0] || {};
       const dataLabel = point.ChartDataLabel || {};

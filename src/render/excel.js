@@ -7,6 +7,7 @@ import { ServiceError } from '../errors.js';
 import { resolveExcelLayoutMode } from '../excelLayoutMode.js';
 import { evaluateExpression, resolveReportCulture } from '../rdl/expression.js';
 import { parseDateValue } from '../rdl/dateValue.js';
+import { resolveSubreportInvocation } from '../rdl/validation.js';
 import { cellBorderStyle, cellText, cellTextbox, color, enforcedBottomBorder, isDateLikeValue, isFreeFormCell, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styledTextForItem, styleColor, styleSize, styleText, styleValue, tablixRows, textForItem } from './common.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { resolveGridColumns } from './tableLayout.js';
@@ -493,6 +494,70 @@ function paintsOwnExtent(style, context) {
   });
 }
 
+// The report an expanded item belongs to. A Subreport outside a data region is invoked once, in the scope
+// of the item that declares it, and SSRS lays the child report's body out inline at that position — so the
+// child's items keep the CHILD model, request, globals, and context for every dataset, expression, image,
+// and column measurement, while sitting in the parent's worksheet flow.
+function scopeOf(item, fallback) {
+  return item?.subreportScope || fallback;
+}
+
+function withSubreportScope(item, scope) {
+  return {
+    ...item,
+    subreportScope: item.subreportScope || scope,
+    ...(item.items ? { items: item.items.map((child) => withSubreportScope(child, scope)) } : {}),
+  };
+}
+
+function containsSubreport(item) {
+  if (item.type === 'Subreport') return true;
+  return (item.items || []).some((child) => containsSubreport(child));
+}
+
+// Replaces every Subreport that is NOT inside a data region with the child report's own body items, at the
+// invoking item's coordinates and carrying the child scope. A Subreport inside a tablix cell is deliberately
+// untouched: it is invoked once per emitted row and is materialized with that row's scope instead.
+function expandStandaloneSubreports(items, context) {
+  const expanded = [];
+  for (const item of items || []) {
+    if (item.type === 'Subreport') {
+      const invocation = resolveSubreportInvocation(item, context);
+      if (!invocation) continue;
+      const childRequest = { parameters: invocation.parameters, datasets: invocation.instance.datasets };
+      const childContext = {
+        parameters: invocation.parameters,
+        globals: invocation.globals,
+        datasets: normalizeDatasets(invocation.model, childRequest),
+        dataset: [],
+        fields: {},
+      };
+      const scope = {
+        model: invocation.model,
+        request: childRequest,
+        globals: invocation.globals,
+        context: childContext,
+      };
+      for (const child of expandStandaloneSubreports(invocation.model.body.items || [], childContext)) {
+        expanded.push(withSubreportScope({
+          ...child,
+          left: point((item.left || 0) + (child.left || 0)),
+          top: point((item.top || 0) + (child.top || 0)),
+        }, scope));
+      }
+      continue;
+    }
+    if (containsSubreport(item)) {
+      // A container keeps its own box; only the Subreport inside it is replaced. Once its children include
+      // the child report's data regions, the container-flattening pass below hoists them as usual.
+      expanded.push({ ...item, items: expandStandaloneSubreports(item.items || [], context) });
+      continue;
+    }
+    expanded.push(item);
+  }
+  return expanded;
+}
+
 // PageBreak is a property of every RDL report item, not only of a direct Body child. A rectangle is a
 // coordinate container rather than a page unit, so a break declared on one of its children splits the report
 // flow *inside* it. REPORT worksheets are partitioned at breaks, so such a container is expanded into its
@@ -562,7 +627,7 @@ function uniqueSheetName(workbook, requested, fallback) {
 }
 
 function partitionReportSections(model, context) {
-  const items = expandBreakBearingContainers(model.body.items || [], context)
+  const items = expandBreakBearingContainers(expandStandaloneSubreports(model.body.items || [], context), context)
     .sort((left, right) => left.top - right.top || left.left - right.left || left.zIndex - right.zIndex);
   const sections = [];
   let current = [];
@@ -571,7 +636,7 @@ function partitionReportSections(model, context) {
     current = [];
   };
   for (const item of items) {
-    const location = visiblePageBreak(item, context);
+    const location = visiblePageBreak(item, scopeOf(item, { context }).context);
     if (/^(Start|StartAndEnd)$/i.test(location)) finish();
     current.push(item);
     if (/^(End|StartAndEnd)$/i.test(location)) finish();
@@ -582,8 +647,15 @@ function partitionReportSections(model, context) {
 
 function firstVisibleText(items, model, request, globals) {
   const datasets = normalizeDatasets(model, request);
-  const context = { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets };
-  const visit = (item) => {
+  const reportScope = {
+    model,
+    request,
+    globals,
+    context: { parameters: request.parameters || {}, globals, fields: {}, dataset: [], datasets },
+  };
+  const visit = (item, parentScope = reportScope) => {
+    const scope = scopeOf(item, parentScope);
+    const context = scope.context;
     if (item.type === 'Textbox') {
       try {
         const value = String(textForItem(item, context) || '').replace(/\s+/g, ' ').trim();
@@ -592,7 +664,7 @@ function firstVisibleText(items, model, request, globals) {
     }
     if (item.type === 'Tablix') {
       try {
-        const { rows } = tablixRows(item, request, globals, model);
+        const { rows } = tablixRows(item, scope.request, scope.globals, scope.model);
         for (const row of rows.slice(0, 3)) {
           for (const cell of row.cells) {
             const value = cellText(cell).replace(/\s+/g, ' ').trim();
@@ -608,7 +680,7 @@ function firstVisibleText(items, model, request, globals) {
       } catch { /* a field-scoped chart title is not a stable section title */ }
     }
     for (const child of [...(item.items || [])].sort((a, b) => a.top - b.top || a.left - b.left)) {
-      const value = visit(child);
+      const value = visit(child, scope);
       if (value) return value;
     }
     return '';
@@ -701,13 +773,14 @@ function collectXBoundaries(items, request, globals, model, tablixCache, target,
     }
   };
   for (const item of items || []) {
+    const scope = scopeOf(item, { model, request, globals });
     const left = point(parentLeft + (item.left || 0));
     const right = point(left + (item.width || 0));
     target.add(left);
     target.add(right);
     spans.add(`${left}|${right}`);
     if (item.type === 'Tablix') {
-      const layout = tablixLayout(item, request, globals, model, tablixCache);
+      const layout = tablixLayout(item, scope.request, scope.globals, scope.model, tablixCache);
       let cursor = left;
       const offsets = [0];
       for (const width of layout.columns) {
@@ -727,7 +800,7 @@ function collectXBoundaries(items, request, globals, model, tablixCache, target,
         }
       }
     }
-    collectXBoundaries(item.items, request, globals, model, tablixCache, target, spans, left);
+    collectXBoundaries(item.items, scope.request, scope.globals, scope.model, tablixCache, target, spans, left);
   }
 }
 
@@ -1224,8 +1297,9 @@ async function renderFreeformBand({
   merges,
   measureDoc,
 }) {
+  const reportScope = { model, context };
   const resolved = items.map((item, sourceIndex) => {
-    const layout = resolveExcelFreeformLayout(item, context, config, measureDoc);
+    const layout = resolveExcelFreeformLayout(item, scopeOf(item, reportScope).context, config, measureDoc);
     return {
       item: layout.item,
       occupiedHeight: layout.occupiedHeight,
@@ -1266,9 +1340,9 @@ async function renderFreeformBand({
     await renderFreeformItem({
       workbook,
       worksheet,
-      model,
+      model: scopeOf(item, reportScope).model,
       item,
-      context,
+      context: scopeOf(item, reportScope).context,
       config,
       tempDir,
       chartCounter,
@@ -1819,6 +1893,9 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   });
 
   const renderNested = (nested, parentCellLeft, parentRowIndex, baseTop, ownTop) => {
+    const nestedParameters = nested.parameters || request.parameters || {};
+    const nestedDatasets = nested.datasets || datasets;
+    const nestedGlobals = nested.globals || globals;
     const nestedRows = nested.rows || [];
     const nestedColumns = nested.columns || nested.item.columns || [];
     const nestedPlacements = computeCellPlacements(nestedRows, nestedColumns.length);
@@ -1832,7 +1909,10 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       for (const [cellIndex, cell] of row.cells.entries()) {
         const start = nestedPlacements[rowIndex][cellIndex];
         const context = materializedCellContext(cell, row, {
-          parameters: request.parameters || {}, globals, dataset: datasets[nested.item.datasetName] || [], datasets,
+          parameters: nestedParameters,
+          globals: nestedGlobals,
+          dataset: nestedDatasets[nested.item.datasetName] || [],
+          datasets: nestedDatasets,
         });
         const presentation = cellStyle(nested.item, cell, context);
         const owner = { cell, rowIndex, start, ...presentation };
@@ -1860,14 +1940,41 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
           startRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, top),
           endRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, bottom) - 1,
         };
-        if (range.startRow !== range.endRow || range.startCol !== range.endCol) mergeSafe(worksheet, range, merges);
-        const target = worksheet.getCell(range.startRow, range.startCol);
-        const { value, numFmt } = excelCellValue(cell, owner.context);
-        const display = cellText(cell);
-        target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
-        if (numFmt) target.numFmt = numFmt;
-        applyFillFontAlignment(target, owner.style || {}, owner.context);
-        target.border = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item));
+        const borders = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item));
+        if (isFreeFormCell(cell)) {
+          for (const child of cell.items || []) {
+            // Tablix/Subreport entries are the design-time source of the materialized child regions, which
+            // the recursive call below renders.
+            if (child.type === 'Tablix' || child.type === 'Subreport') continue;
+            if (isHidden(child.hidden, owner.context)) continue;
+            canvasPlacements.push({
+              item: child,
+              // A chart on a region's canvas is scoped to that region's rows, exactly as the canonical PDF
+              // pass scopes it, rather than to the whole report dataset.
+              context: nested.item.datasetName
+                ? {
+                  ...owner.context,
+                  datasets: { ...owner.context.datasets, [nested.item.datasetName]: owner.context.dataset },
+                }
+                : owner.context,
+              // The report the picture's definition came from, so an embedded child-report image resolves
+              // against that report rather than the one that invoked it.
+              model: nested.model || null,
+              left: point(left + (child.left || 0)),
+              top: point(top + (child.top || 0)),
+            });
+          }
+          applyRegionBorder(worksheet, range, borders);
+        } else {
+          if (range.startRow !== range.endRow || range.startCol !== range.endCol) mergeSafe(worksheet, range, merges);
+          const target = worksheet.getCell(range.startRow, range.startCol);
+          const { value, numFmt } = excelCellValue(cell, owner.context);
+          const display = cellText(cell);
+          target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
+          if (numFmt) target.numFmt = numFmt;
+          applyFillFontAlignment(target, owner.style || {}, owner.context);
+          target.border = borders;
+        }
         const childCellLeft = left;
         for (const child of cell.nestedTablixes || []) renderNested(child, childCellLeft, parentRowIndex, top, nestedTop(cell, child));
       }
@@ -2094,11 +2201,13 @@ async function renderCoordinateScheduledSection({
   const sectionOriginTop = preserveLeadingBodyGap || !section.length
     ? 0
     : Math.min(...section.map((item) => point(item.top || 0)));
+  const reportScope = { model, request, globals, context };
   const plans = [];
   for (const item of section) {
+    const scope = scopeOf(item, reportScope);
     const designTop = point((item.top || 0) - sectionOriginTop);
     if (item.type !== 'Tablix') {
-      const resolved = resolveExcelFreeformLayout(item, context, config, measureDoc);
+      const resolved = resolveExcelFreeformLayout(item, scope.context, config, measureDoc);
       plans.push({
         item: resolved.item,
         designTop,
@@ -2112,10 +2221,10 @@ async function renderCoordinateScheduledSection({
     const planningSheet = planningWorkbook.addWorksheet('Tablix');
     const region = renderReportTablix({
       worksheet: planningSheet,
-      model,
+      model: scope.model,
       item,
-      request,
-      globals,
+      request: scope.request,
+      globals: scope.globals,
       config,
       xGrid,
       startRow: 1,
@@ -2241,7 +2350,7 @@ async function renderCoordinateScheduledSection({
         await renderFreeformItem({
           workbook,
           worksheet,
-          model,
+          model: placed.model || scopeOf(plan.item, reportScope).model,
           item: { ...placed.item, left: placed.left, top: placedTop },
           context: placed.context,
           config,
@@ -2263,13 +2372,13 @@ async function renderCoordinateScheduledSection({
     await renderFreeformItem({
       workbook,
       worksheet,
-      model,
+      model: scopeOf(plan.item, reportScope).model,
       item: {
         ...plan.item,
         top: plan.resolvedTop,
         height: plan.occupiedHeight,
       },
-      context,
+      context: scopeOf(plan.item, reportScope).context,
       config,
       tempDir,
       chartCounter,
@@ -2363,7 +2472,7 @@ function configureReportSheet(worksheet, model, request, globals, usedRows, used
 function declaredSectionName(items, context) {
   for (const item of items) {
     if (item.pageName !== null && item.pageName !== undefined && String(item.pageName).trim() !== '') {
-      const value = evaluateExpression(item.pageName, context);
+      const value = evaluateExpression(item.pageName, scopeOf(item, { context }).context);
       const name = String(value ?? '').replace(/\s+/g, ' ').trim();
       if (name) return name;
     }
@@ -2378,7 +2487,12 @@ function containsTablix(item) {
 
 function containsChart(item) {
   if (item.type === 'Chart') return true;
-  return (item.items || []).some((child) => containsChart(child));
+  // A bundled subreport contributes its child body's charts to this render, whether it is invoked from the
+  // body canvas or from a tablix cell. The definition is already resolved on the item, so deciding whether
+  // a raster workspace is needed does not require the invocation's data.
+  const childBody = item.type === 'Subreport' ? (item.resolvedSubreport?.model?.body?.items || []) : [];
+  const cellItems = (item.rows || []).flatMap((row) => (row.cells || []).flatMap((cell) => cell.items || []));
+  return [...(item.items || []), ...cellItems, ...childBody].some((child) => containsChart(child));
 }
 
 async function renderReportExcel(model, request, config, tempDir) {
@@ -2457,8 +2571,10 @@ async function renderReportExcel(model, request, config, tempDir) {
       cursor += scheduled.rowsConsumed;
       detailRegions.push(...scheduled.detailRegions);
     }
+    const reportScope = { model, request, globals: sectionGlobals, context: sectionContext };
     const renderSectionItem = async (sourceItem, parentLeft = 0) => {
       const item = { ...sourceItem, left: point(parentLeft + (sourceItem.left || 0)) };
+      const scope = scopeOf(item, reportScope);
       if (item.type === 'Rectangle') {
         // A fixed rectangle is a true coordinate container. Rendering all of its children in one band
         // preserves side-by-side charts/text/images. Rectangles containing tablixes retain the flow-aware
@@ -2467,10 +2583,10 @@ async function renderReportExcel(model, request, config, tempDir) {
           const consumed = await renderFreeformBand({
             workbook,
             worksheet,
-            model,
+            model: scope.model,
             items: [{ ...item, top: 0 }],
             height: Math.max(2, item.height || DEFAULT_ROW_POINTS),
-            context: sectionContext,
+            context: scope.context,
             config,
             tempDir,
             chartCounter,
@@ -2500,16 +2616,16 @@ async function renderReportExcel(model, request, config, tempDir) {
           startRow: containerStart,
           endRow: Math.max(containerStart, cursor - 1),
         };
-        paintContainerExtent(worksheet, range, item, sectionContext);
+        paintContainerExtent(worksheet, range, item, scope.context);
         return;
       }
       if (item.type === 'Tablix') {
         const region = renderReportTablix({
           worksheet,
-          model,
+          model: scope.model,
           item,
-          request,
-          globals: sectionGlobals,
+          request: scope.request,
+          globals: scope.globals,
           config,
           xGrid,
           startRow: cursor,
@@ -2525,10 +2641,10 @@ async function renderReportExcel(model, request, config, tempDir) {
       const consumed = await renderFreeformBand({
         workbook,
         worksheet,
-        model,
+        model: scope.model,
         items: [{ ...item, top: 0 }],
         height,
-        context: sectionContext,
+        context: scope.context,
         config,
         tempDir,
         chartCounter,

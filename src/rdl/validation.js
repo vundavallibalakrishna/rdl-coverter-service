@@ -383,6 +383,66 @@ function itemValue(item, context) {
   return item.type === 'Textbox' ? evaluateItemText(item, context) : '';
 }
 
+// Globals a child report body is evaluated in. Report identity and variables belong to the child, while
+// page-dependent globals stay bound to the enclosing render: a subreport body is laid out inside the
+// parent's pagination, so Globals!PageNumber must report the page the child content actually lands on
+// rather than a snapshot taken when the invocation was materialized.
+function childReportGlobals(parentGlobals = {}, overrides = {}) {
+  const child = { ...parentGlobals, ...overrides };
+  for (const key of ['PageNumber', 'TotalPages']) {
+    if (!(key in parentGlobals)) continue;
+    Object.defineProperty(child, key, { enumerable: true, configurable: true, get: () => parentGlobals[key] });
+  }
+  return child;
+}
+
+/**
+ * Resolves one Subreport invocation against its bundled definition, in the scope the invoking item was
+ * evaluated in. SSRS identifies a child invocation by its concrete parameter values, so the resolved
+ * parameter signature selects the instance; the child's parameters, fields, and row limits are validated
+ * only once the call is visible, exactly as SSRS defers a hidden subreport.
+ *
+ * Returns null when the invoking item is hidden. Never executes a child query or report-server path.
+ */
+export function resolveSubreportInvocation(item, context) {
+  if (evalHidden(item.hidden, context)) return null;
+  const resolved = item.resolvedSubreport || item.resolveBundledSubreport?.();
+  if (!resolved?.model || !resolved.instancesBySignature) {
+    throw new ServiceError('UNSUPPORTED_FEATURE', `Subreport is not bundled: ${item.reportName || item.name || 'unnamed'}`);
+  }
+  const suppliedParameters = Object.fromEntries((item.parameters || []).map((parameter) => [
+    parameter.name,
+    evaluateExpression(parameter.value, context),
+  ]));
+  const childParameters = resolveParameterValues(resolved.model.parameters, suppliedParameters);
+  const signature = parameterSignature(resolved.model.parameters, childParameters);
+  const instance = resolved.instancesBySignature.get(signature);
+  if (!instance) {
+    throw new ServiceError(
+      'DATASET_MISSING',
+      `Subreport invocation data is missing: ${item.reportName || item.name || 'unnamed'}`,
+    );
+  }
+  // Bundle resolution deliberately defers validation until an invocation is actually visible. A hidden
+  // SSRS subreport does not need concrete parameters or rows; a visible one still receives the full
+  // parameter, dataset, field, and limit validation before any child content is materialized.
+  const instanceValidation = validateRenderInput(resolved.model, instance, resolved.limits);
+  instance.parameters = instanceValidation.parameters;
+  Object.defineProperty(instance.parameters, '__rdlParameterLabels', {
+    value: instanceValidation.parameterLabels || {}, enumerable: false, configurable: true,
+  });
+  const datasets = Object.fromEntries(resolved.model.datasets.map((dataset) => [
+    dataset.name,
+    (instance.datasets[dataset.name] || []).map((row) => normalizeFields(row, dataset.fields)),
+  ]));
+  const globals = childReportGlobals(context.globals, {
+    ReportName: resolved.reportName,
+    variables: resolved.model.variables || {},
+    __nestedTablixDepth: (context.nestedTablixDepth || 0) + 1,
+  });
+  return { definition: resolved, model: resolved.model, instance, parameters: instance.parameters, datasets, globals };
+}
+
 function materializedCell(rawCell, context, duplicateState, duplicatePrefix, scopeResolver) {
   // A cell whose content is only container Rectangles has no border-bearing item of its own, so its edges
   // keep resolving from the tablix style (as they did before the Rectangle was flattened away). Without
@@ -450,46 +510,13 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     };
   });
   for (const item of cell.items.filter((candidate) => candidate.type === 'Subreport')) {
-    if (evalHidden(item.hidden, context)) continue;
-    const resolved = item.resolvedSubreport || item.resolveBundledSubreport?.();
-    if (!resolved?.model || !resolved.instancesBySignature) {
-      throw new ServiceError('UNSUPPORTED_FEATURE', `Subreport is not bundled: ${item.reportName || item.name || 'unnamed'}`);
-    }
-    const suppliedParameters = Object.fromEntries((item.parameters || []).map((parameter) => [
-      parameter.name,
-      evaluateExpression(parameter.value, context),
-    ]));
-    const childParameters = resolveParameterValues(resolved.model.parameters, suppliedParameters);
-    const signature = parameterSignature(resolved.model.parameters, childParameters);
-    const instance = resolved.instancesBySignature.get(signature);
-    if (!instance) {
-      throw new ServiceError(
-        'DATASET_MISSING',
-        `Subreport invocation data is missing: ${item.reportName || item.name || 'unnamed'}`,
-      );
-    }
-    // Bundle resolution deliberately defers validation until an invocation is actually visible. A hidden
-    // SSRS subreport does not need concrete parameters or rows; a visible one still receives the full
-    // parameter, dataset, field, and limit validation before any child content is materialized.
-    const instanceValidation = validateRenderInput(resolved.model, instance, resolved.limits);
-    instance.parameters = instanceValidation.parameters;
-    Object.defineProperty(instance.parameters, '__rdlParameterLabels', {
-      value: instanceValidation.parameterLabels || {}, enumerable: false, configurable: true,
-    });
-    const childDatasets = Object.fromEntries(resolved.model.datasets.map((dataset) => [
-      dataset.name,
-      (instance.datasets[dataset.name] || []).map((row) => normalizeFields(row, dataset.fields)),
-    ]));
-    const childGlobals = {
-      ...context.globals,
-      ReportName: resolved.reportName,
-      variables: resolved.model.variables || {},
-      __nestedTablixDepth: (context.nestedTablixDepth || 0) + 1,
-    };
+    const invocation = resolveSubreportInvocation(item, context);
+    if (!invocation) continue;
+    const { model: childModel, instance, datasets: childDatasets, globals: childGlobals } = invocation;
     // A subreport body is free-form and may contain a Textbox (not only a data region). Keep native
     // tablixes on the existing path and normalize other body items to one-cell nested regions so all
     // renderers share the same coordinate, growth, and border behavior.
-    for (const childItem of resolved.model.body.items) {
+    for (const childItem of childModel.body.items) {
       const left = (item.left || 0) + (childItem.left || 0);
       const top = (item.top || 0) + (childItem.top || 0);
       if (childItem.type === 'Tablix') {
@@ -503,6 +530,9 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
           datasets: childDatasets,
           globals: childGlobals,
           subreport: true,
+          // The report this region came from. Its embedded images and declared item definitions belong to
+          // the child, not to the report that invoked it.
+          model: childModel,
           // SSRS honours KeepTogether from the invoking Subreport item, not from the child report body's
           // own tablix. Record it here so pagination can tell "keep this subreport on one page" apart from
           // whatever the child definition declares.
@@ -510,8 +540,8 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
         });
         continue;
       }
-      const width = Math.max(1, childItem.width || resolved.model.body.width || 1);
-      const height = Math.max(1, childItem.height || resolved.model.body.height || 1);
+      const width = Math.max(1, childItem.width || childModel.body.width || 1);
+      const height = Math.max(1, childItem.height || childModel.body.height || 1);
       const wrapper = {
         type: 'Tablix',
         name: `${childItem.name || 'SubreportItem'}__nested`,
@@ -536,6 +566,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
         datasets: childDatasets,
         globals: childGlobals,
         subreport: true,
+        model: childModel,
         keepTogether: item.keepTogether,
       });
     }
