@@ -8,6 +8,7 @@ import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
 import { materializeChart } from './chartData.js';
 import { drawChart } from './chart.js';
 import { resolveReportCulture } from '../rdl/expression.js';
+import { resolveSubreportInvocation } from '../rdl/validation.js';
 import {
   attachLayoutTrace,
   beginLayoutTracePage,
@@ -614,6 +615,10 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
       // so carry the resolved series here — re-materializing downstream from the report-level datasets
       // redraws a different chart (every category in the dataset instead of the group's own).
       chartData: data,
+      // The definition that was drawn. An RDL item Name is unique only within its own report, so a chart
+      // that came from a bundled subreport cannot be found by name in the invoking report — and a name it
+      // happens to share with a parent chart would silently rebuild the wrong one.
+      chartItem: item,
     });
     drawChart(doc, config, item, data, x, y, item.width, item.height, context);
   } else if (item.type === 'Image') drawImage(doc, model, item, x, y, context);
@@ -1028,7 +1033,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const naturalColumns = nested.columns || nested.item.columns || [];
     const naturalWidth = Math.max(1, naturalColumns.reduce((sum, value) => sum + value, 0));
     const usableWidth = Math.max(1, availableWidth - Math.max(0, nested.item.left || 0));
-    const width = Math.min(naturalWidth, usableWidth);
+    // A native nested tablix was designed inside the cell that holds it, so it is fitted to the width that
+    // cell actually got. A bundled subreport is a whole child report laid out inside a placeholder box:
+    // SSRS never scales report content, so it keeps its own column widths and overflows a narrower
+    // placeholder rather than being squeezed into it — squeezing collapses child columns to a few points
+    // and wraps their text into an unbounded, unpaginatable column.
+    const width = nested.subreport ? naturalWidth : Math.min(naturalWidth, usableWidth);
     const scale = width / naturalWidth;
     const columns = naturalColumns.map((value) => value * scale);
     const placements = nestedPlacements(nested, nested.rows || [], columns.length);
@@ -1095,7 +1105,32 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         const borderStyle = cellBorderStyle(cell, nested.item) || {};
         const background = styleColor(style.backgroundColor, context, null);
         if (background) doc.save().rect(x, cellY, width, height).fill(background).restore();
-        if (textbox && !cell.hidden) {
+        // A nested region cell is a free-form canvas whenever it holds a chart, image, line, or several
+        // positioned textboxes — the same rule the top-level tablix path applies. A bundled subreport body
+        // reaches every renderer through such cells, so drawing only the cell's first textbox here dropped
+        // the child report's charts and images entirely.
+        if (isFreeFormCell(cell) && !cell.hidden) {
+          const canvasContext = nested.item.datasetName
+            ? { ...context, datasets: { ...context.datasets, [nested.item.datasetName]: context.dataset } }
+            : context;
+          const canvasItems = [...(cell.items || [])].sort((left, right) => (
+            (left.zIndex || 0) - (right.zIndex || 0)
+            || (left.top || 0) - (right.top || 0)
+            || (left.left || 0) - (right.left || 0)
+          ));
+          for (const canvasItem of canvasItems) {
+            if (canvasItem.type === 'Tablix' || canvasItem.type === 'Subreport') continue;
+            drawSimpleItem(
+              doc,
+              config,
+              nested.model || model,
+              canvasItem,
+              x + (canvasItem.left || 0),
+              cellY + (canvasItem.top || 0),
+              canvasContext,
+            );
+          }
+        } else if (textbox && !cell.hidden) {
           drawTextbox(doc, config, textbox, x, cellY, context, {
             width,
             height,
@@ -2045,16 +2080,20 @@ export async function renderPdf(model, request, config, options = {}) {
     normalizedDatasetCount: Object.keys(datasets || {}).length,
     captureLayoutTrace: Boolean(layoutTrace),
   });
-  const renderBodyItem = (item, x, y, context, pagination = {}) => {
+  // The report an item and its subtree belong to. A bundled subreport's body is laid out inline in the
+  // parent's flow, but every expression, dataset, image, and font in it resolves against the CHILD report
+  // definition and that invocation's rows, so the scope travels with the item instead of being closed over.
+  const reportScope = { model, request };
+  const renderBodyItem = (item, x, y, context, pagination = {}, scope = reportScope) => {
     const pageAdvance = pagination.addPage || addPage;
     if (isHidden(item.hidden, context)) return { endY: y };
     if (item.type === 'Tablix') {
       return renderTablix({
         doc,
         config,
-        model,
+        model: scope.model,
         item,
-        request,
+        request: scope.request,
         startX: x,
         startY: y,
         pageBottom,
@@ -2136,7 +2175,41 @@ export async function renderPdf(model, request, config, options = {}) {
         firstSegment = false;
       }
     }
-    if (item.type === 'Rectangle') {
+    // A Rectangle and a Subreport are both coordinate containers whose children flow, break, and grow
+    // inside the enclosing pagination. They differ only in where the children come from and which scope
+    // they are evaluated in: a Subreport outside a data region is invoked once, in the scope of the item
+    // that declares it, and SSRS lays the child report's body out inline at that position. Sharing one
+    // container path is what gives a standalone subreport the same banding, page-break, growth, and
+    // fragmentation rules the rest of the body already obeys.
+    let containerChildren = item.type === 'Rectangle' ? (item.items || []) : null;
+    let containerWidth = item.width;
+    let containerHeight = item.height;
+    let childContext = context;
+    let childScope = scope;
+    if (item.type === 'Subreport') {
+      const invocation = resolveSubreportInvocation(item, context);
+      if (!invocation) return { endY: y };
+      const childRequest = {
+        ...scope.request,
+        parameters: invocation.parameters,
+        datasets: invocation.instance.datasets,
+      };
+      childScope = { model: invocation.model, request: childRequest };
+      childContext = {
+        parameters: invocation.parameters,
+        globals: invocation.globals,
+        datasets: normalizeDatasets(invocation.model, childRequest),
+        dataset: [],
+        fields: {},
+      };
+      containerChildren = invocation.model.body.items || [];
+      // The invoking item's Width/Height are a placeholder for a child report that is measured only at
+      // render time. SSRS never scales report content, so the rendered subreport occupies at least the
+      // child body's own declared extent and simply overflows a smaller placeholder.
+      containerWidth = Math.max(item.width || 0, invocation.model.body.width || 0);
+      containerHeight = Math.max(item.height || 0, invocation.model.body.height || 0);
+    }
+    if (containerChildren) {
       const backgroundColor = styleColor(item.style.backgroundColor, context, null);
       const rectangleTrace = recordLayoutItem(doc, {
         kind: 'rectangle',
@@ -2144,12 +2217,12 @@ export async function renderPdf(model, request, config, options = {}) {
         zIndex: item.zIndex || 0,
         x,
         y,
-        width: item.width,
-        height: item.height,
+        width: containerWidth,
+        height: containerHeight,
         backgroundColor,
         borders: resolvedTraceBorders(item.style, context),
       });
-      if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, item.width, item.height).fill().restore();
+      if (backgroundColor) doc.save().fillColor(backgroundColor).rect(x, y, containerWidth, containerHeight).fill().restore();
       // The border is deferred to the end of this branch, after the child bands are laid out, so its
       // bottom edge tracks the container's *rendered* height. A flow child such as a Tablix with a CanGrow
       // cell can grow past the rectangle's declared height; drawing the border here at item.height would
@@ -2157,10 +2230,10 @@ export async function renderPdf(model, request, config, options = {}) {
       // tablix edge (the "double line" defect). A bordered/filled rectangle is guarded against page
       // fragmentation below, so the grown extent stays on one page and endY - y is a valid single-page
       // height.
-      const visibleChildren = (item.items || []).filter((child) => !isHidden(child.hidden, context));
+      const visibleChildren = containerChildren.filter((child) => !isHidden(child.hidden, childContext));
       const bands = containerLayoutBands(
         visibleChildren,
-        (child) => !/^None$/i.test(activeBreakLocation(child, context)),
+        (child) => !/^None$/i.test(activeBreakLocation(child, childContext)),
       );
       // Fragmenting the container is only safe when nothing paints its extent: a fill or border would be
       // drawn once, at the design height, on the page the container started on. The same guard already
@@ -2183,7 +2256,7 @@ export async function renderPdf(model, request, config, options = {}) {
       // a following sibling, or a sibling of an ancestor.
       let pendingBreak = false;
       for (const band of bands) {
-        const bandBreak = band.isolated ? activeBreakLocation(band.items[0], context) : 'None';
+        const bandBreak = band.isolated ? activeBreakLocation(band.items[0], childContext) : 'None';
         const gap = hasRenderedBand ? Math.max(0, band.top - previousDesignBottom) : band.top;
         let bandY = endY + gap;
         const bandHeight = band.designBottom - band.top;
@@ -2235,8 +2308,9 @@ export async function renderPdf(model, request, config, options = {}) {
               child,
               x + (child.left || 0),
               childY,
-              context,
+              childContext,
               { addPage: synchronizedAdvance },
+              childScope,
             );
             state.lastPage = Math.max(state.lastPage, globals.PageNumber);
             bandPropagatedBreak = bandPropagatedBreak || Boolean(rendered.pageBreakAfter);
@@ -2261,8 +2335,9 @@ export async function renderPdf(model, request, config, options = {}) {
               child,
               x + (child.left || 0),
               childY,
-              context,
+              childContext,
               { addPage: pageAdvance },
+              childScope,
             );
             const renderedEndY = rendered.endY ?? childY;
             bandPropagatedBreak = bandPropagatedBreak || Boolean(rendered.pageBreakAfter);
@@ -2280,21 +2355,21 @@ export async function renderPdf(model, request, config, options = {}) {
         if (breaksAfterItem(bandBreak) || bandPropagatedBreak) pendingBreak = true;
       }
       if (hasRenderedBand) {
-        endY += Math.max(0, item.height - previousDesignBottom);
+        endY += Math.max(0, containerHeight - previousDesignBottom);
       }
-      const renderedHeight = Math.max(item.height, endY - y);
+      const renderedHeight = Math.max(containerHeight, endY - y);
       // Correct the recorded geometry and draw the border/box at the rendered height so PDF, and the
       // trace-driven editable DOCX built from it, keep the container's bottom edge coincident with grown
       // flow content instead of doubling it at the declared height.
       if (rectangleTrace) rectangleTrace.height = Math.round(renderedHeight * 1000) / 1000;
-      drawBorder(doc, x, y, item.width, renderedHeight, item.style, context);
+      drawBorder(doc, x, y, containerWidth, renderedHeight, item.style, context);
       return {
         height: renderedHeight,
-        endY: hasRenderedBand ? endY : y + item.height,
+        endY: hasRenderedBand ? endY : y + containerHeight,
         pageBreakAfter: pendingBreak,
       };
     }
-    drawSimpleItem(doc, config, model, item, x, y, context);
+    drawSimpleItem(doc, config, scope.model, item, x, y, context);
     return { height: item.height, endY: y + item.height };
   };
   const items = [...model.body.items].sort((left, right) => left.top - right.top || left.left - right.left || left.zIndex - right.zIndex);
@@ -2303,7 +2378,9 @@ export async function renderPdf(model, request, config, options = {}) {
   // path: rendering two independently paginating objects beside each other needs synchronized page
   // fragments, while fixed items can safely share their declared page-relative Y coordinate.
   const isFixedCoordinateItem = (item) => {
-    if (item.type === 'Tablix' || (item.type === 'Textbox' && item.canGrow)) return false;
+    // A Subreport is a flow region like a Tablix: the child body it renders is measured only at render
+    // time, so its declared placeholder box says nothing about how far down the page it reaches.
+    if (item.type === 'Tablix' || item.type === 'Subreport' || (item.type === 'Textbox' && item.canGrow)) return false;
     // A declared break makes the item move the page cursor, so it is a flow participant however simple its
     // own content is. Without this a break nested in a textbox-only rectangle keeps the fixed-coordinate
     // fast path and its page advance is measured against a stale band origin.
@@ -2388,7 +2465,7 @@ export async function renderPdf(model, request, config, options = {}) {
     // the growable-textbox flow above already reasons about its own oversized blocks.
     const freshPageCapacity = pageBottom - bodyTop;
     if (y >= pageBottom || (
-      band.every((candidate) => candidate.type !== 'Tablix')
+      band.every((candidate) => candidate.type !== 'Tablix' && candidate.type !== 'Subreport')
       && y + bandBottomOffset > pageBottom
       && bandBottomOffset <= freshPageCapacity + COINCIDENT_EDGE_TOLERANCE_PT
       && pageHasContent

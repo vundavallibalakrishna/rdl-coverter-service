@@ -82,6 +82,13 @@ const dormantGrandchildRdl = childRdl.replace(
   '<Textbox Name="ChildLabel">',
   '<Subreport Name="DormantGrandchild"><ReportName>/Children/Grandchild</ReportName><Height>0.25in</Height><Width>2in</Width></Subreport><Textbox Name="ChildLabel">',
 );
+const childWithGrandchildRdl = childRdl.replace(
+  /<Textbox Name="ChildLabel">[\s\S]*?<\/Textbox>/,
+  `<Subreport Name="GrandchildCall"><ReportName>/Children/Grandchild</ReportName>
+    <Parameters><Parameter Name="EntityID"><Value>=Fields!EntityID.Value</Value></Parameter></Parameters>
+    <Height>0.25in</Height><Width>2in</Width>
+  </Subreport>`,
+);
 
 function bundledRequest(instances) {
   return {
@@ -217,6 +224,48 @@ test('fails closed when a materialized nested subreport has no bundled definitio
     converter.render({ rdl: parentRdl, ...request, output: 'XLSX' }),
     (error) => error.code === 'UNSUPPORTED_FEATURE',
   );
+});
+
+test('resolves a grandchild definition scoped beneath its bundled parent in every REPORT renderer', async (context) => {
+  const converter = await createConverter({
+    env: { ...process.env, RDL_STRICT_FONTS: 'false', RDL_RENDER_TIMEOUT_MS: '30000' },
+  });
+  context.after(() => converter.close());
+  const request = bundledRequest([
+    { parameters: { EntityID: 1 }, datasets: { ChildData: [{ EntityID: 1, Label: 'CHILD_ALPHA' }] } },
+    { parameters: { EntityID: 2 }, datasets: { ChildData: [{ EntityID: 2, Label: 'CHILD_BETA' }] } },
+  ]);
+  request.subreports['/Children/Child'].rdlBase64 = Buffer.from(childWithGrandchildRdl).toString('base64');
+  request.subreports['/Children/Child'].subreports = {
+    '/Children/Grandchild': {
+      rdlBase64: Buffer.from(childRdl).toString('base64'),
+      instances: [
+        { parameters: { EntityID: 1 }, datasets: { ChildData: [{ EntityID: 1, Label: 'GRANDCHILD_ALPHA' }] } },
+        { parameters: { EntityID: 2 }, datasets: { ChildData: [{ EntityID: 2, Label: 'GRANDCHILD_BETA' }] } },
+      ],
+    },
+  };
+
+  const pdf = await converter.render({ rdl: parentRdl, ...request, output: 'PDF' });
+  assert.equal(pdf.pageCount > 0, true);
+
+  const docx = await converter.render({ rdl: parentRdl, ...request, output: 'DOCX_EDITABLE' });
+  const docxZip = await JSZip.loadAsync(docx.buffer);
+  const documentXml = await docxZip.file('word/document.xml').async('string');
+  assert.match(documentXml, /GRANDCHILD_ALPHA/);
+  assert.match(documentXml, /GRANDCHILD_BETA/);
+
+  const visualDocx = await converter.render({ rdl: parentRdl, ...request, output: 'DOCX_VISUAL' });
+  const visualZip = await JSZip.loadAsync(visualDocx.buffer);
+  assert.ok(Object.keys(visualZip.files).some((name) => name.startsWith('word/media/')));
+
+  const xlsx = await converter.render({ rdl: parentRdl, ...request, output: 'XLSX' });
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(xlsx.buffer);
+  const values = [];
+  for (const worksheet of workbook.worksheets) worksheet.eachRow((row) => row.eachCell((cell) => values.push(cell.text)));
+  assert.ok(values.includes('GRANDCHILD_ALPHA'));
+  assert.ok(values.includes('GRANDCHILD_BETA'));
 });
 
 test('does not validate a bundled instance for a subreport hidden by SSRS visibility', async (context) => {

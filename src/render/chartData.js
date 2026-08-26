@@ -77,6 +77,8 @@ function pointLabel(dataLabel, y, row, base) {
   if (!dataLabel?.visible) return null;
   if (dataLabel.useValueAsLabel) return y === null ? '' : String(y);
   if (dataLabel.expression) {
+    // SSRS's chart keyword binds the label to the resolved Y value, not a literal string.
+    if (/^#VALY$/i.test(String(dataLabel.expression).trim())) return y === null ? '' : String(y);
     const value = evalIn(dataLabel.expression, row, base);
     return value === null || value === undefined ? '' : String(value);
   }
@@ -89,7 +91,7 @@ function pointLabel(dataLabel, y, row, base) {
 export function materializeChart(chart, datasetsByName, parameters = {}, globals = {}) {
   const rows = datasetsByName[chart.datasetName] || [];
   const base = { parameters, globals, datasets: datasetsByName, dataset: rows, fields: {} };
-  const seriesDef = chart.seriesDefs[0] || {};
+  const seriesDefs = chart.seriesDefs.length ? chart.seriesDefs : [{}];
   const palette = chartPalette(chart, base);
 
   const categories = groupsFor(chart.category, rows, base);
@@ -97,23 +99,35 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
   const seriesRows = grouped
     ? rows.filter((row) => (chart.series.filters || []).every((filter) => filterMatches(filter, row, parameters, globals, rows, datasetsByName)))
     : rows;
-  const seriesGroups = grouped ? groupsFor(chart.series, seriesRows, base) : [{ label: seriesDef.name, rows: seriesRows }];
+  const seriesGroups = grouped ? groupsFor(chart.series, seriesRows, base) : [];
 
   // A shape chart (pie/doughnut) consumes one palette colour and one legend entry PER DATA POINT, so an
   // empty point changes what every later point looks like. Other chart types key the legend/palette off
   // the series, where an empty cell only leaves a gap in that series' own line of points.
   const shapeChart = chart.chartType === 'pie' || chart.chartType === 'doughnut';
 
-  const series = seriesGroups.map((group, seriesIndex) => {
+  // A static series hierarchy has one chart series for every ChartSeries definition. A dynamic
+  // hierarchy instead expands the declared definition across its data-driven member instances.
+  const entries = grouped
+    ? seriesGroups.map((group, index) => ({ group, definition: seriesDefs[index % seriesDefs.length], index }))
+    : seriesDefs.map((definition, index) => ({
+      group: { label: chart.staticSeriesLabels?.[index] ?? definition.name, rows: seriesRows }, definition, index,
+    }));
+  const series = entries.map(({ group, definition: seriesDef, index: seriesIndex }) => {
     const groupSet = new Set(group.rows);
     // For a grouped chart the colour is a property of the SERIES (e.g. Incident Type), so evaluate it
     // once from a row of this series. Evaluating per-cell would mis-colour empty cells, whose fallback
     // row belongs to a different series.
-    const seriesColor = grouped ? pointColor(seriesDef.color, group.rows[0] || rows[0] || {}, base, seriesIndex, palette) : null;
+    const seriesColor = (!shapeChart || grouped)
+      ? pointColor(seriesDef.color, group.rows[0] || rows[0] || {}, base, seriesIndex, palette)
+      : null;
     let palettePosition = 0;
     const points = categories.map((category, categoryIndex) => {
       const cellRows = category.rows.filter((row) => groupSet.has(row));
-      const first = cellRows[0] || category.rows[0] || rows[0] || {};
+      // A missing dynamic series/category intersection is an empty point. Falling back to the
+      // category's first row leaks another series' value into this cell (every stacked segment
+      // becomes identical), which is unlike SSRS and corrupts palettes, labels, and totals.
+      const first = cellRows[0] || {};
       const context = { parameters, globals, datasets: datasetsByName, dataset: cellRows, fields: first };
       const raw = evaluateExpression(seriesDef.y, context);
       const numeric = raw === null || raw === undefined || raw === '' ? null : Number(raw);
@@ -124,7 +138,9 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
       // real value, not an empty point: it keeps its colour and legend entry and draws a zero-width slice.
       const empty = y === null;
       const paletteIndex = shapeChart ? palettePosition : categoryIndex;
-      const color = grouped ? seriesColor : pointColor(seriesDef.color, first, base, paletteIndex, palette);
+      const color = shapeChart && !grouped
+        ? pointColor(seriesDef.color, first, base, paletteIndex, palette)
+        : seriesColor;
       if (!(shapeChart && empty)) palettePosition += 1;
       return {
         y,
@@ -137,8 +153,8 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
     return { label: group.label ?? seriesDef.name, color: seriesColor, points };
   });
 
-  const legend = grouped
-    ? series.map((entry) => ({ label: entry.label, color: entry.color || palette[0] }))
+  const legend = grouped || !shapeChart
+    ? series.map((entry, index) => ({ label: entry.label, color: entry.color || palette[index % palette.length] }))
     : categories.reduce((entries, category, index) => {
       const point = series[0]?.points[index];
       if (shapeChart && point?.empty) return entries;

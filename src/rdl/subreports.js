@@ -79,35 +79,52 @@ function stripResolvedSubreportBlockers(model) {
 
 function bundleMap(raw, config) {
   if (!isPlainObject(raw)) return new Map();
-  const entries = Object.entries(raw);
-  if (entries.length > MAX_SUBREPORT_DEFINITIONS) {
-    throw new ServiceError(
-      'RDL_INVALID',
-      `Subreport bundle exceeds the supported limit of ${MAX_SUBREPORT_DEFINITIONS} definitions`,
-      413,
-    );
-  }
   const result = new Map();
   let totalBytes = 0;
-  for (const [reportName, definition] of entries) {
-    if (!isPlainObject(definition)) {
-      throw new ServiceError('RDL_INVALID', `Bundled subreport ${reportName} must be an object`);
+  const addDefinitions = (definitions, depth = 0) => {
+    if (!isPlainObject(definitions)) {
+      throw new ServiceError('RDL_INVALID', 'Bundled subreports must be an object');
     }
-    const canonical = canonicalReportName(reportName);
-    if (!canonical) throw new ServiceError('RDL_INVALID', 'Bundled subreport name is required');
-    if (result.has(canonical)) {
-      throw new ServiceError('RDL_INVALID', `Duplicate bundled subreport name: ${reportName}`);
+    if (depth >= MAX_SUBREPORT_DEPTH) {
+      throw new ServiceError(
+        'UNSUPPORTED_FEATURE',
+        `Subreport nesting depth exceeds the supported limit of ${MAX_SUBREPORT_DEPTH}`,
+      );
     }
-    const rdl = decodeRdlBase64(definition.rdlBase64, config);
-    totalBytes += rdl.length;
-    if (totalBytes > config.maxRequestBytes) {
-      throw new ServiceError('RDL_INVALID', 'Bundled subreport definitions exceed the configured request size limit', 413);
+    for (const [reportName, definition] of Object.entries(definitions)) {
+      if (!isPlainObject(definition)) {
+        throw new ServiceError('RDL_INVALID', `Bundled subreport ${reportName} must be an object`);
+      }
+      const canonical = canonicalReportName(reportName);
+      if (!canonical) throw new ServiceError('RDL_INVALID', 'Bundled subreport name is required');
+      if (result.has(canonical)) {
+        throw new ServiceError('RDL_INVALID', `Duplicate bundled subreport name: ${reportName}`);
+      }
+      if (result.size >= MAX_SUBREPORT_DEFINITIONS) {
+        throw new ServiceError(
+          'RDL_INVALID',
+          `Subreport bundle exceeds the supported limit of ${MAX_SUBREPORT_DEFINITIONS} definitions`,
+          413,
+        );
+      }
+      const rdl = decodeRdlBase64(definition.rdlBase64, config);
+      totalBytes += rdl.length;
+      if (totalBytes > config.maxRequestBytes) {
+        throw new ServiceError('RDL_INVALID', 'Bundled subreport definitions exceed the configured request size limit', 413);
+      }
+      if (!Array.isArray(definition.instances) || definition.instances.length === 0) {
+        throw new ServiceError('RDL_INVALID', `Bundled subreport ${reportName} requires at least one invocation instance`);
+      }
+      result.set(canonical, { reportName, rdl, instances: definition.instances, used: false, model: null });
+
+      // The caller may scope a grandchild definition beneath its parent definition.  Registration is
+      // nevertheless global for this render because an RDL <ReportName> is resolved independently of
+      // the transport's JSON nesting.  This preserves the caller's natural tree while letting the
+      // materializer select the correct invocation from the grandchild's parameter signature.
+      if (definition.subreports !== undefined) addDefinitions(definition.subreports, depth + 1);
     }
-    if (!Array.isArray(definition.instances) || definition.instances.length === 0) {
-      throw new ServiceError('RDL_INVALID', `Bundled subreport ${reportName} requires at least one invocation instance`);
-    }
-    result.set(canonical, { reportName, rdl, instances: definition.instances, used: false, model: null });
-  }
+  };
+  addDefinitions(raw);
   return result;
 }
 
@@ -185,6 +202,13 @@ export function resolveBundledSubreports(model, request, config) {
     ], (item) => {
       if (item.type !== 'Subreport') return;
       const childCanonical = canonicalReportName(item.reportName);
+      // A supplied nested definition is structurally consumed by this child report, even though SSRS
+      // defers evaluating its instance until a visible parent row materializes. Mark it here so the
+      // request-level unused-bundle guard does not reject a valid nested bundle before materialization.
+      // Do not resolve it eagerly: a missing definition for a dormant (empty/hidden) nested call remains
+      // permissible, while a visible call still fails closed through the resolver below.
+      const suppliedNested = bundles.get(childCanonical);
+      if (suppliedNested) suppliedNested.used = true;
       // A child Subreport is evaluated only after its containing region emits a visible instance. SSRS
       // does not need a nested definition for a dormant call in an empty or hidden parent region, but a
       // call that does materialize must still fail closed when the caller omitted its bundle.

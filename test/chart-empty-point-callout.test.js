@@ -104,7 +104,7 @@ test('a zero is a real value, not an empty point: it keeps its legend entry and 
   assert.deepEqual(data.legend.map((entry) => entry.color), PALETTE);
 });
 
-test('a non-shape chart keeps its category legend and colours across an empty point', () => {
+test('a non-shape chart keeps one series legend entry and one colour across an empty point', () => {
   // A column chart's legend/palette is not a per-point sequence, so an empty cell only leaves a gap in
   // the series' own points — the categories after it must not shift colour.
   const { chart, data } = dataFor(reportRdl(chartXml({
@@ -112,8 +112,14 @@ test('a non-shape chart keeps its category legend and colours across an empty po
   })));
   assert.equal(chart.chartType, 'column');
   assert.equal(data.series[0].points[0].y, null);
-  assert.deepEqual(data.legend.map((entry) => entry.label), ['Alpha', 'Beta', 'Gamma']);
-  assert.deepEqual(data.legend.map((entry) => entry.color), PALETTE);
+  // SSRS keys a non-shape chart's legend off its SERIES; category names belong to the axis. One static
+  // series therefore takes exactly one legend entry, holding the first palette colour. (A shape chart is
+  // the exception the tests above pin down: there the legend and palette run per data point.)
+  assert.deepEqual(data.legend.map((entry) => entry.label), ['Amount']);
+  assert.deepEqual(data.legend.map((entry) => entry.color), [PALETTE[0]]);
+  // Every point of that series keeps the series colour, so the empty first cell cannot advance the
+  // palette and recolour the categories drawn after it.
+  assert.deepEqual(data.series[0].points.map((point) => point.color), [PALETTE[0], PALETTE[0], PALETTE[0]]);
 });
 
 // Records the resolved PDFKit path and text operations for one chart draw.

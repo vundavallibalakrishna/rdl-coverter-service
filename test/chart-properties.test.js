@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
+import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { PNG } from 'pngjs';
 import { loadConfig } from '../src/config.js';
@@ -14,6 +17,8 @@ import { renderExcel } from '../src/render/excel.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { rasterizePdf } from '../src/render/raster.js';
 import { renderVisualDocx } from '../src/render/visualDocx.js';
+
+const execFileAsync = promisify(execFile);
 
 const chartXml = ({ name, type, subtype = '', property, value, top, left = 0.1, allowLabelRotation = null }) => `
 <Chart Name="${name}">
@@ -154,6 +159,43 @@ test('parses and renders declared category-axis label rotation', async () => {
   assert.equal(model.body.items[0].categoryAxis.allowLabelRotation, 'Rotate45');
   const result = await renderPdf(model, request, config);
   assert.equal(result.buffer.subarray(0, 4).toString(), '%PDF');
+});
+
+test('preserves every static series and keeps sparse dynamic intersections empty', () => {
+  const staticChart = {
+    chartType: 'column', datasetName: 'D', palette: 'Pacific', category: {
+      group: { expressions: ['=Fields!Quarter.Value'] }, label: '=Fields!Quarter.Value', sortExpressions: [], filters: [],
+    }, series: null,
+    seriesDefs: [
+      { name: 'Plan', y: '=Sum(Fields!Plan.Value)', color: null, dataLabel: { visible: true, useValueAsLabel: true } },
+      { name: 'Achieved', y: '=Sum(Fields!Achieved.Value)', color: '#ff0000', dataLabel: { visible: true, useValueAsLabel: true } },
+    ],
+  };
+  const staticData = materializeChart(staticChart, { D: [{ Quarter: 'Q2', Plan: 3, Achieved: 1 }] });
+  assert.deepEqual(staticData.series.map((entry) => entry.label), ['Plan', 'Achieved']);
+  assert.deepEqual(staticData.series.map((entry) => entry.points[0].y), [3, 1]);
+  assert.deepEqual(staticData.legend.map((entry) => entry.label), ['Plan', 'Achieved']);
+
+  staticChart.staticSeriesLabels = ['Year Plan', 'Achieved for the Quarter'];
+  assert.deepEqual(
+    materializeChart(staticChart, { D: [{ Quarter: 'Q2', Plan: 3, Achieved: 1 }] }).legend.map((entry) => entry.label),
+    ['Year Plan', 'Achieved for the Quarter'],
+  );
+
+  const dynamicChart = {
+    chartType: 'bar', datasetName: 'D', palette: 'Pacific', stacked: 'percent', category: {
+      group: { expressions: ['=Fields!Category.Value'] }, label: '=Fields!Category.Value', sortExpressions: [], filters: [],
+    }, series: {
+      group: { expressions: ['=Fields!Status.Value'] }, label: '=Fields!Status.Value', sortExpressions: [], filters: [],
+    },
+    seriesDefs: [{ name: 'Count', y: '=Fields!Count.Value', color: null, dataLabel: { visible: true, expression: '#VALY' } }],
+  };
+  const dynamicData = materializeChart(dynamicChart, { D: [
+    { Category: 'A', Status: 'Red', Count: 1 }, { Category: 'A', Status: 'Blue', Count: 1 },
+    { Category: 'B', Status: 'Blue', Count: 1 },
+  ] });
+  assert.deepEqual(dynamicData.series.map((entry) => entry.points.map((point) => point.y)), [[1, null], [1, 1]]);
+  assert.deepEqual(dynamicData.series[0].points.map((point) => point.label), ['1', '']);
 });
 
 test('an unknown chart custom property remains fail-closed', () => {
@@ -358,4 +400,74 @@ test('standalone editable DOCX chart rendering owns and cleans its temporary wor
   const result = await renderEditableDocx(parseRdl(rdl()), request, ownedWorkspaceConfig);
   assert.equal(result.buffer.subarray(0, 2).toString(), 'PK');
   assert.deepEqual(await fs.readdir(tempRoot), []);
+});
+
+// A chart's own expressions — the title, axis titles, legend title — are evaluated in the CHART's data
+// scope, not in the scope of whatever positioned the chart. A body, canvas, or nested-region context
+// carries no row of the chart's dataset, so a bare Fields! reference there must still resolve.
+const chartScopeRdl = `<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <Body><ReportItems>
+    <Chart Name="Scoped">
+      <ChartCategoryHierarchy><ChartMembers><ChartMember>
+        <Group Name="ScopedCategory"><GroupExpressions><GroupExpression>=Fields!Category.Value</GroupExpression></GroupExpressions></Group>
+        <Label>=Fields!Category.Value</Label>
+      </ChartMember></ChartMembers></ChartCategoryHierarchy>
+      <ChartSeriesHierarchy><ChartMembers><ChartMember><Label>Amount</Label></ChartMember></ChartMembers></ChartSeriesHierarchy>
+      <ChartData><ChartSeriesCollection><ChartSeries Name="AmountSeries"><ChartDataPoints><ChartDataPoint>
+        <ChartDataPointValues><Y>=Sum(Fields!Amount.Value)</Y></ChartDataPointValues>
+        <ChartDataLabel><Label>=Fields!Amount.Value &amp; " units"</Label><Visible>true</Visible><Style><FontFamily>Arial</FontFamily></Style></ChartDataLabel>
+        <Style/>
+      </ChartDataPoint></ChartDataPoints><Type>Shape</Type><Subtype>Pie</Subtype></ChartSeries></ChartSeriesCollection></ChartData>
+      <ChartAreas><ChartArea Name="Default"><Style/></ChartArea></ChartAreas>
+      <ChartTitles><ChartTitle Name="Default"><Caption>=Fields!Total.Value &amp; " TOTAL_IN_TITLE"</Caption>
+        <Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize></Style></ChartTitle></ChartTitles>
+      <DataSetName>D</DataSetName><Top>0.1in</Top><Left>0.1in</Left><Width>4in</Width><Height>3in</Height><Style/>
+    </Chart>
+  </ReportItems><Height>3.3in</Height></Body><Width>4.5in</Width>
+  <DataSets><DataSet Name="D"><Fields>
+    <Field Name="Category"><DataField>Category</DataField></Field>
+    <Field Name="Amount"><DataField>Amount</DataField></Field>
+    <Field Name="Total"><DataField>Total</DataField></Field>
+  </Fields></DataSet></DataSets>
+  <Page><PageWidth>4.7in</PageWidth><PageHeight>3.6in</PageHeight><TopMargin>0.1in</TopMargin>
+    <BottomMargin>0.1in</BottomMargin><LeftMargin>0.1in</LeftMargin><RightMargin>0.1in</RightMargin></Page>
+</Report>`;
+
+// One slice is genuinely zero and one carries the whole total.
+const chartScopeRequest = {
+  parameters: {},
+  datasets: { D: [{ Category: 'Zero', Amount: 0, Total: 42 }, { Category: 'Rest', Amount: 5, Total: 42 }] },
+};
+
+test('chart-level expressions resolve in the chart dataset scope and zero-value slices keep their label', async (context) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-chart-scope-'));
+  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const pdf = await renderPdf(parseRdl(chartScopeRdl), chartScopeRequest, config);
+  const pdfPath = path.join(tempDir, 'chart-scope.pdf');
+  await fs.writeFile(pdfPath, pdf.buffer);
+  const { stdout } = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
+  // Without the chart's own row scope this caption rendered as a bare " TOTAL_IN_TITLE".
+  assert.match(stdout, /42 TOTAL_IN_TITLE/);
+  // A zero-value point is a real value: SSRS keeps its palette colour and legend entry, draws a
+  // zero-width slice, and still prints its data label. Only a point with no value at all is dropped.
+  assert.match(stdout, /0 units/);
+  assert.match(stdout, /5 units/);
+
+  // Word rasterizes the chart from the canonical trace and Excel routes the same chart through the same
+  // drawing pass, so the format-appropriate assertion there is that the picture is produced at all.
+  const docx = await renderEditableDocx(parseRdl(chartScopeRdl), { ...chartScopeRequest, output: 'DOCX_EDITABLE' }, config, tempDir);
+  const zip = await JSZip.loadAsync(docx.buffer);
+  assert.ok(Object.keys(zip.files).some((name) => /^word\/media\/.+/.test(name)));
+  const excel = await renderExcel(parseRdl(chartScopeRdl), { ...chartScopeRequest, output: 'XLSX' }, config, tempDir);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(excel.buffer);
+  assert.equal(workbook.model.media.length, 1);
+});
+
+test('a chart whose dataset produced no rows still renders its declared caption', async () => {
+  // The scope rule must not depend on rows existing: an empty chart keeps the report renderable.
+  const empty = await renderPdf(parseRdl(chartScopeRdl), { parameters: {}, datasets: { D: [] } }, config);
+  assert.equal(empty.buffer.subarray(0, 4).toString(), '%PDF');
+  assert.equal(empty.pageCount, 1);
 });

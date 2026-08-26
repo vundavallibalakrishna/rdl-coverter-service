@@ -668,9 +668,31 @@ function naturalImageSize(buffer) {
   return null;
 }
 
+// A bundled subreport's body is laid out inside this report's pages, so its embedded images and item
+// definitions must be resolvable when a traced page is rebuilt as native Word content. Those child
+// definitions hang off the Subreport items that resolved them; `model.subreports` is the parser's
+// inventory of declared calls, not a map of loaded child reports.
+function collectSubreportModels(items, result) {
+  for (const item of items || []) {
+    const child = item.type === 'Subreport' ? item.resolvedSubreport?.model : null;
+    if (child && !result.includes(child)) {
+      result.push(child);
+      collectSubreportModels(child.body?.items, result);
+      collectSubreportModels(child.page?.header?.items, result);
+      collectSubreportModels(child.page?.footer?.items, result);
+    }
+    collectSubreportModels(item.items, result);
+    for (const row of item.rows || []) {
+      for (const cell of row.cells || []) collectSubreportModels(cell.items, result);
+    }
+  }
+}
+
 function collectModels(model, result = []) {
   result.push(model);
-  for (const child of Object.values(model.subreports || {})) collectModels(child, result);
+  collectSubreportModels(model.body?.items, result);
+  collectSubreportModels(model.page?.header?.items, result);
+  collectSubreportModels(model.page?.footer?.items, result);
   return result;
 }
 
@@ -721,7 +743,10 @@ async function pictureForItem(
       item: item.itemName,
     });
   } else {
-    const chart = resources.items.get(item.itemName);
+    // Prefer the definition the canonical pass recorded: an item Name is unique only inside its own
+    // report, so a chart drawn from a bundled subreport is either absent from the invoking report's index
+    // or, worse, shadowed by a same-named chart there.
+    const chart = item.chartItem || resources.items.get(item.itemName);
     if (!chart || !config || !tempDir) {
       unsupported('A PDF-traced chart cannot be materialized as a native Word picture', { item: item.itemName });
     }

@@ -381,7 +381,10 @@ function drawColumnChart(doc, config, chart, data, plot, stacked, context) {
 // a renderer-level semantic used for every exploded shape chart; the radius is reduced first so no slice,
 // label, or callout can leave the declared plot rectangle.
 function drawPieChart(doc, config, chart, data, plot, innerRatio, context) {
-  const points = (data.series[0]?.points || []).filter((point) => point.y && point.y > 0);
+  // A zero-value data point is a real value, not an empty one: SSRS keeps its palette colour and legend
+  // entry, draws a zero-width slice, and still prints its data label at that angle. Only a point with no
+  // value at all (an empty category/series intersection) is dropped, which materializeChart already marks.
+  const points = (data.series[0]?.points || []).filter((point) => Number.isFinite(point.y) && point.y >= 0);
   const total = points.reduce((sum, point) => sum + point.y, 0);
   if (total <= 0) return;
   const explosionRatio = chart.exploded && points.length > 1 ? 0.1 : 0;
@@ -556,7 +559,16 @@ function drawScatterChart(doc, config, chart, data, plot, context) {
 // Draws a chart into the current PDFKit document at (x,y) within width x height. Supports the
 // bar/column/pie/doughnut/line/area/scatter types the parser accepts (bar/column/area honour the
 // stacked & percent-stacked subtypes); everything else is fail-closed before we get here.
-export function drawChart(doc, config, chart, data, x, y, width, height, context) {
+export function drawChart(doc, config, chart, data, x, y, width, height, outerContext) {
+  // Chart-level expressions — the title, axis titles, legend title, and expression-backed styles — are
+  // evaluated in the CHART's data scope, not in the scope of whatever positioned the chart. SSRS resolves
+  // a bare Fields! reference there against the chart's own dataset, so those expressions see the first row
+  // the chart was materialized from. Without this every field-backed caption rendered empty, because a
+  // body, canvas, or nested-region context carries no row of the chart's dataset.
+  const chartRows = chart.datasetName ? outerContext?.datasets?.[chart.datasetName] : null;
+  const context = Array.isArray(chartRows) && chartRows.length > 0
+    ? { ...outerContext, dataset: chartRows, fields: chartRows[0] }
+    : outerContext;
   drawStyledBox(doc, x, y, width, height, chart.style, context, { fill: true, border: false });
   doc.save().rect(x, y, width, height).clip();
   const content = {
