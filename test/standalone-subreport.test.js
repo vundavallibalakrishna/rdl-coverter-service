@@ -334,3 +334,41 @@ test('fails closed when a standalone subreport has no bundled definition', async
     (error) => error.code === 'UNSUPPORTED_FEATURE',
   );
 });
+
+test('anchors a repeated child region picture at its own invoking row in Excel', async () => {
+  const rows = [{ Label: 'Alpha', Amount: 3 }, { Label: 'Beta', Amount: 1 }];
+  const keys = ['ALPHA', 'BETA', 'GAMMA'];
+  const model = parseRdl(Buffer.from(cellParent, 'utf8'));
+  const request = {
+    output: 'XLSX',
+    parameters: {},
+    datasets: { Parent: keys.map((key) => ({ Key: key })) },
+    subreports: {
+      '/Children/Child': {
+        rdlBase64: Buffer.from(chartChild).toString('base64'),
+        instances: keys.map((key) => ({ parameters: { Key: key }, datasets: { ChildData: rows } })),
+      },
+    },
+  };
+  resolveBundledSubreports(model, request, config);
+  // A chart that only exists inside a subreport invoked per row is not visible to inspection before that
+  // row materializes. Passing no workspace proves the renderer still provisions one for it.
+  const excel = await renderExcel(model, request, config, null);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(excel.buffer);
+  const anchors = workbook.worksheets
+    .flatMap((worksheet) => worksheet.getImages())
+    .map((image) => ({ top: image.range.tl.nativeRow, bottom: image.range.br.nativeRow }));
+  assert.equal(anchors.length, keys.length, 'one picture per invocation');
+  // Every invocation belongs to a different parent row, so each picture must occupy its own rows. Sharing
+  // one anchor stacks them and leaves every picture but the last invisible.
+  const tops = anchors.map((anchor) => anchor.top);
+  assert.equal(new Set(tops).size, keys.length, `pictures share an anchor: ${JSON.stringify(anchors)}`);
+  const ordered = [...anchors].sort((left, right) => left.top - right.top);
+  for (let index = 1; index < ordered.length; index += 1) {
+    assert.ok(
+      ordered[index].top >= ordered[index - 1].bottom - 1,
+      `picture ${index} at row ${ordered[index].top} overlaps the one ending at ${ordered[index - 1].bottom}`,
+    );
+  }
+});

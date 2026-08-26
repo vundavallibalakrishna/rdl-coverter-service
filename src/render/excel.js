@@ -1961,7 +1961,10 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
               // against that report rather than the one that invoked it.
               model: nested.model || null,
               left: point(left + (child.left || 0)),
-              top: point(top + (child.top || 0)),
+              // canvasPlacements are consumed as offsets from the TABLIX top, while `top` here is measured
+              // inside the parent row (that is what the nested cell's own row range is built from). Add the
+              // parent row's offset or every repeated invocation anchors at the same place.
+              top: point(rowTops[parentRowIndex] + top + (child.top || 0)),
             });
           }
           applyRegionBorder(worksheet, range, borders);
@@ -2488,11 +2491,18 @@ function containsTablix(item) {
 function containsChart(item) {
   if (item.type === 'Chart') return true;
   // A bundled subreport contributes its child body's charts to this render, whether it is invoked from the
-  // body canvas or from a tablix cell. The definition is already resolved on the item, so deciding whether
-  // a raster workspace is needed does not require the invocation's data.
-  const childBody = item.type === 'Subreport' ? (item.resolvedSubreport?.model?.body?.items || []) : [];
+  // body canvas or from a tablix cell. Where the definition is already resolved, look inside it. A call
+  // that is still deferred — one invoked per row of a data region — cannot be inspected without
+  // materializing it, and materializing here would evaluate an invocation that may never become visible.
+  // Assume such a call may chart: an unused raster workspace is created and removed either way, whereas
+  // missing one leaves the chart renderer with nowhere to work.
+  if (item.type === 'Subreport') {
+    const childBody = item.resolvedSubreport?.model?.body?.items;
+    if (!childBody) return true;
+    if (childBody.some((child) => containsChart(child))) return true;
+  }
   const cellItems = (item.rows || []).flatMap((row) => (row.cells || []).flatMap((cell) => cell.items || []));
-  return [...(item.items || []), ...cellItems, ...childBody].some((child) => containsChart(child));
+  return [...(item.items || []), ...cellItems].some((child) => containsChart(child));
 }
 
 async function renderReportExcel(model, request, config, tempDir) {
