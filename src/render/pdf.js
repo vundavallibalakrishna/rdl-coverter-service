@@ -975,6 +975,13 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     return advancePage(...args);
   };
   addPage.bodyTop = advancePage.bodyTop;
+  // The edges of a cell whose box the page break cut in half. The cut is not an edge of anything: the cell
+  // resumes at the top of the next page, so the side that falls on the cut carries no rule — the same way
+  // SSRS (and a native Word table) leaves a split row open and draws the row's rule only where it ends.
+  // Stroking it turns every page break inside a row into a horizontal rule against the printable body
+  // boundary, so a table that happens to break mid-row closes flush on the page footer's own rule while an
+  // otherwise identical table that breaks between rows shows the gap its last row leaves.
+  const openEdge = (edges, side) => ({ ...edges, [side]: null });
   const drawEdges = (x, y, width, height, edges) => {
     for (const side of ['top', 'right', 'bottom', 'left']) {
       if (edges[side]) collectEdge(x, y, width, height, side, edges[side].border, edges[side].context);
@@ -1344,7 +1351,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // segment (and re-drawing the value, SSRS-style) at every page break in between.
   let openSpans = [];
 
-  const closeOuterBorderFragment = (endY) => {
+  // `cutInsideRow` marks a fragment that ends because a row was split, not because a row ended.
+  const closeOuterBorderFragment = (endY, cutInsideRow = false) => {
     const fragmentHeight = Math.max(0, endY - fragmentStartY);
     if (firstFragment) collectEdge(
       startX, fragmentStartY, totalWidth, fragmentHeight, 'top',
@@ -1358,15 +1366,28 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       startX, fragmentStartY, totalWidth, fragmentHeight, 'right',
       item.style?.borders?.right, outerContext, { side: 'right' },
     );
-    // Data fragments always close, including overflow pages. Static layout tablixes instead honor the
-    // declared bottom edge, so Border=None cannot create a decorative rule after headings or prose.
+    // Data fragments close, so the last row of a bordered grid is never left open. Static layout tablixes
+    // instead honor the declared bottom edge, so Border=None cannot create a decorative rule after
+    // headings or prose.
+    const declaredBottom = item.style?.borders?.bottom;
+    const bottomBorder = enforceBottomClosure
+      ? enforcedBottomBorder(item.style, rows, item)
+      : declaredBottom;
+    // A page cut INSIDE a row is not the edge of anything: the row resumes at the top of the next page.
+    // The synthesized closure exists to mark where a data table ends, so at such a cut it has nothing to
+    // close — and drawing it there ends the table on every split page, hard against the printable body
+    // boundary, which is where a page footer's own rule sits. That is why one page showed the table's rule
+    // sitting flush on the footer rule while a page that happened to end on a row boundary showed the
+    // natural gap. A bottom border the RDL actually declares is the author's own box and still closes every
+    // fragment.
+    const synthesized = Boolean(bottomBorder) && bottomBorder !== declaredBottom;
     collectEdge(
       startX,
       fragmentStartY,
       totalWidth,
       fragmentHeight,
       'bottom',
-      enforceBottomClosure ? enforcedBottomBorder(item.style) : item.style?.borders?.bottom,
+      cutInsideRow && synthesized ? null : bottomBorder,
       outerContext,
       { side: 'bottom' },
     );
@@ -1471,6 +1492,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const drawSpanSegment = (span, endY, finalSegment = false) => {
     const segmentHeight = Math.min(endY - span.segStartY, Math.max(0, pageBottom - span.segStartY));
     if (segmentHeight <= 0.5) return;
+    // A segment that the page break cut still has its cell's bottom edge below it, on the next page.
+    const edges = finalSegment ? span.edges : openEdge(span.edges, 'bottom');
     span.pendingTail = null;
     if (span.textbox && !span.cell.hidden) {
       const { head, tail } = splitTextForHeight(doc, config, span.textbox, span.context, span.text, span.width, segmentHeight);
@@ -1480,7 +1503,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         height: segmentHeight,
         text: head,
         skipBorder: true,
-        traceEdges: span.edges,
+        traceEdges: edges,
         traceMeta: {
           kind: 'tablixCell',
           tablixName: item.name || null,
@@ -1514,7 +1537,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         verticalAlign: 'top',
         padding: { top: 0, right: 0, bottom: 0, left: 0 },
         backgroundColor: styleColor(item.style?.backgroundColor, span.context, null),
-        borders: resolvedTraceBorders(item.style, span.context, span.edges),
+        borders: resolvedTraceBorders(item.style, span.context, edges),
       });
     }
     // A nested data region can live in a row-header cell whose owning group spans several physical parent
@@ -1537,7 +1560,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         );
       }
     }
-    drawEdges(span.x, span.segStartY, span.width, segmentHeight, span.edges);
+    drawEdges(span.x, span.segStartY, span.width, segmentHeight, edges);
   };
 
   // Close every span whose last spanned row has now been fully drawn, ending it at the current y.
@@ -1555,7 +1578,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const x = startX + xOffsetPt;
       const textbox = cellTextbox(cell);
       const cellContext = contextForCell(rowIndex, cell);
-      const edges = resolveEdges({ cell, rowIndex }, columnIndex, span);
+      const declaredEdges = resolveEdges({ cell, rowIndex }, columnIndex, span);
+      // A row segment the page break cut keeps its bottom edge for the page that finishes the row.
+      const edges = rowComplete ? declaredEdges : openEdge(declaredEdges, 'bottom');
       // Merged (row-span) cells are drawn lazily via drawSpanSegment so they track the real extent of their
       // spanned rows across page splits; single-row cells draw here directly.
       if ((cell.rowSpan || 1) > 1) {
@@ -1566,7 +1591,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           cell,
           text: texts[index] || '',
           context: cellContext,
-          edges,
+          // The merged cell's own box. drawSpanSegment decides per segment which of these edges the page
+          // break cut, so the span must carry the declared set rather than this row's cut-aware view.
+          edges: declaredEdges,
           segStartY: y,
           endRowIndex: rowIndex + (cell.rowSpan || 1) - 1,
           sourceRow: row,
@@ -1686,7 +1713,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     for (const span of openSpans) drawSpanSegment(span, y);
     // Close and flush the actual table fragment before breaking so the final data row retains its bottom
     // border. The continuation annotation belongs only to the next page, above its repeated table header.
-    closeOuterBorderFragment(y);
+    // A caller that names the row it is continuing is cutting inside that row, so this fragment ends
+    // mid-row and has no row edge to close.
+    closeOuterBorderFragment(y, Boolean(continuedRow));
     addPage();
     y = addPage.bodyTop;
     if (showContinuationMarkers && logicalContinuationRow) drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, logicalContinuationRow);

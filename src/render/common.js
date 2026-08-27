@@ -147,10 +147,14 @@ export function textForItem(item, context) {
       : String(value));
 }
 
-function styleDeclaresVisibleBorder(style) {
-  const sides = style?.borders || (style?.border
+function borderSides(style) {
+  return style?.borders || (style?.border
     ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
     : null);
+}
+
+function styleDeclaresVisibleBorder(style) {
+  const sides = borderSides(style);
   return Object.values(sides || {}).some((border) => {
     if (!border || border.style === undefined) return false;
     // Expressions are border intent even when a particular row resolves to None. Literal None on every
@@ -193,20 +197,51 @@ export function shouldEnforceTablixBottom(rows, tablix) {
   )));
 }
 
+// The rule a tablix draws along its own row boundaries, when its cells rather than its outer Style carry
+// the grid — the common RDL idiom of a Border=None tablix whose every cell declares the same edge. Returns
+// that border only when the row being closed speaks with one voice: a row whose cells disagree declares no
+// single rule, so the caller keeps its neutral default rather than picking one cell's edge arbitrarily.
+function rowBoundaryBorder(rows, tablix) {
+  const visible = (border) => border && border.style !== undefined && !/^none$/i.test(String(border.style));
+  const agreedBorder = (row) => {
+    const found = new Map();
+    for (const cell of row?.cells || []) {
+      const sides = borderSides(cellBorderStyle(cell, tablix));
+      const border = [sides?.bottom, sides?.top].find(visible);
+      if (!border) continue;
+      found.set(`${border.style}|${border.color ?? ''}|${border.width ?? ''}`, border);
+    }
+    return found.size === 1 ? [...found.values()][0] : null;
+  };
+  // The edge being closed is the last row's bottom, so that row's own rule is the closest match. A split or
+  // group-footer row can carry an edge the body does not, so fall back to a rule the whole table agrees on.
+  const last = agreedBorder((rows || []).at(-1));
+  if (last) return last;
+  const everywhere = new Map();
+  for (const row of rows || []) {
+    const border = agreedBorder(row);
+    if (border) everywhere.set(`${border.style}|${border.color ?? ''}|${border.width ?? ''}`, border);
+  }
+  return everywhere.size === 1 ? [...everywhere.values()][0] : null;
+}
+
 // For data tablixes, the last row must be closed with a bottom border even when the RDL leaves the
 // tablix/last-row bottom edge as None (or the row splits across a page). Returns the declared bottom border
-// when it is already a visible rule (Solid, or a conditional expression the row may resolve), otherwise a
-// Solid border matching another declared side of the same style (so the enforced edge picks up the table's
-// own colour/width), falling back to black 1pt. Shared by the PDF (outer fragment bottom) and DOCX (last-row
-// cell borders) so both renderers close the table identically.
-export function enforcedBottomBorder(style) {
-  const sides = style?.borders || (style?.border
-    ? { top: style.border, right: style.border, bottom: style.border, left: style.border }
-    : null);
+// when it is already a visible rule (Solid, or a conditional expression the row may resolve), otherwise
+// another declared side of the tablix's own style, so the enforced edge picks up the table's own line style,
+// colour and width. With no tablix-level border at all, the rule the table's own cells draw along their row
+// boundaries stands in: closing a table whose every rule is Dotted with a hardcoded Solid one contradicts
+// the grid SSRS renders. Black 1pt remains the last resort. Shared by the PDF (outer fragment bottom) and
+// DOCX (last-row cell borders) so both renderers close the table identically.
+export function enforcedBottomBorder(style, rows, tablix) {
+  const sides = borderSides(style);
   const visible = (border) => border && border.style !== undefined && !/^none$/i.test(String(border.style));
   if (visible(sides?.bottom)) return sides.bottom;
   const template = [sides?.left, sides?.right, sides?.top].find(visible);
-  return { style: 'Solid', color: template?.color ?? '#000000', width: template?.width ?? 1 };
+  if (template) {
+    return { style: template.style, color: template.color ?? '#000000', width: template.width ?? 1 };
+  }
+  return rowBoundaryBorder(rows, tablix) || { style: 'Solid', color: '#000000', width: 1 };
 }
 
 export function normalizeDatasets(model, request) {
