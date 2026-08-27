@@ -138,3 +138,35 @@ test('the chart picture keeps every slice, so Word and Excel match the PDF', asy
   assert.equal(workbook.model.media.length, 1);
   assert.equal(paletteUse(workbook.model.media[0].buffer).size, 2, 'XLSX embedded an incomplete chart');
 });
+
+test('editable Word keeps a Rectangle border visible above a chart that fills the container', async (context) => {
+  const chart = chartXml({ subtype: 'Pie', width: 240, height: 160 });
+  const rdlText = reportRdl(`
+    <Rectangle Name="Frame"><ReportItems>${chart}</ReportItems>
+      <Top>0pt</Top><Left>0pt</Left><Width>240pt</Width><Height>160pt</Height>
+      <Style><Border><Color>#112233</Color><Style>Solid</Style><Width>2pt</Width></Border></Style>
+    </Rectangle>`);
+  const model = parseRdl(rdlText);
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-chart-frame-docx-'));
+  context.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const ownedConfig = loadConfig({
+    ...process.env,
+    RDL_STRICT_FONTS: 'false',
+    RDL_RENDER_TIMEOUT_MS: '60000',
+    RDL_TEMP_ROOT: tempRoot,
+  });
+
+  const docx = await renderEditableDocx(model, request, ownedConfig);
+  const zip = await JSZip.loadAsync(docx.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  // Word floats drawings above native cell borders. The converter must fit the picture inside the four
+  // 2pt container edges, leaving the parent frame visible just as SSRS paints it above its children.
+  const extent = documentXml.match(/<wp:extent cx="(\d+)" cy="(\d+)"/);
+  assert.ok(extent, 'the chart must remain a native Word drawing');
+  assert.ok(Number(extent[1]) / 12_700 <= 236, 'drawing must stay inside the 2pt left/right frame edges');
+  assert.ok(Number(extent[2]) / 12_700 <= 156, 'drawing must stay inside the 2pt top/bottom frame edges');
+  assert.match(documentXml, /<w:bottom w:val="single" w:color="112233" w:sz="16"\/>/);
+  const offsets = [...documentXml.matchAll(/<wp:posOffset>(\d+)<\/wp:posOffset>/g)].map((match) => Number(match[1]));
+  assert.ok(offsets.some((offset) => offset >= 25_400),
+    'the chart must start inside the 2pt left/top frame edge');
+});

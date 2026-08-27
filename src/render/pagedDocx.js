@@ -728,6 +728,7 @@ async function pictureForItem(
   chartIndex,
   bottomPaddingTwips = 0,
   topPaddingTwips = 0,
+  borderInsets = {},
 ) {
   let data;
   let type;
@@ -786,8 +787,20 @@ async function pictureForItem(
     type = 'png';
   }
 
-  let width = item.width;
-  let height = item.height;
+  // A floating Word drawing is painted above its host cell's native borders.  SSRS paints a container
+  // border after its positioned children, so an image or chart that fills a bordered Rectangle must not
+  // be allowed to cover the equivalent Word border.  Constrain the drawing to the border's inner box;
+  // the physical table cell and its edges remain at the canonical PDF geometry.
+  const inset = {
+    top: Math.max(0, Number(borderInsets.top || 0)),
+    right: Math.max(0, Number(borderInsets.right || 0)),
+    bottom: Math.max(0, Number(borderInsets.bottom || 0)),
+    left: Math.max(0, Number(borderInsets.left || 0)),
+  };
+  const innerWidth = Math.max(0.01, Number(item.width || 0) - inset.left - inset.right);
+  const innerHeight = Math.max(0.01, Number(item.height || 0) - inset.top - inset.bottom);
+  let width = innerWidth;
+  let height = innerHeight;
   const sizing = String(item.sizing || 'FitProportional');
   if (/^(Clip|AutoSize)$/i.test(sizing)) {
     unsupported(`RDL image sizing '${sizing}' is not safely representable in the page-locked editable Word contract`, {
@@ -797,7 +810,7 @@ async function pictureForItem(
   if (!/^Fit$/i.test(sizing)) {
     const natural = naturalImageSize(data);
     if (natural) {
-      const scale = Math.min(item.width / natural.width, item.height / natural.height);
+      const scale = Math.min(innerWidth / natural.width, innerHeight / natural.height);
       width = natural.width * scale;
       height = natural.height * scale;
     }
@@ -826,11 +839,11 @@ async function pictureForItem(
       floating: {
         horizontalPosition: {
           relative: HorizontalPositionRelativeFrom.CHARACTER,
-          offset: pointsToDrawingEmus(Math.max(0, (item.width - width) / 2)),
+          offset: pointsToDrawingEmus(inset.left + Math.max(0, (innerWidth - width) / 2)),
         },
         verticalPosition: {
           relative: VerticalPositionRelativeFrom.PARAGRAPH,
-          offset: pointsToDrawingEmus(Math.max(0, (item.height - height) / 2)),
+          offset: pointsToDrawingEmus(inset.top + Math.max(0, (innerHeight - height) / 2)),
         },
         allowOverlap: true,
         lockAnchor: true,
@@ -997,7 +1010,7 @@ function alignResolvedFragmentBordersToCellEdges(lines, owners, canonicalBounds)
   }
 }
 
-function resolvedCellBorders(box, owner, decorators, lines) {
+function resolvedRenderedBorders(box, owner, decorators, lines) {
   return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => {
     let resolved = owner?.borders?.[side] || null;
     for (const decorator of decorators) {
@@ -1008,8 +1021,24 @@ function resolvedCellBorders(box, owner, decorators, lines) {
         resolved = strongerBorder(resolved, lineBorder(line));
       }
     }
-    return [side, wordBorder(resolved)];
+    return [side, resolved];
   }));
+}
+
+function resolvedCellBorders(box, owner, decorators, lines) {
+  return Object.fromEntries(Object.entries(
+    resolvedRenderedBorders(box, owner, decorators, lines),
+  ).map(([side, border]) => [side, wordBorder(border)]));
+}
+
+function drawingBorderInsets(box, owner, decorators, lines) {
+  const borders = resolvedRenderedBorders(box, owner, decorators, lines);
+  return Object.fromEntries(Object.entries(borders).map(([side, border]) => [
+    side,
+    border && !/^none$/i.test(String(border.style || 'None'))
+      ? Math.max(0, Number(border.width || 0))
+      : 0,
+  ]));
 }
 
 function resolvedBackground(box, owner, decorators) {
@@ -1448,6 +1477,7 @@ async function tableCellFor(
       chartCounter.value++,
       bottomPaddingTwips,
       displacedTopPaddingTwips,
+      drawingBorderInsets(box, owner, grid.decorators, grid.lines),
     )];
   } else {
     children = owner
