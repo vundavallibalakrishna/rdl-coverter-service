@@ -106,16 +106,16 @@ test('a nested region in a row-spanned cell paginates instead of failing closed'
       `CHILD_${index} must appear once per group`,
     );
   }
-  // The child really did split: its last row lands on a page that does not carry its first row.
-  const lastRowPages = rendered.layoutTrace.pages
-    .filter((page) => (page.items || []).some((item) => item.text === `CHILD_${OVERSIZED.childRowCount}`));
+  // The child really did split: for each group, its last row lands on a later page than its first.
+  const pagesCarrying = (value) => rendered.layoutTrace.pages
+    .filter((page) => (page.items || []).some((item) => item.text === value))
+    .map((page) => page.number);
+  const firstRowPages = pagesCarrying('CHILD_1');
+  const lastRowPages = pagesCarrying(`CHILD_${OVERSIZED.childRowCount}`);
+  assert.equal(firstRowPages.length, GROUPS.length);
   assert.equal(lastRowPages.length, GROUPS.length);
-  for (const page of lastRowPages) {
-    assert.equal(
-      (page.items || []).some((item) => item.text === 'CHILD_1'),
-      false,
-      `page ${page.number} must continue the child rather than restart it`,
-    );
+  for (const [index, page] of lastRowPages.entries()) {
+    assert.equal(page > firstRowPages[index], true, 'the child must continue onto a later page');
   }
 
   // No merged cell may be emitted twice at one origin — the condition the native-Word cell builder enforces.
