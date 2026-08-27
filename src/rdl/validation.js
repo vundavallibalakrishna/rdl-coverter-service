@@ -1165,8 +1165,51 @@ function materializeAdvancedRows(tablix, sourceRows, parameters, globals, datase
         if (match && descriptorValue(visibleUnits[ahead], unitDescriptors[ahead], match) === key) rowSpan += 1;
         else break;
       }
+      // A static row-header member owns one physical cell for its complete containing group. Its report
+      // items, however, are evaluated in the row scope in which they become visible. Keep the owner at the
+      // group's first row (and preserve its full row span), but materialize a subreport with the first
+      // visible unit from that same owner run. Moving the owner itself to that later unit is what placed
+      // child data halfway down the merged cell and also broke the declared grid in native renderers.
+      const subreport = (descriptor.header.cell.items || []).find((item) => item.type === 'Subreport');
+      let contentUnit = unit;
+      if (subreport && evalHidden(subreport.hidden, context)) {
+        for (let ahead = index + 1; ahead < index + rowSpan; ahead += 1) {
+          const candidate = visibleUnits[ahead];
+          const candidateContext = {
+            fields: candidate.fields,
+            parameters,
+            globals,
+            dataset: candidate.dataset,
+            outermostDataset: sourceRows,
+            regionRowOrder,
+            nestedDataset: candidate.nestedDataset,
+            datasets,
+            scopes: candidate.scopes,
+            previousInstance: candidate.previousInstance,
+            previousInstances: candidate.previousInstances,
+            tablixDatasetName: tablix.datasetName,
+            tablixName: tablix.name,
+          };
+          if (!evalHidden(subreport.hidden, candidateContext)) {
+            contentUnit = candidate;
+            break;
+          }
+        }
+      }
+      const contentContext = contentUnit === unit ? context : {
+        ...context,
+        fields: contentUnit.fields,
+        dataset: contentUnit.dataset,
+        nestedDataset: contentUnit.nestedDataset,
+        scopes: contentUnit.scopes,
+        previousInstance: contentUnit.previousInstance,
+        previousInstances: contentUnit.previousInstances,
+      };
+      const contentResolveScope = contentUnit === unit
+        ? resolveScope
+        : (scope) => scopeKey(scope, tablix, groups, contentUnit.fields, parameters, globals, sourceRows, datasets, contentUnit.emitIndex, contentUnit.path);
       rowHeaders.push({
-        ...materializedCell(descriptor.header.cell, context, duplicateState, `header:${descriptorIndex}`, resolveScope),
+        ...materializedCell(descriptor.header.cell, contentContext, duplicateState, `header:${descriptorIndex}`, contentResolveScope),
         // Dynamic group owners keep a stable single hierarchy column because they may also span later
         // rows with deeper descendants. A standalone static band has no such descendants, so preserve
         // its declared header size as a horizontal span across the row-header grid.

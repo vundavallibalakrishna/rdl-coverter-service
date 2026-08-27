@@ -1387,13 +1387,22 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
   const below = endRow + 1 < gridOwners.length ? gridOwners[endRow + 1][columnIndex] : null;
   const left = columnIndex > 0 ? gridOwners[rowIndex][columnIndex - 1] : null;
   const right = columnIndex + span < gridOwners[rowIndex].length ? gridOwners[rowIndex][columnIndex + span] : null;
+  const sameRowEdge = (side) => [
+    ...gridOwners[rowIndex].slice(columnIndex, columnIndex + span),
+    gridOwners[rowIndex][columnIndex - 1],
+    gridOwners[rowIndex][columnIndex + span],
+  ]
+    .map((candidate) => (candidate && candidate !== owner ? resolvedOwnerBorder(candidate, side) : null))
+    .find(Boolean);
   const bottom = resolvedOwnerBorder(owner, 'bottom')
     || (below && resolvedOwnerBorder(below, 'top'))
+    || sameRowEdge('bottom')
     || (enforceBottomClosure && endRow === gridOwners.length - 1
       ? excelBorderSide(enforcedBottomBorder(itemStyle), owner.context)
       : undefined);
   const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
     || (above && resolvedOwnerBorder(above, 'bottom'))
+    || sameRowEdge('top')
     || matchingChangedGroupOwnerRowBoundary(
       owner,
       above,
@@ -1667,8 +1676,18 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         if (cell.hidden) return;
         const start = nestedPlacements[rowIndex][cellIndex];
         if (start === undefined || start < 0) return;
+        // A bundled subreport carries its own parameter/dataset/global scope.  Measurement must use that
+        // same scope as rendering; otherwise child fields resolve against the parent dataset (usually to
+        // an empty string), so the planned row/merge geometry is built without the child content and the
+        // later native-sheet copy drops the child values.
+        const nestedParameters = nested.parameters || request.parameters || {};
+        const nestedDatasets = nested.datasets || datasets;
+        const nestedGlobals = nested.globals || globals;
         const context = materializedCellContext(cell, row, {
-          parameters: request.parameters || {}, globals, dataset: datasets[nested.item.datasetName] || [], datasets,
+          parameters: nestedParameters,
+          globals: nestedGlobals,
+          dataset: nestedDatasets[nested.item.datasetName] || [],
+          datasets: nestedDatasets,
         });
         const { textbox, style } = cellStyle(nested.item, cell, context);
         const span = Math.max(1, cell.colSpan || 1);
@@ -1974,6 +1993,12 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
           if (numFmt) target.numFmt = numFmt;
           applyFillFontAlignment(target, owner.style || {}, owner.context);
           target.border = borders;
+          // ExcelJS stores the anchor's border on merged ranges only.  Materialize the perimeter on every
+          // covered physical cell as well, otherwise wide/row-spanning headers show white gaps where a
+          // follower cell has no top or bottom edge in the OOXML.
+          if (range.startRow !== range.endRow || range.startCol !== range.endCol) {
+            applyRegionBorder(worksheet, range, borders);
+          }
         }
         const childCellLeft = left;
         for (const child of cell.nestedTablixes || []) renderNested(child, childCellLeft, parentRowIndex, top, nestedTop(cell, child));
@@ -2048,8 +2073,13 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
       } else {
         // A free-form cell wrote no anchor cell of its own; its box goes on the region it occupies.
-        if (target) target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
-        else applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
+        const borders = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+        if (target) {
+          target.border = borders;
+          if (range.startRow !== range.endRow || range.startCol !== range.endCol) {
+            applyRegionBorder(worksheet, range, borders);
+          }
+        } else applyRegionBorder(worksheet, range, borders);
       }
       columnIndex += span;
     }
@@ -2058,6 +2088,25 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   const headerRows = rows.reduce((sum, row, index) => (
     row.isHeader ? sum + Math.max(1, rowProfiles[index].length - 1) : sum
   ), 0);
+  // A multi-row SSRS header can leave a tiny structural row between a parent header merge and its leaf
+  // cells.  The PDF paints that row as part of the header band; Excel otherwise exposes it as a white
+  // strip because no logical cell owns the physical grid slots.  Carry the immediately preceding header
+  // style into only genuinely empty slots whose neighbour is a filled header cell.  Values, merges, data
+  // rows, and intentionally styled blanks are left untouched.
+  for (let row = startRow + 1; row < startRow + headerRows; row += 1) {
+    for (let column = 1; column <= xGrid.length - 1; column += 1) {
+      const current = worksheet.getCell(row, column);
+      const above = worksheet.getCell(row - 1, column);
+      const empty = current.value === null || current.value === undefined || current.value === '';
+      const unpainted = !current.fill || current.fill.type !== 'pattern' || !current.fill.fgColor?.argb;
+      const aboveFilled = above.fill?.type === 'pattern' && Boolean(above.fill.fgColor?.argb);
+      if (!empty || !unpainted || !aboveFilled) continue;
+      current.fill = structuredClone(above.fill);
+      current.font = structuredClone(above.font);
+      current.alignment = structuredClone(above.alignment);
+      current.border = structuredClone(above.border);
+    }
+  }
   const tableRange = gridRange(xGrid, point(item.left || 0), columnOffsets[columnOffsets.length - 1]);
   const fixedLogicalColumns = item.fixedRowHeaders
     ? (item.rowHeaderColumns?.length || 0)
