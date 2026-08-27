@@ -1506,7 +1506,7 @@ function resolvedOwnerBorder(owner, side) {
   return excelBorderSide(border, owner.context);
 }
 
-function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
+function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure, rows, tablix) {
   const rowIndex = owner.rowIndex;
   const columnIndex = owner.start;
   const span = owner.cell.colSpan || 1;
@@ -1518,7 +1518,7 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
   const bottom = resolvedOwnerBorder(owner, 'bottom')
     || (below && resolvedOwnerBorder(below, 'top'))
     || (enforceBottomClosure && endRow === gridOwners.length - 1
-      ? excelBorderSide(enforcedBottomBorder(itemStyle), owner.context)
+      ? excelBorderSide(enforcedBottomBorder(itemStyle, rows, tablix), owner.context)
       : undefined);
   const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
     || (above && resolvedOwnerBorder(above, 'bottom'))
@@ -2158,7 +2158,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
           endRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, bottom) - 1,
         };
         notePainted(range);
-        const borders = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item));
+        const borders = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item), nestedRows, nested.item);
         if (isFreeFormCell(cell)) {
           const frame = canvasCellFrame(owner, left, rowTops[parentRowIndex] + top, width, bottom - top);
           for (const child of cell.items || []) {
@@ -2306,11 +2306,11 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         // The child grid writes its own cells inside this region, so the enclosing cell's box goes on last
         // and only on the perimeter: applied first it would be overwritten by the child's first row, and
         // applied to the anchor cell it would draw this cell's bottom rule across its top physical row.
-        applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
+        applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure, rows, item));
       } else {
         // A free-form cell wrote no anchor cell of its own; its box goes on the region it occupies.
-        if (target) target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
-        else applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
+        if (target) target.border = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure, rows, item);
+        else applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure, rows, item));
       }
       columnIndex += span;
     }
