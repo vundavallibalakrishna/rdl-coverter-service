@@ -137,6 +137,9 @@ const styledDoughnutRdl = (subtype = 'ExplodedDoughnut', legendPosition = 'Right
 
 const request = { parameters: {}, datasets: { D: [{ Category: 'A', Amount: 2 }, { Category: 'B', Amount: 3 }] } };
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
+const pdfTextTool = /pdftoppm(?:\.exe)?$/i.test(config.pdftoppmPath)
+  ? path.join(path.dirname(config.pdftoppmPath), process.platform === 'win32' ? 'pdftotext.exe' : 'pdftotext')
+  : 'pdftotext';
 
 test('parses documented axis and series chart properties into the normalized model', () => {
   const model = parseRdl(rdl());
@@ -148,6 +151,12 @@ test('parses documented axis and series chart properties into the normalized mod
   assert.equal(pie.seriesDefs[0].dataLabel.position, 'Outside');
   const data = materializeChart(pie, normalizeDatasets(model, request), {}, {});
   assert.equal(data.series[0].points[0].labelPosition, 'Outside');
+
+  const skinned = parseRdl(rdl().replace(
+    '<ChartAreas>',
+    '<ChartBorderSkin><Style><Color>White</Color></Style></ChartBorderSkin><ChartAreas>',
+  ));
+  assert.equal(skinned.body.items[0].borderSkin.style.color, 'White');
 });
 
 test('parses and renders declared category-axis label rotation', async () => {
@@ -209,6 +218,22 @@ test('documented PointWidth, disabled auto-fit, and PieLineColor render to a val
   assert.equal(result.buffer.subarray(0, 4).toString(), '%PDF');
   assert.equal(result.pageCount, 1);
   assert.ok(result.buffer.length > 2_000);
+});
+
+test('percent-stacked bars retain enabled data-point labels inside each segment', async (context) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-stacked-bar-label-'));
+  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  // Keep one static series and remove the second chart so the only numeric labels in this synthetic
+  // report must be the labels drawn by the horizontal stacked-bar renderer.
+  const barOnly = rdl()
+    .replace('<Type>Column</Type>', '<Type>Bar</Type><Subtype>PercentStacked</Subtype>')
+    .replace(/<Chart Name="Pie">[\s\S]*?<\/Chart>/, '');
+  const pdf = await renderPdf(parseRdl(barOnly), request, config);
+  const pdfPath = path.join(tempDir, 'stacked-bar-label.pdf');
+  await fs.writeFile(pdfPath, pdf.buffer);
+  const { stdout } = await execFileAsync(pdfTextTool, ['-layout', pdfPath, '-']);
+  assert.match(stdout, /\b2\b/);
+  assert.match(stdout, /\b3\b/);
 });
 
 test('fixed charts with the same RDL Top render side by side on one PDF page', async () => {
@@ -446,7 +471,7 @@ test('chart-level expressions resolve in the chart dataset scope and zero-value 
   const pdf = await renderPdf(parseRdl(chartScopeRdl), chartScopeRequest, config);
   const pdfPath = path.join(tempDir, 'chart-scope.pdf');
   await fs.writeFile(pdfPath, pdf.buffer);
-  const { stdout } = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
+  const { stdout } = await execFileAsync(pdfTextTool, ['-layout', pdfPath, '-']);
   // Without the chart's own row scope this caption rendered as a bare " TOTAL_IN_TITLE".
   assert.match(stdout, /42 TOTAL_IN_TITLE/);
   // A zero-value point is a real value: SSRS keeps its palette colour and legend entry, draws a

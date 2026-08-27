@@ -443,6 +443,35 @@ export function resolveSubreportInvocation(item, context) {
   return { definition: resolved, model: resolved.model, instance, parameters: instance.parameters, datasets, globals };
 }
 
+// True when a style would actually paint something: a fill, or any edge whose Border Style is not the
+// literal None. An expression-backed style is treated as visible because it can only be resolved with a
+// row in hand at render time, and a box that might be drawn must reserve its geometry now.
+function declaresVisiblePaint(style) {
+  if (!style) return false;
+  if (style.backgroundColor) return true;
+  const borders = style.borders || {};
+  return ['top', 'right', 'bottom', 'left'].some((side) => {
+    const declared = borders[side]?.style;
+    if (declared === undefined || declared === null) return false;
+    const text = String(declared).trim();
+    return text.startsWith('=') || !/^none$/i.test(text);
+  });
+}
+
+// The enclosing cell paints a coincident box itself when the Subreport is the cell's border authority
+// (see cellBorderStyle): RDL puts a cell's edges on the report item inside its CellContents, and a bare
+// Subreport there IS that item. A Rectangle-wrapped Subreport — or one sharing the cell with a textbox —
+// is not, so nothing would draw its declared box; it needs a frame of its own.
+function cellPaintsSubreportBox(cell, subreport) {
+  if (cell.containerWrapped) return false;
+  const items = cell.items || [];
+  if (items.some((item) => item.type === 'Textbox')) return false;
+  const authority = items.find((item, index) => (
+    item.type !== 'Rectangle' && item.type !== 'Tablix' && !cell.itemHidden?.[index]
+  ));
+  return authority === subreport;
+}
+
 function materializedCell(rawCell, context, duplicateState, duplicatePrefix, scopeResolver) {
   // A cell whose content is only container Rectangles has no border-bearing item of its own, so its edges
   // keep resolving from the tablix style (as they did before the Rectangle was flattened away). Without
@@ -513,6 +542,9 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
     const invocation = resolveSubreportInvocation(item, context);
     if (!invocation) continue;
     const { model: childModel, instance, datasets: childDatasets, globals: childGlobals } = invocation;
+    // Regions produced by THIS invocation. The invoking item's own box is sized from their rendered
+    // extent, so the frame pushed below has to know which siblings belong to it.
+    const invoked = [];
     // A subreport body is free-form and may contain a Textbox (not only a data region). Keep native
     // tablixes on the existing path and normalize other body items to one-cell nested regions so all
     // renderers share the same coordinate, growth, and border behavior.
@@ -522,7 +554,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
       if (childItem.type === 'Tablix') {
         const nestedItem = { ...childItem, left, top };
         const rawRows = instance.datasets[childItem.datasetName] || [];
-        nestedTablixes.push({
+        invoked.push({
           item: nestedItem,
           rows: materializeTablixRows(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
           columns: materializeTablixColumns(nestedItem, rawRows, instance.parameters, childGlobals, childDatasets),
@@ -558,7 +590,7 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
         style: { borders: {} },
         datasetName: null,
       };
-      nestedTablixes.push({
+      invoked.push({
         item: wrapper,
         rows: materializeTablixRows(wrapper, [], instance.parameters, childGlobals, childDatasets),
         columns: wrapper.columns,
@@ -566,6 +598,43 @@ function materializedCell(rawCell, context, duplicateState, duplicatePrefix, sco
         datasets: childDatasets,
         globals: childGlobals,
         subreport: true,
+        model: childModel,
+        keepTogether: item.keepTogether,
+      });
+    }
+    nestedTablixes.push(...invoked);
+    // The invoking Subreport's own Style is a property of the placeholder, not of any single child body
+    // item: SSRS paints that fill and border around the WHOLE rendered child report, which is at least the
+    // child body's declared extent (a Subreport is never scaled down to a smaller placeholder). None of the
+    // per-item regions above can carry it — the first would frame only the first item — so it becomes a
+    // content-free region of its own, pushed last so the box is drawn over the child rather than under it.
+    if (declaresVisiblePaint(item.style) && !cellPaintsSubreportBox(cell, item)) {
+      const frameWidth = Math.max(1, item.width || 0, childModel.body.width || 0);
+      const frameHeight = Math.max(1, item.height || 0, childModel.body.height || 0);
+      nestedTablixes.push({
+        item: {
+          type: 'Tablix',
+          name: `${item.name || 'Subreport'}__frame`,
+          left: item.left || 0,
+          top: item.top || 0,
+          width: frameWidth,
+          height: frameHeight,
+          columns: [frameWidth],
+          rows: [],
+          rowMembers: [],
+          columnMembers: [],
+          rowMemberPaths: [],
+          rowHeaderColumns: [],
+          style: item.style,
+          datasetName: null,
+        },
+        rows: [],
+        columns: [frameWidth],
+        parameters: instance.parameters,
+        datasets: childDatasets,
+        globals: childGlobals,
+        subreport: true,
+        subreportFrame: invoked,
         model: childModel,
         keepTogether: item.keepTogether,
       });

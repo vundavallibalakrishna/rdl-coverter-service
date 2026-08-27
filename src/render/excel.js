@@ -830,6 +830,16 @@ function reportGrid(model, section, request, globals, tablixCache) {
   return collapsedBoundaries(values, protectedSpans, aliases);
 }
 
+// boundaryIndex for a coordinate that is only expected to be on the grid, not required to be: returns null
+// instead of failing the render when it is not.
+function optionalBoundaryIndex(boundaries, value) {
+  try {
+    return boundaryIndex(boundaries, value);
+  } catch {
+    return null;
+  }
+}
+
 function boundaryIndex(boundaries, value) {
   const raw = point(value);
   const expected = boundaries.aliases?.get(raw) ?? raw;
@@ -1171,17 +1181,124 @@ function rowRange(boundaries, startRow, top, height) {
   return { startRow: startRow + from, endRow: startRow + to - 1 };
 }
 
-function addEmbeddedImage(workbook, worksheet, model, item, range, context) {
+// Excel pictures float above cell borders.  When a picture reaches a bordered Rectangle's edge, the
+// picture would therefore cover the rule even though that same rule remains visible in SSRS.  Keep the
+// picture inside every coincident ancestor edge by the declared stroke width.  This is not Rectangle
+// padding (which only applies to text); it is the XLSX representation of the parent canvas clip.
+function fractionalGridPosition(boundaries, coordinate) {
+  const value = point(coordinate);
+  for (let index = 0; index < boundaries.length; index += 1) {
+    if (Math.abs(boundaries[index] - value) <= COINCIDENT_EDGE_TOLERANCE_PT) return index;
+    if (index + 1 >= boundaries.length || value > boundaries[index + 1]) continue;
+    const span = boundaries[index + 1] - boundaries[index];
+    return index + ((value - boundaries[index]) / Math.max(span, Number.EPSILON));
+  }
+  return boundaries.length - 1;
+}
+
+function pictureInsetsAtContainerEdges(left, top, width, height, containerFrames = []) {
+  const right = point(left + width);
+  const bottom = point(top + height);
+  const result = { top: 0, bottom: 0, left: 0, right: 0 };
+  for (const frame of containerFrames) {
+    const borders = frame.item.style?.borders || {};
+    if (Math.abs(left - frame.left) <= COINCIDENT_EDGE_TOLERANCE_PT) result.left = Math.max(result.left, visibleBorderWidth(borders.left, frame.context));
+    if (Math.abs(right - frame.right) <= COINCIDENT_EDGE_TOLERANCE_PT) result.right = Math.max(result.right, visibleBorderWidth(borders.right, frame.context));
+    if (Math.abs(top - frame.top) <= COINCIDENT_EDGE_TOLERANCE_PT) result.top = Math.max(result.top, visibleBorderWidth(borders.top, frame.context));
+    if (Math.abs(bottom - frame.bottom) <= COINCIDENT_EDGE_TOLERANCE_PT) result.bottom = Math.max(result.bottom, visibleBorderWidth(borders.bottom, frame.context));
+  }
+  // Preserve a drawable area for an unusually narrow picture rather than inverting its anchors.
+  const horizontal = Math.max(0, width - (1 / POINT_PRECISION));
+  const vertical = Math.max(0, height - (1 / POINT_PRECISION));
+  if (result.left + result.right > horizontal) {
+    const scale = horizontal / Math.max(result.left + result.right, 1);
+    result.left *= scale;
+    result.right *= scale;
+  }
+  if (result.top + result.bottom > vertical) {
+    const scale = vertical / Math.max(result.top + result.bottom, 1);
+    result.top *= scale;
+    result.bottom *= scale;
+  }
+  return result;
+}
+
+function hasVisibleExcelBorder(border) {
+  return Boolean(border?.style && !/^none$/i.test(String(border.style)));
+}
+
+// Pictures float above worksheet cells.  The normalized-container chain can be flattened by a grouped
+// tablix or bundled subreport, but the target worksheet already has the resolved native border in either
+// case. Use that final border as the last authority before anchoring a picture, so a border is never
+// hidden merely because its original Rectangle/tablix ancestor was normalized away.
+function worksheetPictureBorderInsets(worksheet, startRow, xGrid, yGrid, left, top, width, height) {
+  const result = { top: 0, bottom: 0, left: 0, right: 0 };
+  const leftIndex = fractionalGridPosition(xGrid, left);
+  const rightIndex = fractionalGridPosition(xGrid, point(left + width));
+  const topIndex = fractionalGridPosition(yGrid, top);
+  const bottomIndex = fractionalGridPosition(yGrid, point(top + height));
+  const isBoundary = (value) => Math.abs(value - Math.round(value)) <= Number.EPSILON;
+  if (!isBoundary(leftIndex) || !isBoundary(rightIndex) || !isBoundary(topIndex) || !isBoundary(bottomIndex)) return result;
+  const firstColumn = Math.round(leftIndex) + 1;
+  const afterLastColumn = Math.round(rightIndex) + 1;
+  const firstRow = startRow + Math.round(topIndex);
+  const afterLastRow = startRow + Math.round(bottomIndex);
+  for (let row = firstRow; row < afterLastRow; row += 1) {
+    const leftCell = worksheet.getCell(row, firstColumn);
+    const rightCell = worksheet.getCell(row, Math.max(1, afterLastColumn - 1));
+    const outsideLeft = firstColumn > 1 ? worksheet.getCell(row, firstColumn - 1) : null;
+    const outsideRight = worksheet.getCell(row, afterLastColumn);
+    if (hasVisibleExcelBorder(leftCell.border?.left) || hasVisibleExcelBorder(outsideLeft?.border?.right)) result.left = 1;
+    if (hasVisibleExcelBorder(rightCell.border?.right) || hasVisibleExcelBorder(outsideRight?.border?.left)) result.right = 1;
+  }
+  for (let column = firstColumn; column < afterLastColumn; column += 1) {
+    const topCell = worksheet.getCell(firstRow, column);
+    const bottomCell = worksheet.getCell(Math.max(1, afterLastRow - 1), column);
+    const outsideTop = firstRow > 1 ? worksheet.getCell(firstRow - 1, column) : null;
+    const outsideBottom = worksheet.getCell(afterLastRow, column);
+    if (hasVisibleExcelBorder(topCell.border?.top) || hasVisibleExcelBorder(outsideTop?.border?.bottom)) result.top = 1;
+    if (hasVisibleExcelBorder(bottomCell.border?.bottom) || hasVisibleExcelBorder(outsideBottom?.border?.top)) result.bottom = 1;
+  }
+  return result;
+}
+
+function pictureAnchor(worksheet, xGrid, yGrid, startRow, left, top, width, height, containerFrames) {
+  const insets = pictureInsetsAtContainerEdges(left, top, width, height, containerFrames);
+  const worksheetInsets = worksheetPictureBorderInsets(worksheet, startRow, xGrid, yGrid, left, top, width, height);
+  for (const side of ['top', 'right', 'bottom', 'left']) insets[side] = Math.max(insets[side], worksheetInsets[side]);
+  return {
+    tl: {
+      col: fractionalGridPosition(xGrid, point(left + insets.left)),
+      row: startRow - 1 + fractionalGridPosition(yGrid, point(top + insets.top)),
+    },
+    br: {
+      col: fractionalGridPosition(xGrid, point(left + width - insets.right)),
+      row: startRow - 1 + fractionalGridPosition(yGrid, point(top + height - insets.bottom)),
+    },
+    editAs: 'oneCell',
+  };
+}
+
+function canvasCellFrame(owner, left, top, width, height) {
+  return {
+    // The owning tablix cell is also a positioned canvas container. Its resolved cell style—not only an
+    // explicit Rectangle style—owns the visible perimeter that an Excel floating picture must preserve.
+    item: { style: owner.style || {} },
+    context: owner.context,
+    left: point(left),
+    top: point(top),
+    right: point(left + width),
+    bottom: point(top + height),
+  };
+}
+
+function addEmbeddedImage(workbook, worksheet, model, item, anchor, context) {
   if (item.source !== 'Embedded') return;
   const image = model.embeddedImages?.[styleValue(item.value, context, item.value)];
   if (!image?.data) throw new ServiceError('UNSUPPORTED_FEATURE', `Embedded Excel image is unavailable: ${item.name || 'unnamed'}`);
   const buffer = Buffer.from(image.data.replace(/\s+/g, ''), 'base64');
   const id = workbook.addImage({ buffer, extension: imageExtension(buffer) });
-  worksheet.addImage(id, {
-    tl: { col: range.startCol - 1, row: range.startRow - 1 },
-    br: { col: range.endCol, row: range.endRow },
-    editAs: 'oneCell',
-  });
+  worksheet.addImage(id, anchor);
 }
 
 async function renderFreeformItem({
@@ -1201,6 +1318,7 @@ async function renderFreeformItem({
   parentLeft = 0,
   parentTop = 0,
   rowsOverride = null,
+  containerFrames = [],
 }) {
   if (isHidden(item.hidden, context)) return;
   const left = point(parentLeft + (item.left || 0));
@@ -1208,20 +1326,17 @@ async function renderFreeformItem({
   const columns = gridRange(xGrid, left, item.width || 0);
   const rows = rowsOverride || rowRange(yGrid, startRow, top, item.height || 0);
   const range = { ...columns, ...rows };
+  const anchor = pictureAnchor(worksheet, xGrid, yGrid, startRow, left, top, item.width || 0, item.height || 0, containerFrames);
   if (item.type === 'Chart') {
     const data = materializeChart(item, context.datasets, context.parameters, context.globals);
     const png = await renderChartPng(item, data, config, tempDir, context, chartCounter.value++);
     if (!png?.data) throw new ServiceError('RENDER_FAILED', 'Excel chart picture could not be rendered', 500);
     const id = workbook.addImage({ buffer: png.data, extension: 'png' });
-    worksheet.addImage(id, {
-      tl: { col: range.startCol - 1, row: range.startRow - 1 },
-      br: { col: range.endCol, row: range.endRow },
-      editAs: 'oneCell',
-    });
+    worksheet.addImage(id, anchor);
     return;
   }
   if (item.type === 'Image') {
-    addEmbeddedImage(workbook, worksheet, model, item, range, context);
+    addEmbeddedImage(workbook, worksheet, model, item, anchor, context);
     return;
   }
   if (item.type === 'Line') {
@@ -1260,6 +1375,14 @@ async function renderFreeformItem({
     return;
   }
   if (item.type === 'Rectangle') {
+    const frame = {
+      item,
+      context,
+      left,
+      top,
+      right: point(left + (item.width || 0)),
+      bottom: point(top + (item.height || 0)),
+    };
     for (const child of [...(item.items || [])].sort((a, b) => a.zIndex - b.zIndex || a.top - b.top || a.left - b.left)) {
       await renderFreeformItem({
         workbook,
@@ -1277,8 +1400,13 @@ async function renderFreeformItem({
         measureDoc,
         parentLeft: left,
         parentTop: top,
+        containerFrames: [...containerFrames, frame],
       });
     }
+    // The cell perimeter is the only native XLSX representation of a Rectangle border.  Apply it after
+    // its children so a child textbox/tablix cannot erase it; floating pictures are separately inset
+    // above because Excel always paints them above cells.
+    paintContainerExtent(worksheet, range, item, context);
   }
 }
 
@@ -1378,7 +1506,7 @@ function resolvedOwnerBorder(owner, side) {
   return excelBorderSide(border, owner.context);
 }
 
-function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
+function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure, rows, tablix) {
   const rowIndex = owner.rowIndex;
   const columnIndex = owner.start;
   const span = owner.cell.colSpan || 1;
@@ -1398,7 +1526,7 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure) {
     || (below && resolvedOwnerBorder(below, 'top'))
     || sameRowEdge('bottom')
     || (enforceBottomClosure && endRow === gridOwners.length - 1
-      ? excelBorderSide(enforcedBottomBorder(itemStyle), owner.context)
+      ? excelBorderSide(enforcedBottomBorder(itemStyle, rows, tablix), owner.context)
       : undefined);
   const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
     || (above && resolvedOwnerBorder(above, 'bottom'))
@@ -1608,11 +1736,32 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   const owners = [];
   // Pictures a cell carries on its canvas, collected while the grid is written and anchored later.
   const canvasPlacements = [];
+  // Bundled subreports expose their frame and their rendered child regions as sibling normalized
+  // records. Keep the frame geometry so a chart/image that belongs to that child report still respects
+  // the invoking Subreport's border when it is anchored later as an Excel floating drawing.
+  const subreportFrames = [];
+  // The columns this region actually painted into its scratch worksheet. A tablix's own grid is bounded by
+  // its declared column widths, but a nested region or a subreport frame is positioned at its own left and
+  // width and can legitimately extend past that bound. The copy step reads back exactly the columns named
+  // here, so anything painted outside them — most visibly a subreport frame's right edge and the outer
+  // rule above and below a sibling region — would otherwise be written to the scratch sheet and silently
+  // dropped. Kept separate from the declared table range, which still defines the freeze pane/autofilter.
+  const painted = { startCol: Infinity, endCol: -Infinity };
+  const notePainted = (range) => {
+    if (!range) return;
+    painted.startCol = Math.min(painted.startCol, range.startCol);
+    painted.endCol = Math.max(painted.endCol, range.endCol);
+  };
   const columnOffsets = [0];
   columns.forEach((width) => columnOffsets.push(point(columnOffsets[columnOffsets.length - 1] + width)));
   const addNestedYBoundaries = (nested, baseTop, target) => {
     let cursor = point(baseTop + (nested.item.top || 0));
     target.add(cursor);
+    // A subreport frame carries no rows: its declared box is the only boundary it contributes.
+    if (nested.subreportFrame) {
+      target.add(point(cursor + (nested.item.height || 0)));
+      return;
+    }
     for (const row of nested.rows || []) {
       const rowTop = cursor;
       cursor = point(cursor + (row.height || DEFAULT_ROW_POINTS));
@@ -1810,10 +1959,25 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   // Replace declared child-row boundaries with their measured CanGrow boundaries before mapping them to
   // physical Excel rows. Otherwise a nested row may grow in measurement but still be rendered into its old
   // one-line interval.
+  // The rendered extent of an invoking Subreport's box: the union of the regions that invocation
+  // produced, floored at the placeholder and child-body geometry the frame was created with.
+  const subreportFrameExtent = (nested) => nested.subreportFrame.reduce((box, sibling) => {
+    const measurement = measureNestedTablix(sibling);
+    return {
+      width: Math.max(box.width, (sibling.item.left || 0) - (nested.item.left || 0)
+        + measurement.columnsPt.reduce((sum, value) => sum + value, 0)),
+      height: Math.max(box.height, (sibling.item.top || 0) - (nested.item.top || 0)
+        + measurement.heights.reduce((sum, value) => sum + value, 0)),
+    };
+  }, { width: nested.item.width || 0, height: nested.item.height || 0 });
   const addMeasuredNestedYBoundaries = (nested, baseTop, target, ownTop) => {
-    const measurement = measureNestedTablix(nested);
     let cursor = point(baseTop + ownTop);
     target.add(cursor);
+    if (nested.subreportFrame) {
+      target.add(point(cursor + subreportFrameExtent(nested).height));
+      return;
+    }
+    const measurement = measureNestedTablix(nested);
     (nested.rows || []).forEach((row, index) => {
       const rowTop = cursor;
       cursor = point(cursor + measurement.heights[index]);
@@ -1911,7 +2075,60 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     }
   });
 
+  // The invoking Subreport's own box. It carries no rows: SSRS paints the placeholder's border around the
+  // whole child report that was rendered, so the range is the union of the sibling regions this invocation
+  // produced, floored at the placeholder and child-body geometry. applyRegionBorder only adds perimeter
+  // edges, so the child's own grid lines inside the box are untouched.
+  const renderSubreportFrame = (nested, parentCellLeft, parentRowIndex, baseTop, ownTop) => {
+    const frameLeft = nested.item.left || 0;
+    const extent = subreportFrameExtent(nested);
+    const context = {
+      parameters: nested.parameters || request.parameters || {},
+      globals: nested.globals || globals,
+      datasets: nested.datasets || datasets,
+      dataset: [],
+      fields: {},
+    };
+    const borders = Object.fromEntries(['top', 'bottom', 'left', 'right']
+      .map((side) => [side, excelBorderSide(nested.item.style?.borders?.[side], context)]));
+    if (!Object.values(borders).some(Boolean)) return;
+    const left = point(parentCellLeft + frameLeft);
+    const top = point(baseTop + ownTop);
+    const profile = rowProfiles[parentRowIndex];
+    const range = {
+      ...gridRange(xGrid, left, extent.width),
+      startRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, top),
+      endRow: physicalStarts[parentRowIndex] + Math.max(
+        boundaryIndex(profile, top) + 1,
+        boundaryIndex(profile, point(top + extent.height)),
+      ) - 1,
+    };
+    notePainted(range);
+    applyRegionBorder(worksheet, range, borders);
+    subreportFrames.push({
+      item: nested.item,
+      context,
+      left,
+      top: point(rowTops[parentRowIndex] + top),
+      right: point(left + extent.width),
+      bottom: point(rowTops[parentRowIndex] + top + extent.height),
+    });
+  };
+  const framesContainingPicture = (left, top, width, height) => {
+    const right = point(left + width);
+    const bottom = point(top + height);
+    return subreportFrames.filter((frame) => (
+      left >= frame.left - COINCIDENT_EDGE_TOLERANCE_PT
+      && right <= frame.right + COINCIDENT_EDGE_TOLERANCE_PT
+      && top >= frame.top - COINCIDENT_EDGE_TOLERANCE_PT
+      && bottom <= frame.bottom + COINCIDENT_EDGE_TOLERANCE_PT
+    ));
+  };
   const renderNested = (nested, parentCellLeft, parentRowIndex, baseTop, ownTop) => {
+    if (nested.subreportFrame) {
+      renderSubreportFrame(nested, parentCellLeft, parentRowIndex, baseTop, ownTop);
+      return;
+    }
     const nestedParameters = nested.parameters || request.parameters || {};
     const nestedDatasets = nested.datasets || datasets;
     const nestedGlobals = nested.globals || globals;
@@ -1959,8 +2176,10 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
           startRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, top),
           endRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, bottom) - 1,
         };
-        const borders = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item));
+        notePainted(range);
+        const borders = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item), nestedRows, nested.item);
         if (isFreeFormCell(cell)) {
+          const frame = canvasCellFrame(owner, left, rowTops[parentRowIndex] + top, width, bottom - top);
           for (const child of cell.items || []) {
             // Tablix/Subreport entries are the design-time source of the materialized child regions, which
             // the recursive call below renders.
@@ -1980,7 +2199,30 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
               // against that report rather than the one that invoked it.
               model: nested.model || null,
               left: point(left + (child.left || 0)),
-              top: point(top + (child.top || 0)),
+              // The scratch row this picture's top coincides with. Excel cannot make a row thinner than
+              // two points, so a row profile built from sub-point RDL edges renders taller than it was
+              // declared and every later boundary shifts down with it. A picture resolved from its raw
+              // point offset then lands above the very cells it belongs to and covers their top rule —
+              // most visibly the enclosing subreport frame, whose own edge went through this same row
+              // mapping. Anchor to the row instead, so both land on one grid line.
+              localStartRow: (() => {
+                const index = optionalBoundaryIndex(rowProfiles[parentRowIndex], point(top + (child.top || 0)));
+                return index === null ? null : physicalStarts[parentRowIndex] + index;
+              })(),
+              // Canvas placements are resolved by the caller against the section row grid, so they must
+              // carry an offset from the *tablix* top. Every nested coordinate here — `rowOffsets`, and
+              // the `baseTop`/`ownTop` a recursive call passes on — is local to the parent logical row,
+              // because the nested grid is measured against that row's own profile. Without the parent
+              // row's own offset, two instances of the same group each report the same local top, and the
+              // caller schedules both pictures onto one range: the second overpaints the first and the
+              // earlier group instance renders with no picture at all.
+              top: point(rowTops[parentRowIndex] + top + (child.top || 0)),
+              containerFrames: [frame, ...framesContainingPicture(
+                left + (child.left || 0),
+                rowTops[parentRowIndex] + top + (child.top || 0),
+                child.width || 0,
+                child.height || 0,
+              )],
             });
           }
           applyRegionBorder(worksheet, range, borders);
@@ -2024,6 +2266,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         endRow: physicalStarts[endLogicalRow] + Math.max(1, rowProfiles[endLogicalRow].length - 1) - 1,
         ...columnsRange,
       };
+      notePainted(range);
       // The section-wide coordinate grid also contains boundaries from unrelated report items (for example,
       // a logo edge can fall inside a tablix column). A single logical RDL cell may therefore cover several
       // physical Excel columns even when its ColSpan is 1. Merge the occupied Excel region, not merely RDL
@@ -2045,6 +2288,9 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         applyFillFontAlignment(target, owner.style || {}, owner.context);
       }
       if (freeForm) {
+        const frameHeight = rows.slice(rowIndex, endLogicalRow + 1)
+          .reduce((sum, _row, index) => sum + (rowProfiles[rowIndex + index].at(-1) || 0), 0);
+        const frame = canvasCellFrame(owner, left, rowTops[rowIndex], width, frameHeight);
         for (const child of owner.cell.items || []) {
           // Tablix/Subreport entries are the design-time source of the materialized nested regions,
           // which the child-region path below already renders.
@@ -2061,6 +2307,21 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
             // Points from the tablix top. A child that follows a grown nested region is displaced by the
             // same SSRS rule the regions use, so it moves down with it exactly as the PDF places it.
             top: point(rowTops[rowIndex] + (nestedTopsFor(owner.cell).get(child) ?? (child.top || 0))),
+            // See the nested push below: the row this picture's top coincides with, so it resolves onto
+            // the same grid line as the cells around it once Excel's minimum row height has widened them.
+            localStartRow: (() => {
+              const index = optionalBoundaryIndex(
+                rowProfiles[rowIndex],
+                point(nestedTopsFor(owner.cell).get(child) ?? (child.top || 0)),
+              );
+              return index === null ? null : physicalStarts[rowIndex] + index;
+            })(),
+            containerFrames: [frame, ...framesContainingPicture(
+              left + (child.left || 0),
+              rowTops[rowIndex] + (nestedTopsFor(owner.cell).get(child) ?? (child.top || 0)),
+              child.width || 0,
+              child.height || 0,
+            )],
           });
         }
       }
@@ -2070,10 +2331,10 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         // The child grid writes its own cells inside this region, so the enclosing cell's box goes on last
         // and only on the perimeter: applied first it would be overwritten by the child's first row, and
         // applied to the anchor cell it would draw this cell's bottom rule across its top physical row.
-        applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure));
+        applyRegionBorder(worksheet, range, reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure, rows, item));
       } else {
         // A free-form cell wrote no anchor cell of its own; its box goes on the region it occupies.
-        const borders = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure);
+        const borders = reportCellBorders(gridOwners, owner, item.style, enforceBottomClosure, rows, item);
         if (target) {
           target.border = borders;
           if (range.startRow !== range.endRow || range.startCol !== range.endCol) {
@@ -2126,6 +2387,8 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     dynamic: rows.some((row) => !row.isHeader && !row.isStatic),
     fixedColumnsSplit,
     ...tableRange,
+    paintedStartCol: Math.min(tableRange.startCol, painted.startCol),
+    paintedEndCol: Math.max(tableRange.endCol, painted.endCol),
   };
 }
 
@@ -2168,6 +2431,17 @@ function cloneExcelValue(value) {
   return structuredClone(value);
 }
 
+// Where a tablix cell's canvas picture starts, in the section's point space. A picture anchored to one of
+// the region's own rows takes that row's rendered top, so it lands on the same section grid line as the
+// cells it sits among: Excel's two-point minimum row height moves every boundary below a sub-point RDL
+// edge, and the raw declared offset no longer names the same line the region's own grid was built on.
+function canvasPlacementTop(plan, placed) {
+  const localTop = placed.localStartRow !== null && placed.localStartRow !== undefined
+    ? plan.localBoundaries?.[placed.localStartRow - 1]
+    : null;
+  return point(plan.resolvedTop + (localTop ?? placed.top));
+}
+
 function copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges }) {
   const offset = plan.resolvedTop;
   const local = plan.localBoundaries;
@@ -2178,8 +2452,13 @@ function copyPlannedTablix({ worksheet, plan, yGrid, startRow, merges }) {
   const mapStart = (localRow) => startRow + boundaryIndex(yGrid, point(offset + local[localRow - 1]));
   const mapEnd = (localRow) => startRow + boundaryIndex(yGrid, point(offset + local[localRow])) - 1;
 
+  // Read back every column the region painted, not only its declared table range: a nested region or a
+  // subreport frame legitimately extends past the parent grid's own columns, and those cells carry the
+  // frame's right edge and the rules that close it above and below a sibling region.
+  const firstPaintedColumn = plan.region.paintedStartCol ?? plan.region.startCol;
+  const lastPaintedColumn = plan.region.paintedEndCol ?? plan.region.endCol;
   for (let row = 1; row <= plan.region.rowsConsumed; row += 1) {
-    for (let column = plan.region.startCol; column <= plan.region.endCol; column += 1) {
+    for (let column = firstPaintedColumn; column <= lastPaintedColumn; column += 1) {
       const source = plan.worksheet.getCell(row, column);
       if (source.isMerged && source.master.address !== source.address) continue;
       const sourceMerge = mergeByMaster.get(`${row}:${column}`);
@@ -2353,7 +2632,7 @@ async function renderCoordinateScheduledSection({
       // A picture on a tablix cell's canvas floats at its own top and height, so those two coordinates
       // have to exist on the section grid for the anchor to resolve. They add boundaries only.
       for (const placed of plan.region?.canvasPlacements || []) {
-        const from = point(plan.resolvedTop + placed.top);
+        const from = canvasPlacementTop(plan, placed);
         const to = point(from + (placed.item.height || 0));
         boundaries.add(from);
         boundaries.add(to);
@@ -2387,10 +2666,17 @@ async function renderCoordinateScheduledSection({
         // The point model and the worksheet row grid can disagree by one interval where a grown child
         // region ends and the next canvas item begins. SSRS resolves exactly that case by displacement —
         // a later item moves below what grew — so apply the same rule against the rows already taken.
-        const placedTop = point(plan.resolvedTop + placed.top);
+        const placedTop = canvasPlacementTop(plan, placed);
         const placedColumns = gridRange(xGrid, placed.left, placed.item.width || 0);
         let placedRows = rowRange(yGrid, startRow, placedTop, placed.item.height || 0);
-        for (let guard = 0; guard < 64; guard += 1) {
+        // A picture is anchored *over* the worksheet grid: it floats above the cells its range covers
+        // and occupies none of them, exactly as the canonical PDF paints a chart or image on top of the
+        // region beneath it. The merged cells of the tablix row the picture sits on are therefore not a
+        // collision, and displacing the anchor past them pushes the picture off its own region — or off
+        // the end of the sheet once several rows of that region are merged. Only an item that writes
+        // into cells has to move below content that grew.
+        const floats = placed.item.type === 'Chart' || placed.item.type === 'Image';
+        for (let guard = 0; !floats && guard < 64; guard += 1) {
           const clash = findIndexedMergeOverlap(merges, { ...placedColumns, ...placedRows });
           if (!clash) break;
           const height = placedRows.endRow - placedRows.startRow;
@@ -2413,6 +2699,13 @@ async function renderCoordinateScheduledSection({
           parentLeft: 0,
           parentTop: 0,
           rowsOverride: placedRows,
+          // Tablix canvas placements are stored relative to the tablix. Convert their parent-cell frame
+          // into the section's resolved coordinates alongside the floating child item.
+          containerFrames: (placed.containerFrames || []).map((frame) => ({
+            ...frame,
+            top: point(plan.resolvedTop + frame.top),
+            bottom: point(plan.resolvedTop + frame.bottom),
+          })),
         });
       }
       if (region.dynamic) detailRegions.push(region);

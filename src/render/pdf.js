@@ -619,6 +619,12 @@ function drawSimpleItem(doc, config, model, item, x, y, context) {
       // that came from a bundled subreport cannot be found by name in the invoking report — and a name it
       // happens to share with a parent chart would silently rebuild the wrong one.
       chartItem: item,
+      // The scope the chart's own expressions were evaluated in. A chart title, axis title, legend title
+      // or expression-backed style resolves against the chart's dataset — and for a bundled subreport
+      // that dataset belongs to the child report, so it is absent from the invoking report's datasets.
+      // Word rasterizes charts from this trace: without the recorded scope every field-backed caption
+      // re-renders empty there while the PDF shows it, so carry the resolved scope with the series.
+      chartContext: context,
     });
     drawChart(doc, config, item, data, x, y, item.width, item.height, context);
   } else if (item.type === 'Image') drawImage(doc, model, item, x, y, context);
@@ -969,6 +975,13 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     return advancePage(...args);
   };
   addPage.bodyTop = advancePage.bodyTop;
+  // The edges of a cell whose box the page break cut in half. The cut is not an edge of anything: the cell
+  // resumes at the top of the next page, so the side that falls on the cut carries no rule — the same way
+  // SSRS (and a native Word table) leaves a split row open and draws the row's rule only where it ends.
+  // Stroking it turns every page break inside a row into a horizontal rule against the printable body
+  // boundary, so a table that happens to break mid-row closes flush on the page footer's own rule while an
+  // otherwise identical table that breaks between rows shows the gap its last row leaves.
+  const openEdge = (edges, side) => ({ ...edges, [side]: null });
   const drawEdges = (x, y, width, height, edges) => {
     for (const side of ['top', 'right', 'bottom', 'left']) {
       if (edges[side]) collectEdge(x, y, width, height, side, edges[side].border, edges[side].context);
@@ -1041,6 +1054,22 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const width = nested.subreport ? naturalWidth : Math.min(naturalWidth, usableWidth);
     const scale = width / naturalWidth;
     const columns = naturalColumns.map((value) => value * scale);
+    // The invoking Subreport's own box. It has no rows of its own: its extent is the rendered extent of
+    // the sibling regions this invocation produced, floored at the placeholder and child-body geometry,
+    // which is what SSRS frames. Measuring it here keeps the cell tall enough for the box on every path
+    // that sizes a row from its nested regions.
+    if (nested.subreportFrame) {
+      const frameLeft = nested.item.left || 0;
+      const frameTop = nested.item.top || 0;
+      const extent = nested.subreportFrame.reduce((box, sibling) => {
+        const siblingLayout = nestedLayout(sibling, availableWidth);
+        return {
+          width: Math.max(box.width, (sibling.item.left || 0) - frameLeft + siblingLayout.width),
+          height: Math.max(box.height, (sibling.item.top || 0) - frameTop + siblingLayout.height),
+        };
+      }, { width, height: nested.item.height || 0 });
+      return { columns, placements: [], heights: [], width: extent.width, height: extent.height };
+    }
     const placements = nestedPlacements(nested, nested.rows || [], columns.length);
     const heights = (nested.rows || []).map((row, rowIndex) => row.cells.reduce((maximum, cell, cellIndex) => {
       const textbox = cellTextbox(cell);
@@ -1064,6 +1093,67 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }, row.height || 0));
     return { columns, placements, heights, width, height: heights.reduce((sum, value) => sum + value, 0) };
   };
+  // Parent-row pagination narrows a child data region to one page's worth of rows by swapping
+  // `nested.rows`, and restores the canonical rows as soon as that loop ends. Any draw that was deferred
+  // past the loop must therefore carry the row window it was queued with; reading `nested.rows` at draw
+  // time would lay out the whole child again.
+  const withChildRows = (nested, rows, action) => {
+    if (rows === nested.rows) return action();
+    const restore = nested.rows;
+    nested.rows = rows;
+    try {
+      return action();
+    } finally {
+      nested.rows = restore;
+    }
+  };
+  // The child rows a paginated region has not drawn yet, as one window (used to measure what is left).
+  const remainingChildRows = (nested, offset) => {
+    const canonical = nested.canonicalRows || nested.rows || [];
+    const leading = [];
+    for (const row of canonical) {
+      if (!row.isHeader) break;
+      leading.push(row);
+    }
+    const data = canonical.slice(leading.length);
+    if (offset <= 0) return canonical;
+    const columnCount = (nested.columns || nested.item.columns || []).length;
+    return [...leading, ...carryOpenSpans(nested, leading.length + offset, data.slice(offset), columnCount)];
+  };
+  // Choose the child rows that fit `available`, starting at absolute data-row `offset`. Returns the row
+  // window to draw (the child's leading headers, any row-span carried in from earlier rows, then the
+  // slice) and where the next window starts. Mirrors the row-level fragment loop so a child region
+  // paginates identically whether its cell spans one row or several.
+  const sliceChildRows = (nested, available, width, offset) => {
+    const canonical = nested.canonicalRows || nested.rows || [];
+    const leading = [];
+    for (const row of canonical) {
+      if (!row.isHeader) break;
+      leading.push(row);
+    }
+    const data = canonical.slice(leading.length);
+    const fullLayout = withChildRows(nested, canonical, () => nestedLayout(nested, width));
+    const heightByRow = new Map(canonical.map((row, index) => [row, fullLayout.heights[index]]));
+    const headerHeight = leading.reduce((sum, row) => sum + (heightByRow.get(row) || 0), 0);
+    const budget = Math.max(1, available - (nested.item.top || 0) - headerHeight);
+    let end = offset;
+    let used = 0;
+    while (end < data.length) {
+      const next = heightByRow.get(data[end]) || data[end].height || 0;
+      if (end > offset && used + next > budget) break;
+      used += next;
+      end += 1;
+      if (used >= budget) break;
+    }
+    if (end === offset && offset < data.length) end += 1;
+    const columnCount = (nested.columns || nested.item.columns || []).length;
+    return {
+      rows: [...leading, ...carryOpenSpans(nested, leading.length + offset, data.slice(offset, end), columnCount)],
+      nextOffset: end,
+      complete: end >= data.length,
+      drewRow: end > offset,
+    };
+  };
   const drawNestedTablix = (nested, parentX, parentY, availableWidth) => {
     const nestedParameters = nested.parameters || request.parameters || {};
     const nestedDatasets = nested.datasets || datasets;
@@ -1073,6 +1163,25 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       x: parentX + (nested.item.left || 0),
       y: parentY + (nested.item.top || 0),
     };
+    if (nested.subreportFrame) {
+      // A content-free box: record it exactly like the body-level Subreport container so the trace-driven
+      // editable DOCX materializes the same frame, then let the outer-border pass below stroke it.
+      recordLayoutItem(doc, {
+        kind: 'rectangle',
+        itemName: nested.item.name || null,
+        zIndex: nested.item.zIndex || 0,
+        x: start.x,
+        y: start.y,
+        width: layout.width,
+        height: layout.height,
+        backgroundColor: styleColor(nested.item.style?.backgroundColor, {
+          parameters: nestedParameters, globals: nestedGlobals, datasets: nestedDatasets, dataset: [], fields: {},
+        }, null),
+        borders: resolvedTraceBorders(nested.item.style, {
+          parameters: nestedParameters, globals: nestedGlobals, datasets: nestedDatasets, dataset: [], fields: {},
+        }),
+      });
+    }
     const rowOffsets = [0];
     layout.heights.forEach((height) => rowOffsets.push(rowOffsets[rowOffsets.length - 1] + height));
     const columnOffsets = [0];
@@ -1303,7 +1412,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // segment (and re-drawing the value, SSRS-style) at every page break in between.
   let openSpans = [];
 
-  const closeOuterBorderFragment = (endY) => {
+  // `cutInsideRow` marks a fragment that ends because a row was split, not because a row ended.
+  const closeOuterBorderFragment = (endY, cutInsideRow = false) => {
     const fragmentHeight = Math.max(0, endY - fragmentStartY);
     if (firstFragment) collectEdge(
       startX, fragmentStartY, totalWidth, fragmentHeight, 'top',
@@ -1317,15 +1427,28 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       startX, fragmentStartY, totalWidth, fragmentHeight, 'right',
       item.style?.borders?.right, outerContext, { side: 'right' },
     );
-    // Data fragments always close, including overflow pages. Static layout tablixes instead honor the
-    // declared bottom edge, so Border=None cannot create a decorative rule after headings or prose.
+    // Data fragments close, so the last row of a bordered grid is never left open. Static layout tablixes
+    // instead honor the declared bottom edge, so Border=None cannot create a decorative rule after
+    // headings or prose.
+    const declaredBottom = item.style?.borders?.bottom;
+    const bottomBorder = enforceBottomClosure
+      ? enforcedBottomBorder(item.style, rows, item)
+      : declaredBottom;
+    // A page cut INSIDE a row is not the edge of anything: the row resumes at the top of the next page.
+    // The synthesized closure exists to mark where a data table ends, so at such a cut it has nothing to
+    // close — and drawing it there ends the table on every split page, hard against the printable body
+    // boundary, which is where a page footer's own rule sits. That is why one page showed the table's rule
+    // sitting flush on the footer rule while a page that happened to end on a row boundary showed the
+    // natural gap. A bottom border the RDL actually declares is the author's own box and still closes every
+    // fragment.
+    const synthesized = Boolean(bottomBorder) && bottomBorder !== declaredBottom;
     collectEdge(
       startX,
       fragmentStartY,
       totalWidth,
       fragmentHeight,
       'bottom',
-      enforceBottomClosure ? enforcedBottomBorder(item.style) : item.style?.borders?.bottom,
+      cutInsideRow && synthesized ? null : bottomBorder,
       outerContext,
       { side: 'bottom' },
     );
@@ -1358,6 +1481,25 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     ...(cell.nestedTablixes || []).map((nested) => (nested.item.top || 0) + nestedLayout(nested, width).height),
   );
 
+  // What one cell needs vertically: its value, its child data regions, or — for a free-form canvas cell —
+  // the extent of the items flattened into it.
+  const cellContentHeight = (layout) => {
+    if (isCanvasCell(layout.cell)) return canvasCellExtent(layout.cell, layout.width);
+    return Math.max(
+      measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
+        + styleSize(layout.textbox?.style.paddingTop, layout.context, 2)
+        + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
+      Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
+        (nested.item.top || 0) + nestedLayout(nested, layout.width).height
+      ))),
+    );
+  };
+
+  // What a vertical merge beginning in this row needs, independent of how tall the rows it spans are.
+  const mergeRequirementAt = (row) => Math.max(0, ...layoutsForRow(row)
+    .filter((layout) => (layout.cell.rowSpan || 1) > 1)
+    .map((layout) => cellContentHeight(layout)));
+
   const rowMeasurementCache = new WeakMap();
   const measureRow = (row, texts = row.cells.map((cell) => cellText(cell))) => {
     statistics.rowMeasurementRequests += 1;
@@ -1386,21 +1528,19 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
     statistics.rowMeasurementsComputed += 1;
     const layouts = layoutsForRow(row, texts);
-    const canvasCells = row.cells.filter(isCanvasCell);
+    // A vertically merged (row-span) cell belongs to every physical row it covers, not to the row it
+    // starts in. Sizing that first row from the merge's whole content pushed every later row of the group
+    // down by it — a group header whose child region is taller than the group's rows dragged the second
+    // detail row hundreds of points below its own data. SSRS keeps each spanned row at its natural height
+    // and grows the GROUP so the merge can finish, which is what closeSpansEndingAt does below.
+    const ownRow = layouts.filter((layout) => (layout.cell.rowSpan || 1) === 1);
+    const canvasCells = ownRow.filter((layout) => isCanvasCell(layout.cell));
     let measured;
     if (canvasCells.length > 0) {
       // A List/canvas row is sized to its content extent, not the tablix's design row height.
-      const widthOf = new Map(layouts.map((layout) => [layout.cell, layout.width]));
-      measured = Math.max(0, ...canvasCells.map((cell) => canvasCellExtent(cell, widthOf.get(cell) || totalWidth)));
+      measured = Math.max(0, ...canvasCells.map((layout) => cellContentHeight(layout)));
     } else {
-      measured = layouts.reduce((height, layout) => Math.max(
-        height,
-        measureTextboxHeight(doc, config, layout.textbox, layout.context, layout.text, layout.width)
-          + styleSize(layout.textbox?.style.paddingTop, layout.context, 2) + styleSize(layout.textbox?.style.paddingBottom, layout.context, 2),
-        Math.max(0, ...(layout.cell.nestedTablixes || []).map((nested) => (
-          (nested.item.top || 0) + nestedLayout(nested, layout.width).height
-        ))),
-      ), row.height);
+      measured = ownRow.reduce((height, layout) => Math.max(height, cellContentHeight(layout)), row.height);
     }
     if (cacheable) pageCache.set(textKey, measured);
     return measured;
@@ -1430,6 +1570,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const drawSpanSegment = (span, endY, finalSegment = false) => {
     const segmentHeight = Math.min(endY - span.segStartY, Math.max(0, pageBottom - span.segStartY));
     if (segmentHeight <= 0.5) return;
+    // A segment that the page break cut still has its cell's bottom edge below it, on the next page.
+    const edges = finalSegment ? span.edges : openEdge(span.edges, 'bottom');
     span.pendingTail = null;
     if (span.textbox && !span.cell.hidden) {
       const { head, tail } = splitTextForHeight(doc, config, span.textbox, span.context, span.text, span.width, segmentHeight);
@@ -1439,7 +1581,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         height: segmentHeight,
         text: head,
         skipBorder: true,
-        traceEdges: span.edges,
+        traceEdges: edges,
         traceMeta: {
           kind: 'tablixCell',
           tablixName: item.name || null,
@@ -1473,22 +1615,44 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         verticalAlign: 'top',
         padding: { top: 0, right: 0, bottom: 0, left: 0 },
         backgroundColor: styleColor(item.style?.backgroundColor, span.context, null),
-        borders: resolvedTraceBorders(item.style, span.context, span.edges),
+        borders: resolvedTraceBorders(item.style, span.context, edges),
       });
     }
     // A nested data region can live in a row-header cell whose owning group spans several physical parent
     // rows. Those cells are rendered lazily by this open-span path, so drawing nested regions only from
-    // drawRowContent silently produced an empty merged cell. Render the child once in the first page
-    // segment that can contain it. If no segment can contain it, fail closed rather than dropping or
-    // clipping child rows; synchronized pagination of a row-spanned parent and oversized child is a
-    // different construct from the supported oversized child in an ordinary cell.
-    if (!span.nestedDrawn && span.nestedTablixes.length > 0) {
-      const requiredHeight = Math.max(...span.nestedTablixes.map((nested) => (
-        (nested.item.top || 0) + nestedLayout(nested, span.width).height
+    // drawRowContent silently produced an empty merged cell. drawRowContent instead queues one entry per
+    // parent-row fragment, each holding that fragment's child row window, and each entry is drawn by the
+    // next span segment that can contain it. If no segment can contain one, fail closed rather than
+    // dropping or clipping child rows.
+    const queuedChildren = span.pendingNested[0];
+    if (queuedChildren) {
+      for (const queued of queuedChildren) {
+        if (!queued.rows) queued.rows = remainingChildRows(queued.nested, queued.offset || 0);
+      }
+      const requiredHeight = Math.max(...queuedChildren.map(({ nested, rows }) => (
+        (nested.item.top || 0) + withChildRows(nested, rows, () => nestedLayout(nested, span.width).height)
       )));
       if (requiredHeight <= segmentHeight + 0.5) {
-        for (const nested of span.nestedTablixes) drawNestedTablix(nested, span.x, span.segStartY, span.width);
-        span.nestedDrawn = true;
+        span.pendingNested.shift();
+        for (const { nested, rows } of queuedChildren) {
+          withChildRows(nested, rows, () => drawNestedTablix(nested, span.x, span.segStartY, span.width));
+        }
+      } else if (queuedChildren.length === 1 && segmentHeight > 0.5) {
+        // The child is taller than this segment: draw the rows that fit and continue the remainder in the
+        // span's next segment. Two children in one merged cell would have to be split in step, which needs
+        // synchronized child grids, so those keep the fail-closed path below.
+        const [{ nested, offset }] = queuedChildren;
+        const slice = sliceChildRows(nested, segmentHeight, span.width, offset || 0);
+        if (slice.drewRow && !slice.complete) {
+          span.pendingNested.shift();
+          withChildRows(nested, slice.rows, () => drawNestedTablix(nested, span.x, span.segStartY, span.width));
+          span.pendingNested.unshift([{ nested, rows: null, offset: slice.nextOffset }]);
+        } else if (finalSegment) {
+          throw new ServiceError(
+            'UNSUPPORTED_FEATURE',
+            `Row-spanned nested tablix in ${item.name || 'unnamed'} exceeds its printable page segment`,
+          );
+        }
       } else if (finalSegment) {
         throw new ServiceError(
           'UNSUPPORTED_FEATURE',
@@ -1496,11 +1660,58 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         );
       }
     }
-    drawEdges(span.x, span.segStartY, span.width, segmentHeight, span.edges);
+    drawEdges(span.x, span.segStartY, span.width, segmentHeight, edges);
+  };
+
+  // What a merged cell still has left to draw: the part of its value that has not been placed yet plus
+  // every child row still queued. Shrinks as segments are drawn, so it is also the amount of group height
+  // the merge still needs.
+  const spanOutstanding = (span) => {
+    const textHeight = span.textbox && !span.cell.hidden
+      ? measureTextboxHeight(doc, config, span.textbox, span.context, span.text, span.width)
+        + styleSize(span.textbox?.style.paddingTop, span.context, 2)
+        + styleSize(span.textbox?.style.paddingBottom, span.context, 2)
+      : 0;
+    const childHeight = span.pendingNested.reduce((total, queued) => total + Math.max(0, ...queued.map((entry) => {
+      const rows = entry.rows || remainingChildRows(entry.nested, entry.offset || 0);
+      return (entry.nested.item.top || 0) + withChildRows(entry.nested, rows, () => nestedLayout(entry.nested, span.width).height);
+    })), 0);
+    return Math.max(textHeight, childHeight);
+  };
+
+  // SSRS grows the group so a vertical merge can finish. The merge's content is not owned by the row it
+  // starts in, so when the rows it spans are shorter than the merge the group gains the difference here,
+  // after its last spanned row — never by inflating its first row.
+  const growGroupForClosingSpans = (rowIndex) => {
+    for (let guard = 0; ; guard += 1) {
+      const closing = openSpans.filter((span) => span.endRowIndex <= rowIndex);
+      if (closing.length === 0) return;
+      const shortfall = Math.max(0, ...closing.map((span) => spanOutstanding(span) - (y - span.segStartY)));
+      if (shortfall <= 0.5) return;
+      if (y + shortfall <= pageBottom + 0.5) {
+        addedHeight += shortfall;
+        y += shortfall;
+        return;
+      }
+      // The merge cannot finish on this page. Fill the page, break, and let the continuation carry on.
+      const filled = Math.max(0, pageBottom - y);
+      const outstandingBefore = Math.max(...closing.map(spanOutstanding));
+      addedHeight += filled;
+      y = pageBottom;
+      startContinuationPage();
+      const outstandingAfter = Math.max(...closing.map(spanOutstanding));
+      if (guard > 0 && outstandingAfter >= outstandingBefore - 0.5) {
+        throw new ServiceError(
+          'UNSUPPORTED_FEATURE',
+          `Row-spanned nested tablix in ${item.name || 'unnamed'} exceeds its printable page segment`,
+        );
+      }
+    }
   };
 
   // Close every span whose last spanned row has now been fully drawn, ending it at the current y.
   const closeSpansEndingAt = (rowIndex) => {
+    growGroupForClosingSpans(rowIndex);
     for (const span of openSpans) if (span.endRowIndex <= rowIndex) drawSpanSegment(span, y, true);
     openSpans = openSpans.filter((span) => span.endRowIndex > rowIndex);
   };
@@ -1514,10 +1725,23 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const x = startX + xOffsetPt;
       const textbox = cellTextbox(cell);
       const cellContext = contextForCell(rowIndex, cell);
-      const edges = resolveEdges({ cell, rowIndex }, columnIndex, span);
+      const declaredEdges = resolveEdges({ cell, rowIndex }, columnIndex, span);
+      // A row segment the page break cut keeps its bottom edge for the page that finishes the row.
+      const edges = rowComplete ? declaredEdges : openEdge(declaredEdges, 'bottom');
       // Merged (row-span) cells are drawn lazily via drawSpanSegment so they track the real extent of their
       // spanned rows across page splits; single-row cells draw here directly.
       if ((cell.rowSpan || 1) > 1) {
+        // A merged cell opens exactly once. Its origin row is drawn again for every fragment a page break
+        // splits it into (a split value, or a child data region paginated across pages), and
+        // startContinuationPage already re-opens the span on each new page. Pushing a second span for the
+        // same cell drew the value, fill, and borders twice at one origin and left the duplicate holding
+        // a stale child row window, so the later segments measured the whole child against one page.
+        const openSpan = openSpans.find((candidate) => candidate.cell === cell && candidate.rowIndex === rowIndex);
+        const childRegions = cell.nestedTablixes || [];
+        // A merged cell's children are paginated by the span, not by this row, so they are queued once
+        // when the span opens; a later fragment of the same row must not queue them again.
+        if (openSpan) continue;
+        for (const nested of childRegions) nested.canonicalRows = nested.canonicalRows || nested.rows;
         openSpans.push({
           x,
           width,
@@ -1525,7 +1749,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           cell,
           text: texts[index] || '',
           context: cellContext,
-          edges,
+          // The merged cell's own box. drawSpanSegment decides per segment which of these edges the page
+          // break cut, so the span must carry the declared set rather than this row's cut-aware view.
+          edges: declaredEdges,
           segStartY: y,
           endRowIndex: rowIndex + (cell.rowSpan || 1) - 1,
           sourceRow: row,
@@ -1534,8 +1760,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           colSpan: span,
           rowSpan: cell.rowSpan || 1,
           firstSegmentY: y,
-          nestedTablixes: cell.nestedTablixes || [],
-          nestedDrawn: false,
+          // The child regions this merged cell still owes, with the exact row window each was laid out
+          // with. drawSpanSegment draws one window per segment, splitting and re-queueing the remainder
+          // when a segment cannot hold it.
+          pendingNested: childRegions.length > 0
+            ? [childRegions.map((nested) => ({ nested, rows: nested.rows, offset: 0 }))]
+            : [],
         });
         continue;
       }
@@ -1645,7 +1875,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     for (const span of openSpans) drawSpanSegment(span, y);
     // Close and flush the actual table fragment before breaking so the final data row retains its bottom
     // border. The continuation annotation belongs only to the next page, above its repeated table header.
-    closeOuterBorderFragment(y);
+    // A caller that names the row it is continuing is cutting inside that row, so this fragment ends
+    // mid-row and has no row edge to close.
+    closeOuterBorderFragment(y, Boolean(continuedRow));
     addPage();
     y = addPage.bodyTop;
     if (showContinuationMarkers && logicalContinuationRow) drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, logicalContinuationRow);
@@ -1812,7 +2044,10 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // must split there; attempting another break would create an endless blank-page loop. Repeating headers
     // use their existing pagination path and must not recursively request a continuation page themselves.
     const atFreshContentStart = y <= addPage.bodyTop + repeatedHeaderHeight + 0.5;
-    const hasNestedTablix = row.cells.some((cell) => (cell.nestedTablixes || []).length > 0);
+    // Merged cells are excluded: their child regions are paginated by the open-span path, which knows the
+    // merge's real extent. Sizing or splitting them from this row would put the whole child in the row it
+    // starts in, which is the growth bug this row measurement no longer has.
+    const hasNestedTablix = row.cells.some((cell) => (cell.rowSpan || 1) === 1 && (cell.nestedTablixes || []).length > 0);
     // SSRS breaks a page at the deepest boundary that can still fill it. A parent row holding a child data
     // region (nested tablix or bundled subreport) is therefore NOT atomic: the break falls between the
     // child region's own rows and the remainder continues on the next page. The whole row moves only when
@@ -1820,8 +2055,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // still fits a fresh page, or when the child grid cannot be split — it has no data rows, or two
     // children would have to be split in step, which would need synchronized child grids.
     if (hasNestedTablix && y + measured > pageBottom) {
-      const nestedOwners = row.cells.flatMap((cell, cellIndex) => (cell.nestedTablixes || [])
-        .map((nested) => ({ cell, cellIndex, nested })));
+      const nestedOwners = row.cells.flatMap((cell, cellIndex) => ((cell.rowSpan || 1) > 1 ? [] : (cell.nestedTablixes || [])
+        .map((nested) => ({ cell, cellIndex, nested }))));
       const childExtent = ({ nested, cellIndex }) => (nested.item.top || 0) + nestedLayout(
         nested,
         layoutsForRow(row)[cellIndex]?.width || totalWidth,
@@ -1929,7 +2164,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         protectedHeight = row.cells.reduce((maximum, cell) => Math.max(
           maximum,
           measuredHeights.slice(rowIndex, rowIndex + Math.max(1, cell.rowSpan || 1)).reduce((sum, value) => sum + value, 0),
-        ), measured);
+        ), Math.max(measured, mergeRequirementAt(row)));
         statistics.rowSpanHeightCalculations += row.cells.length;
       } else {
         const maximumRowSpan = row.cells.reduce((maximum, cell) => Math.max(maximum, Math.max(1, cell.rowSpan || 1)), 1);
@@ -1939,7 +2174,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         const spanEnd = Math.min(measuredHeights.length, rowIndex + maximumRowSpan);
         for (let spanIndex = rowIndex; spanIndex < spanEnd; spanIndex += 1) spannedHeight += measuredHeights[spanIndex];
         statistics.rowSpanHeightCalculations += 1;
-        protectedHeight = Math.max(measured, spannedHeight);
+        protectedHeight = Math.max(measured, spannedHeight, mergeRequirementAt(row));
       }
       if (y + protectedHeight > pageBottom && protectedHeight <= freshPageCapacity) startContinuationPage();
     }
@@ -2002,6 +2237,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
   }
   for (const row of rows) drawRow(row);
+  growGroupForClosingSpans(Number.MAX_SAFE_INTEGER);
   for (const span of openSpans) drawSpanSegment(span, y); // flush any spans still open at the tablix end
   openSpans = [];
   closeOuterBorderFragment(y);

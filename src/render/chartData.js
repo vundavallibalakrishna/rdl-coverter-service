@@ -148,6 +148,7 @@ export function materializeChart(chart, datasetsByName, parameters = {}, globals
         color,
         label: pointLabel(seriesDef.dataLabel, y, first, base),
         labelPosition: seriesDef.dataLabel?.position || 'Auto',
+        labelStyle: seriesDef.dataLabel?.style || {},
       };
     });
     return { label: group.label ?? seriesDef.name, color: seriesColor, points };
