@@ -15,6 +15,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import ExcelJS from 'exceljs';
+import { PNG } from 'pngjs';
 import { loadConfig } from '../src/config.js';
 import { parseRdl } from '../src/rdl/parser.js';
 import { renderExcel } from '../src/render/excel.js';
@@ -22,6 +23,9 @@ import { renderPdf } from '../src/render/pdf.js';
 
 const execFileAsync = promisify(execFile);
 const config = loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
+const pdfTextTool = /pdftoppm(?:\.exe)?$/i.test(config.pdftoppmPath)
+  ? path.join(path.dirname(config.pdftoppmPath), process.platform === 'win32' ? 'pdftotext.exe' : 'pdftotext')
+  : 'pdftotext';
 const request = { outputFileName: 'excel-container-border', parameters: {}, datasets: { Rows: [{ Label: 'only' }] } };
 
 const SOLID = '<Border><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></Border>';
@@ -129,13 +133,46 @@ test('a container that declares its own border still adds it', async () => {
   assert.ok(last.cell.border?.bottom, 'a declared container border must be present, not suppressed');
 });
 
+test('a picture flush with a bordered Rectangle is inset so it cannot cover the container rule', async (context) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-xlsx-picture-border-'));
+  context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const png = new PNG({ width: 2, height: 2 });
+  png.data.fill(0xFF);
+  const imageData = PNG.sync.write(png).toString('base64');
+  const pictureReport = Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <EmbeddedImages><EmbeddedImage Name="Tile"><MIMEType>image/png</MIMEType><ImageData>${imageData}</ImageData></EmbeddedImage></EmbeddedImages>
+  <ReportSections><ReportSection><Body><ReportItems>
+    <Rectangle Name="Frame"><ReportItems>
+      <Image Name="Picture"><Source>Embedded</Source><Value>Tile</Value><Sizing>Fit</Sizing>
+        <Top>0pt</Top><Left>0pt</Left><Height>100pt</Height><Width>200pt</Width><Style/></Image>
+    </ReportItems><Top>0pt</Top><Left>0pt</Left><Height>100pt</Height><Width>200pt</Width>
+      <Style><Border><Style>Solid</Style><Color>Black</Color><Width>2pt</Width></Border></Style></Rectangle>
+  </ReportItems><Height>120pt</Height><Style/></Body><Width>220pt</Width>
+  <Page><PageWidth>300pt</PageWidth><PageHeight>300pt</PageHeight><TopMargin>10pt</TopMargin><BottomMargin>10pt</BottomMargin><LeftMargin>10pt</LeftMargin><RightMargin>10pt</RightMargin></Page>
+  </ReportSection></ReportSections>
+</Report>`, 'utf8');
+  const rendered = await renderExcel(parseRdl(pictureReport), { outputFileName: 'picture-frame', parameters: {}, datasets: {}, excelLayoutMode: 'REPORT' }, config, tempDir);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(rendered.buffer);
+  const sheet = workbook.worksheets[0];
+  const [picture] = sheet.getImages();
+  assert.ok(picture, 'the embedded image must be present');
+  assert.ok(picture.range.tl.col > 0, 'left parent border remains outside the floating picture');
+  assert.ok(picture.range.tl.row > 0, 'top parent border remains outside the floating picture');
+  assert.ok(picture.range.br.col < 1, 'right parent border remains outside the floating picture');
+  assert.ok(picture.range.br.row < 1, 'bottom parent border remains outside the floating picture');
+  const anchor = sheet.getCell(1, 1);
+  assert.ok(anchor.border?.top && anchor.border?.left, 'the parent Rectangle outline is retained in the worksheet cells');
+});
+
 test('PDF is unaffected: it strokes both rules as geometry either way', async (context) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rdl-xlsx-border-pdf-'));
   context.after(() => fs.rm(tempDir, { recursive: true, force: true }));
   const pdfPath = path.join(tempDir, 'borders.pdf');
   const rendered = await renderPdf(parseRdl(report()), request, config);
   await fs.writeFile(pdfPath, rendered.buffer);
-  const { stdout } = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
+  const { stdout } = await execFileAsync(pdfTextTool, ['-layout', pdfPath, '-']);
   assert.match(stdout, /HEAD_A/);
   assert.match(stdout, /LAST_A/);
 });
