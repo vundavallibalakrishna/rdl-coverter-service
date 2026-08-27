@@ -1093,6 +1093,21 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }, row.height || 0));
     return { columns, placements, heights, width, height: heights.reduce((sum, value) => sum + value, 0) };
   };
+  // Parent-row pagination narrows a child data region to one page's worth of rows by swapping
+  // `nested.rows`, and restores the canonical rows as soon as that loop ends. Any draw that was deferred
+  // past the loop must therefore carry the row window it was queued with; reading `nested.rows` at draw
+  // time would lay out the whole child again.
+  const isChildPageFragment = (nested) => Boolean(nested.canonicalRows) && nested.rows !== nested.canonicalRows;
+  const withChildRows = (nested, rows, action) => {
+    if (rows === nested.rows) return action();
+    const restore = nested.rows;
+    nested.rows = rows;
+    try {
+      return action();
+    } finally {
+      nested.rows = restore;
+    }
+  };
   const drawNestedTablix = (nested, parentX, parentY, availableWidth) => {
     const nestedParameters = nested.parameters || request.parameters || {};
     const nestedDatasets = nested.datasets || datasets;
@@ -1542,17 +1557,20 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
     // A nested data region can live in a row-header cell whose owning group spans several physical parent
     // rows. Those cells are rendered lazily by this open-span path, so drawing nested regions only from
-    // drawRowContent silently produced an empty merged cell. Render the child once in the first page
-    // segment that can contain it. If no segment can contain it, fail closed rather than dropping or
-    // clipping child rows; synchronized pagination of a row-spanned parent and oversized child is a
-    // different construct from the supported oversized child in an ordinary cell.
-    if (!span.nestedDrawn && span.nestedTablixes.length > 0) {
-      const requiredHeight = Math.max(...span.nestedTablixes.map((nested) => (
-        (nested.item.top || 0) + nestedLayout(nested, span.width).height
+    // drawRowContent silently produced an empty merged cell. drawRowContent instead queues one entry per
+    // parent-row fragment, each holding that fragment's child row window, and each entry is drawn by the
+    // next span segment that can contain it. If no segment can contain one, fail closed rather than
+    // dropping or clipping child rows.
+    const queuedChildren = span.pendingNested[0];
+    if (queuedChildren) {
+      const requiredHeight = Math.max(...queuedChildren.map(({ nested, rows }) => (
+        (nested.item.top || 0) + withChildRows(nested, rows, () => nestedLayout(nested, span.width).height)
       )));
       if (requiredHeight <= segmentHeight + 0.5) {
-        for (const nested of span.nestedTablixes) drawNestedTablix(nested, span.x, span.segStartY, span.width);
-        span.nestedDrawn = true;
+        span.pendingNested.shift();
+        for (const { nested, rows } of queuedChildren) {
+          withChildRows(nested, rows, () => drawNestedTablix(nested, span.x, span.segStartY, span.width));
+        }
       } else if (finalSegment) {
         throw new ServiceError(
           'UNSUPPORTED_FEATURE',
@@ -1584,6 +1602,21 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       // Merged (row-span) cells are drawn lazily via drawSpanSegment so they track the real extent of their
       // spanned rows across page splits; single-row cells draw here directly.
       if ((cell.rowSpan || 1) > 1) {
+        // A merged cell opens exactly once. Its origin row is drawn again for every fragment a page break
+        // splits it into (a split value, or a child data region paginated across pages), and
+        // startContinuationPage already re-opens the span on each new page. Pushing a second span for the
+        // same cell drew the value, fill, and borders twice at one origin and left the duplicate holding
+        // a stale child row window, so the later segments measured the whole child against one page.
+        const openSpan = openSpans.find((candidate) => candidate.cell === cell && candidate.rowIndex === rowIndex);
+        const childRegions = cell.nestedTablixes || [];
+        if (openSpan) {
+          // Only a child region currently windowed to a page fragment has new content for this segment;
+          // an unpaginated child was queued in full when the span opened and must not repeat per fragment.
+          if (childRegions.some(isChildPageFragment)) {
+            openSpan.pendingNested.push(childRegions.map((nested) => ({ nested, rows: nested.rows })));
+          }
+          continue;
+        }
         openSpans.push({
           x,
           width,
@@ -1602,8 +1635,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
           colSpan: span,
           rowSpan: cell.rowSpan || 1,
           firstSegmentY: y,
-          nestedTablixes: cell.nestedTablixes || [],
-          nestedDrawn: false,
+          // One entry per parent-row fragment: the child regions to draw and the exact row window they
+          // were materialized with when that fragment was laid out.
+          pendingNested: childRegions.length > 0
+            ? [childRegions.map((nested) => ({ nested, rows: nested.rows }))]
+            : [],
         });
         continue;
       }
