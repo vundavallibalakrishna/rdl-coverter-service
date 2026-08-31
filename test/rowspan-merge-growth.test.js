@@ -206,3 +206,117 @@ test('a KeepTogether member reserves the merge that makes its group too tall', a
   assert.equal(groupPage(kept).number, 2, 'KeepTogether moves the whole group to a page that holds it');
   assert.equal(mergeFinishesWithGroup(kept), true, 'the reserved page holds the complete merge');
 });
+
+// A page break forced by a merge that cannot finish is a cut inside the group, not the end of the table.
+// Closing the fragment there stroked the tablix's synthesized bottom rule hard against the printable body
+// boundary — which is exactly where a page footer draws its own rule — so the two fused into one bar. The
+// rule belongs at the row boundary where the table really ends, on the last page only.
+const footerRuleReport = ({ childRows }) => Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <DataSets><DataSet Name="DS"><Fields>
+    <Field Name="G"><DataField>G</DataField><TypeName>System.String</TypeName></Field>
+    <Field Name="D"><DataField>D</DataField><TypeName>System.String</TypeName></Field>
+  </Fields><Query><CommandText>x</CommandText></Query></DataSet></DataSets>
+  <ReportSections><ReportSection><Body><ReportItems>
+    <Tablix Name="T"><TablixBody>
+      <TablixColumns><TablixColumn><Width>3in</Width></TablixColumn></TablixColumns>
+      <TablixRows>
+        <TablixRow><Height>0.3in</Height><TablixCells><TablixCell><CellContents>
+          <Textbox Name="Body1"><CanGrow>true</CanGrow><Paragraphs><Paragraph><TextRuns>
+            <TextRun><Value>=Fields!D.Value</Value><Style><FontFamily>Arial</FontFamily><FontSize>9pt</FontSize></Style></TextRun>
+          </TextRuns></Paragraph></Paragraphs>
+          <Style><Border><Style>None</Style></Border><BottomBorder><Style>Dotted</Style><Color>Black</Color><Width>1pt</Width></BottomBorder></Style></Textbox>
+        </CellContents></TablixCell></TablixCells></TablixRow>
+      </TablixRows></TablixBody>
+      <TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
+      <TablixRowHierarchy><TablixMembers>
+        <TablixMember><Group Name="G"><GroupExpressions><GroupExpression>=Fields!G.Value</GroupExpression></GroupExpressions></Group>
+          <TablixHeader><Size>1.5in</Size><CellContents>
+            <Tablix Name="Child"><TablixBody>
+              <TablixColumns><TablixColumn><Width>1.5in</Width></TablixColumn></TablixColumns>
+              <TablixRows>${Array.from({ length: childRows }, (unused, index) => (
+    `<TablixRow><Height>0.4in</Height><TablixCells><TablixCell><CellContents>`
+                + `${textbox(`ChildCell${index + 1}`, `CHILD_${index + 1}`)}</CellContents></TablixCell></TablixCells></TablixRow>`
+  )).join('')}</TablixRows>
+            </TablixBody>
+            <TablixColumnHierarchy><TablixMembers><TablixMember/></TablixMembers></TablixColumnHierarchy>
+            <TablixRowHierarchy><TablixMembers>${'<TablixMember/>'.repeat(childRows)}</TablixMembers></TablixRowHierarchy>
+            <Top>0in</Top><Left>0in</Left><Height>${0.4 * childRows}in</Height><Width>1.5in</Width><Style/></Tablix>
+          </CellContents></TablixHeader>
+          <TablixMembers>
+            <TablixMember><Group Name="D"><GroupExpressions><GroupExpression>=Fields!D.Value</GroupExpression></GroupExpressions></Group></TablixMember>
+          </TablixMembers>
+        </TablixMember>
+      </TablixMembers></TablixRowHierarchy>
+      <DataSetName>DS</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.3in</Height><Width>4.5in</Width>
+      <Style><Border><Style>None</Style></Border></Style></Tablix>
+  </ReportItems><Height>6in</Height><Style/></Body><Width>8in</Width>
+  <Page><PageHeight>4in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.3in</LeftMargin><RightMargin>0.3in</RightMargin><TopMargin>0.3in</TopMargin><BottomMargin>0.3in</BottomMargin>
+    <PageFooter><Height>0.5in</Height><PrintOnFirstPage>true</PrintOnFirstPage><PrintOnLastPage>true</PrintOnLastPage><ReportItems>
+      <Line Name="FooterRule"><Top>0.05in</Top><Left>0in</Left><Height>0in</Height><Width>7.9in</Width>
+        <Style><Border><Style>Solid</Style><Color>Black</Color><Width>1pt</Width></Border></Style></Line>
+    </ReportItems><Style/></PageFooter>
+  </Page></ReportSection></ReportSections></Report>`, 'utf8');
+
+test('a page break forced by an unfinished merge does not rule the body boundary', async () => {
+  const rendered = await renderPdf(
+    parseRdl(footerRuleReport({ childRows: 12 })),
+    { output: 'PDF', outputFileName: 'merge-fragment-border', parameters: {}, datasets: { DS: rows } },
+    config,
+    { captureLayoutTrace: true },
+  );
+  const pages = rendered.layoutTrace.pages;
+  assert.ok(pages.length >= 2, `the merge must cross a page to isolate the cut, got ${pages.length}`);
+
+  const closuresAtBodyBottom = (page) => (page.items || []).filter((item) => (
+    item.traceRole === 'resolvedTablixFragmentBorder'
+    && item.fragmentSide === 'bottom'
+    && Math.abs(item.y - page.bodyBottom) <= 0.5
+  ));
+
+  // Every page but the last is cut inside the group: nothing may close there.
+  for (const page of pages.slice(0, -1)) {
+    assert.deepEqual(
+      closuresAtBodyBottom(page).map((item) => item.itemName || item.kind),
+      [],
+      `page ${page.number} continues the merge, so the table must not close at the body boundary`,
+    );
+  }
+
+  // The table does close, on the last page, at the row boundary where it really ends.
+  const last = pages.at(-1);
+  const closing = (last.items || []).filter((item) => (
+    item.traceRole === 'resolvedTablixFragmentBorder' && item.fragmentSide === 'bottom'
+  ));
+  assert.equal(closing.length, 1, 'the table closes exactly once, where it ends');
+  assert.ok(closing[0].y < last.bodyBottom - 1, 'and clear of the body boundary');
+
+  // The footer keeps its own rule on every page; the two are never the same line.
+  for (const page of pages) {
+    const footer = (page.items || []).filter((item) => item.itemName === 'FooterRule');
+    assert.equal(footer.length, 1, `page ${page.number} draws the report footer rule`);
+    assert.ok(footer[0].y > page.bodyBottom, 'the footer rule belongs to the footer band, not the body');
+  }
+
+  // Both Word modes are built from this trace, so the closure they can draw is the one asserted above.
+  // Rendering them here proves the traced geometry stays representable, page for page.
+  const model = parseRdl(footerRuleReport({ childRows: 12 }));
+  const wordRequest = (output) => ({ output, outputFileName: 'merge-fragment-border', parameters: {}, datasets: { DS: rows } });
+  const editable = await renderEditableDocx(model, wordRequest('DOCX_EDITABLE'), config);
+  assert.equal(editable.pageCount, pages.length);
+  const documentXml = await (await JSZip.loadAsync(editable.buffer)).file('word/document.xml').async('string');
+  assert.match(documentXml, /<w:t[^>]*>CHILD_12<\/w:t>/);
+
+  // Excel has no page fragments at all, so the construct cannot arise there; the table still closes once,
+  // on its real last row.
+  const excel = await renderExcel(model, wordRequest('XLSX'), config, null);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(excel.buffer);
+  const sheet = workbook.worksheets[0];
+  const ruled = [];
+  sheet.eachRow((row, number) => row.eachCell((cell) => {
+    if (cell.border?.bottom && !ruled.includes(number)) ruled.push(number);
+  }));
+  assert.ok(ruled.length > 0, 'the Excel table keeps its row rules');
+  assert.ok(ruled.at(-1) <= sheet.rowCount, 'and none of them fall past the last written row');
+});
