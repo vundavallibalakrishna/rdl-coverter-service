@@ -30,6 +30,11 @@ Reproduce SSRS's absolute coordinate model and its page/pagination rules.
 - `KeepTogether` is best-effort ("keep on one page if possible") and is emitted on nearly every textbox;
   do not treat it as an absolute veto that stops long content from ever crossing a page. Atomic
   keep-together is enforced where the unit is truly indivisible (a tablix row).
+- A tablix **row** is that indivisible unit: a row that does not fit the space left on the page moves whole
+  to the next page. Split a row across pages only when it cannot fit a page at all — a row split at a page
+  boundary breaks a value SSRS keeps together and ends the fragment mid-row, where no closing rule is drawn,
+  so the table stops flush on the printable body boundary against the page footer's own rule. A row whose
+  cell holds a **child data region** is the documented exception: the break falls between the child's rows.
 - Tablix `RepeatColumnHeaders`/`RepeatRowHeaders` repeat headers at the top of each page/fragment;
   `KeepWithGroup`/group headers stay with their data. Repeated headers must not add a blank page.
 - **Wide content**: a tablix/matrix wider than the printable body is split across horizontal page columns,

@@ -18,6 +18,10 @@ paint every container at its **rendered** extent.
 - A tablix cell's height is `max(declared row height, measured content height)` using the same font metrics
   and rich-text run boundaries as the final draw.
 - A row's height is the max over its cells (including the row-span contribution of merged cells).
+- A merged (row-span) cell taller than the rows it spans grows its group at the merge's **last** spanned
+  row: that row is sized to the tallest content ending in it, so **every** cell of that row — not only the
+  merged one — is painted and ruled at the grown height. The difference is never an unowned band appended
+  after the row, which would leave the other columns' boxes short and their grid lines missing.
 - A grown row pushes every following row down; the tablix's total height is the sum of rendered row
   heights, not the sum of declared heights.
 

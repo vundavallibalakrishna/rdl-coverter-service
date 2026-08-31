@@ -1744,6 +1744,19 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     }
   };
 
+  // The height the merges that CLOSE in this row still need, measured from this row's own top — the same
+  // shortfall growGroupForClosingSpans would otherwise append after the row. SSRS sizes a row to the
+  // tallest content that ends in it, so a merged cell taller than the rows it spans grows its LAST
+  // spanned row: every cell of that row, not only the merged one, is painted and ruled at the grown
+  // height. Appending the difference as an unowned band instead left the other columns' boxes short, so
+  // the band below them carried the merged cell's own rules and no grid at all.
+  const closingMergeRequirement = (row) => {
+    const rowIndex = rowIndexes.get(row);
+    return Math.max(0, ...openSpans
+      .filter((span) => span.endRowIndex <= rowIndex)
+      .map((span) => spanOutstanding(span) - Math.max(0, y - span.segStartY)));
+  };
+
   // Close every span whose last spanned row has now been fully drawn, ending it at the current y.
   const closeSpansEndingAt = (rowIndex) => {
     growGroupForClosingSpans(rowIndex);
@@ -2079,6 +2092,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // must split there; attempting another break would create an endless blank-page loop. Repeating headers
     // use their existing pagination path and must not recursively request a continuation page themselves.
     const atFreshContentStart = y <= addPage.bodyTop + repeatedHeaderHeight + 0.5;
+    // SSRS moves a non-fitting row to the next page at most ONCE. `atFreshContentStart` is a snapshot of
+    // this row's original cursor, so once any branch below has broken the page it no longer reports where
+    // the cursor is; a second move would break again on a page the row had just been given (and with a
+    // continuation marker eating into the fresh page, break forever).
+    let movedForFit = false;
     // Merged cells are excluded: their child regions are paginated by the open-span path, which knows the
     // merge's real extent. Sizing or splitting them from this row would put the whole child in the row it
     // starts in, which is the growth bug this row measurement no longer has.
@@ -2185,6 +2203,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       return;
     }
     if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart) {
+      movedForFit = true;
       startContinuationPage();
       measured = measureRow(row, remainingTexts);
     }
@@ -2211,21 +2230,48 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         statistics.rowSpanHeightCalculations += 1;
         protectedHeight = Math.max(measured, spannedHeight, mergeRequirementAt(row));
       }
-      if (y + protectedHeight > pageBottom && protectedHeight <= freshPageCapacity) startContinuationPage();
+      if (y + protectedHeight > pageBottom && protectedHeight <= freshPageCapacity) {
+        startContinuationPage();
+        movedForFit = true;
+      }
     }
     measured = measureRow(row, remainingTexts);
+    // A merge that closes in this row is part of this row's height (see closingMergeRequirement).
+    let target = Math.max(measured, closingMergeRequirement(row));
+    // A tablix row is SSRS's indivisible pagination unit: a row that does not fit what is left of the
+    // page moves whole to the next one, and only a row that cannot fit a page at all is split. Splitting a
+    // row that would have fitted a fresh page both breaks a value SSRS keeps on one page and ends the
+    // fragment mid-row — where, by design, no closing rule is drawn — so the table stops flush on the
+    // printable body boundary, hard against the page footer's own rule, instead of showing the gap its
+    // last complete row leaves. This also covers a row with no continuation-able text (the trailing row of
+    // a row-span group, whose columns are covered by the merged header), which the split loop below cannot
+    // advance: it would be left undrawn with its span still open, and the residual would later paint over
+    // the next group.
+    if (y + target > pageBottom && !atFreshContentStart && !movedForFit && target <= freshPageCapacity) {
+      movedForFit = true;
+      startContinuationPage();
+      measured = measureRow(row, remainingTexts);
+      target = Math.max(measured, closingMergeRequirement(row));
+    }
+    if (y + target <= pageBottom) {
+      drawRowContent(row, target, remainingTexts);
+      return;
+    }
+    // The merge cannot be closed inside this page. Draw the row at its own height and let
+    // growGroupForClosingSpans fill the page and continue the merge on the next one.
     if (y + measured <= pageBottom) {
       drawRowContent(row, measured, remainingTexts);
       return;
     }
 
-    // The row does not fit and the split loop below only advances rows that have splittable text. A row
-    // whose cells carry no continuation-able text (e.g. the trailing row of a row-span group, whose columns
-    // are covered by the merged header) would otherwise fall through the loop undrawn: its height is never
-    // consumed and its open row-span stays open, so the header's residual later closes against the *next*
-    // group's cursor and paints on top of it (two same-named cells at one origin — unrepresentable in Word).
-    // Move the whole row to a fresh page so it draws in order and its span closes against its own row.
-    if (!remainingTexts.some(Boolean) && !atFreshContentStart && measured <= freshPageCapacity) {
+    // Last resort for a row the split loop cannot advance: a row whose cells carry no continuation-able
+    // text (the trailing row of a row-span group, whose columns are covered by the merged header) would
+    // fall through that loop undrawn — its height never consumed and its row-span left open, so the
+    // header's residual would later close against the NEXT group's cursor and paint on top of it (two
+    // same-named cells at one origin — unrepresentable in Word). Move it on its own height, which the
+    // branch above declined to do because the merge closing in it cannot finish on any page.
+    if (!remainingTexts.some(Boolean) && !atFreshContentStart && !movedForFit && measured <= freshPageCapacity) {
+      movedForFit = true;
       startContinuationPage();
       drawRowContent(row, measureRow(row, remainingTexts), remainingTexts);
       return;

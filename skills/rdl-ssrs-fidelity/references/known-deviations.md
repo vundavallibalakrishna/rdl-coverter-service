@@ -235,6 +235,35 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
   pagination. Regression: `test/nested-region-page-fill.test.js` (split + KeepTogether counterexamples for
   both nested tablix and bundled subreport, plus DOCX_EDITABLE and XLSX coverage). Ref: `page-and-flow.md`.
 
+- **A merge's extra height belonged to no row (grid missing under a grown group).** A merged (row-span) cell
+  taller than the rows it spans grows its group; SSRS sizes a row to the tallest content that *ends* in it,
+  so that growth belongs to the merge's LAST spanned row and every cell of that row is painted and ruled at
+  the grown height. `renderTablix` (`pdf.js`) appended the difference after the last row instead, as a band
+  no row owned: the merged cell drew its own box through it while every other column stopped at its natural
+  height, so the band showed one tall cell flanked by columns with no borders at all and the row's fills
+  stopped short of the row. Fixed in the shared PDF tablix layer — `closingMergeRequirement` hands the
+  closing row the height `growGroupForClosingSpans` would otherwise append, so `drawRowContent` sizes,
+  fills, and rules all of that row's cells together; the page-filling path is unchanged for a merge that
+  cannot close on the current page. XLSX already implemented the same rule (`excel.js` grows
+  `measuredHeights[endRow]` for a span it cannot contain), and `DOCX_EDITABLE`/`DOCX_VISUAL` inherit the
+  corrected geometry through the canonical trace. Regression: `test/rowspan-merge-closing-row.test.js`
+  (PDF geometry, the Word row that holds the closing detail, the Excel row height, plus the short-merge
+  counterexample). Ref: `sizing-and-growth.md`, `border-resolution.md`.
+
+- **A tablix row was split mid-text as soon as it overflowed the page remainder.** A tablix row is SSRS's
+  indivisible pagination unit: a row that does not fit what is left of the page moves whole to the next one,
+  and only a row that cannot fit a page at all is split. `drawRow` (`pdf.js`) moved the whole row only when
+  KeepTogether was declared or the row carried no continuation-able text, and split every other overflowing
+  row. Two visible consequences: a value SSRS keeps on one page was broken across two, and — because a cut
+  inside a row is deliberately left open, drawing no closing rule (`tablix-split-row-open-edge.test.js`) —
+  the table stopped flush on the printable body boundary, hard against the page footer's own rule, instead
+  of closing at its last complete row with the gap that leaves. Fixed by moving any non-fitting row that
+  fits a fresh page; the split path stays for a row taller than a page, and the child-data-region row keeps
+  its own deeper break (entry above). PDF owns pagination, `DOCX_EDITABLE` and `DOCX_VISUAL` inherit it from
+  the canonical trace/raster, and XLSX has no pagination. Regression:
+  `test/tablix-row-page-atomicity.test.js` (whole-row move, closure clear of the footer band, and the
+  oversized-row counterexample that must still split). Ref: `page-and-flow.md`.
+
 - **Row-span group header duplicated across a page break (DOCX overlap).** A row-span (merged) group-header
   cell whose group crossed a page boundary could be emitted twice at one origin, so DOCX_EDITABLE failed
   with "Overlapping editable PDF regions" (native Word cells cannot overlap; PDF and XLSX tolerate it). Root
