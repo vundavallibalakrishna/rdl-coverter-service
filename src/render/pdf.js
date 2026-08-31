@@ -901,6 +901,13 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // pieces of each identical line into maximal runs and stroke each run exactly once — the way SSRS draws.
   const posKey = (v) => Math.round(v * 4); // 0.25pt precision so coincident edges match
   let pendingEdges = [];
+  // How deeply nested, in data regions, the edges being collected right now are. A data region inside a
+  // tablix cell is CONTENT of that cell, so SSRS paints the containing region's rule after it: every RPL
+  // item draws its background, then its children, then its own border. Without this the flush below could
+  // order a nested cell's border after the enclosing grid line purely because that line had first been
+  // seen on an earlier row, and a nested White border then erased the black column rule for exactly the
+  // height of the nested region while the rest of the same cell kept it.
+  let borderDepth = 0;
   const collectEdge = (x, y, width, height, side, border, context, traceMeta = null) => {
     if (!border) return;
     statistics.borderEdgesCollected += 1;
@@ -909,19 +916,28 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     const [a, b] = vertical ? [y, y + height] : [x, x + width];
     const sig = `${styleValue(border.style, context, 'None')}|${styleColor(border.color, context, null)}|${styleSize(border.width, context, 1)}`;
     pendingEdges.push({
-      orient: vertical ? 'V' : 'H', pos, a, b, border, context, sig, traceMeta,
+      orient: vertical ? 'V' : 'H', pos, a, b, border, context, sig, traceMeta, depth: borderDepth,
     });
   };
   const flushEdges = () => {
     const groups = new Map();
     for (const edge of pendingEdges) {
       const key = `${edge.orient}|${posKey(edge.pos)}|${edge.sig}`;
-      if (!groups.has(key)) groups.set(key, { edge, intervals: [], traceMeta: null });
+      if (!groups.has(key)) {
+        groups.set(key, {
+          edge, intervals: [], traceMeta: null, depth: edge.depth, order: groups.size,
+        });
+      }
       const group = groups.get(key);
+      group.depth = Math.min(group.depth, edge.depth);
       group.intervals.push([edge.a, edge.b]);
       if (edge.traceMeta) group.traceMeta = edge.traceMeta;
     }
-    for (const { edge, intervals, traceMeta } of groups.values()) {
+    // Deepest first, so a containing region's rules land on top of the borders of the regions nested in
+    // its cells. Identical-signature edges still merge across levels (their order cannot change a pixel),
+    // and groups at the same level keep the order this flush collected them in.
+    const ordered = [...groups.values()].sort((left, right) => right.depth - left.depth || left.order - right.order);
+    for (const { edge, intervals, traceMeta } of ordered) {
       intervals.sort((p, q) => p[0] - q[0]);
       let [runStart, runEnd] = intervals[0];
       const runs = [];
@@ -1154,7 +1170,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       drewRow: end > offset,
     };
   };
-  const drawNestedTablix = (nested, parentX, parentY, availableWidth) => {
+  const drawNestedTablixContent = (nested, parentX, parentY, availableWidth) => {
     const nestedParameters = nested.parameters || request.parameters || {};
     const nestedDatasets = nested.datasets || datasets;
     const nestedGlobals = nested.globals || globals;
@@ -1318,6 +1334,16 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }),
     ));
     return layout.height;
+  };
+  // Every border a nested region contributes is collected one level deeper than its container's, so the
+  // flush paints the container's rules over it.
+  const drawNestedTablix = (nested, parentX, parentY, availableWidth) => {
+    borderDepth += 1;
+    try {
+      return drawNestedTablixContent(nested, parentX, parentY, availableWidth);
+    } finally {
+      borderDepth -= 1;
+    }
   };
   // Draw a nested data region that is taller than one printable page, continuing its rows on further
   // pages instead of painting a single block through the footer band and off the sheet. The region's own
