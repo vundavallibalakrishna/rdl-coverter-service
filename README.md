@@ -318,7 +318,7 @@ Excel chart objects, while the surrounding workbook remains editable.
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
 | `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; see [Supplying subreports](./docs/SUBREPORTS.md). |
-| `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, places “Continued from previous page” above the next table fragment for renderer-confirmed logical-row continuations. |
+| `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, labels a row whose own content the page break cut where it resumes, with “Continued from previous page”. A page break on its own is never labelled, so a table whose rows all fit carries nothing. Text and on/off come from the `continuation.rowLabel` config. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
 | `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
 | `outputFileName` | — | Sanitized for `Content-Disposition`; also `Globals!ReportName`. |

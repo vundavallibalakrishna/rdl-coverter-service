@@ -132,24 +132,31 @@ test('a row header that spans into a continuation fragment is repeated there', a
   }
 });
 
-test('a continued child region is labelled on the page it continues onto', async () => {
-  // The "continued from previous page" annotation belongs to whichever region crossed the boundary. Only
-  // the top-level tablix's continuation path emitted it, so a report whose tables are all CHILD regions
-  // carried no marker at all even with the option on.
+test('a child region sliced at row boundaries is never labelled', async () => {
+  // The child region is sliced at whole child-row boundaries, so each new page STARTS a detail row: no
+  // row's own content is cut, and a page break on its own is not a continuation. The row header that spans
+  // the cut is still carried into the fragment — it just says nothing about crossing the boundary.
   const marked = await renderPdf(parseRdl(rdl), { ...request, pagination: { continuationMarkers: true } }, config, { captureLayoutTrace: true });
-  const markerPages = new Set(marked.layoutTrace.pages
-    .filter((page) => (page.items || []).some((item) => item.traceRole === 'continuationMarker'))
-    .map((page) => page.number));
-  const detailPages = [...new Set(tracedCells(marked.layoutTrace)
+  assert.equal(
+    marked.layoutTrace.pages.filter((page) => (page.items || []).some((item) => item.traceRole === 'continuationMarker')).length,
+    0,
+    'a page that begins a fresh child row is not a row continuation',
+  );
+  const cells = tracedCells(marked.layoutTrace);
+  const detailPages = [...new Set(cells
     .filter((cell) => /^ITEM_\d\d\d$/.test((cell.text || '').trim()))
     .map((cell) => cell.page))].sort((left, right) => left - right);
   assert.ok(detailPages.length > 2, 'the fixture must continue across several pages');
-  assert.ok(!markerPages.has(detailPages[0]), 'the page the table starts on is not a continuation');
-  for (const page of detailPages.slice(1)) {
-    assert.ok(markerPages.has(page), `page ${page} continues the child region but carries no marker`);
+  for (const page of detailPages) {
+    assert.deepEqual(
+      cells.filter((cell) => cell.page === page && (cell.text || '').trim().startsWith('ONLY_GROUP'))
+        .map((cell) => (cell.text || '').trim()),
+      ['ONLY_GROUP'],
+      `page ${page} carries the spanning row header, with its plain value`,
+    );
   }
 
-  // The option is opt-in: without it the annotation must not appear.
+  // The option is opt-in, and with it off the page carries nothing either.
   const plain = await renderPdf(parseRdl(rdl), request, config, { captureLayoutTrace: true });
   assert.equal(
     plain.layoutTrace.pages.filter((page) => (page.items || []).some((item) => item.traceRole === 'continuationMarker')).length,

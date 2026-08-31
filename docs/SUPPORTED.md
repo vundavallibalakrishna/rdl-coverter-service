@@ -222,11 +222,20 @@ heights, line breaks, headers, footers, borders, and embedded fonts. It is desig
 Microsoft Word on Windows. Editing may change later pagination. `/v1/analyze` reports
 `windowsWordEditable`; unsupported geometry and ineligible fonts fail closed.
 
-Set `pagination.continuationMarkers` to `true` to label renderer-confirmed logical-row continuations in
-PDF and editable DOCX. Both formats place “Continued from previous page” above the next table fragment;
-the current page remains unannotated. PDF detects cell-text and row-span splits. Editable DOCX detects
-row-span continuations across explicit native fragments. Pagination that Word creates after opening or
-editing the document is not observable during generation and therefore is not labelled.
+Set `pagination.continuationMarkers` to `true` to label renderer-confirmed row continuations in PDF and
+editable DOCX. The label (default “Continued from previous page”) is decided from measured layout state,
+never from the page break itself: it appears only where a physical tablix row's own content, cut by the
+break, resumes. It is placed above the repeated column header, in reserved space, so no cell moves.
+
+Nothing else is labelled. A row that merely *starts* a page is not a continuation, and neither is a group
+instance spanning the boundary, a repeated header, or a child region sliced at a row boundary — so a table
+whose rows all fit produces no labels at all, however many pages it occupies. A row that spans several
+pages is labelled on each page it resumes on.
+
+Text and on/off are deployment config (`continuation.rowLabel`); disabled, the output is identical to
+rendering without the request option. Editable DOCX inherits the label from the canonical PDF layout trace.
+Pagination that Word creates after opening or editing the document is not observable during generation and
+therefore is not labelled.
 The former continuous renderer, per-report profiles, and native-fragment switches have been removed.
 Obsolete properties are rejected with `RDL_INVALID`. `DOCX_VISUAL` remains the non-editable raster-page
 alternative.

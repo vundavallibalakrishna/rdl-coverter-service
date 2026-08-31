@@ -4,15 +4,33 @@ import { materializeTablixColumns, materializeTablixRows } from '../rdl/validati
 import { normalizeDisplayText, renderMarkupText } from '../rdl/text.js';
 import { toPoints } from '../units.js';
 
-// Cross-format labels for an explicitly detected logical row continuation. The feature is opt-in because
-// adding explanatory text changes the rendered artifact. Renderers must only emit these labels when they
-// own the pagination decision; a viewer-created page break is not detectable while generating the file.
+// Cross-format label for an explicitly detected logical row continuation. The feature is opt-in because
+// adding explanatory text changes the rendered artifact. Renderers must only emit it when they own the
+// pagination decision; a viewer-created page break is not detectable while generating the file.
+//
+// It states one thing, and it is never "a page break happened": this physical tablix row's own content was
+// cut by the break and resumes here. A row that merely STARTS a page is not a continuation, and neither is
+// a group, a repeated header, or a fragment of any region that begins a page on a row boundary.
 export const CONTINUATION_MARKERS = Object.freeze({
-  fromPrevious: 'Continued from previous page',
+  row: 'Continued from previous page',
 });
 
 export function continuationMarkersEnabled(request) {
   return request?.pagination?.continuationMarkers === true;
+}
+
+// The resolved label for one render: the request switch decides whether the annotation exists at all, the
+// deployment config decides what it says and whether it is wanted. Disabled must produce exactly the
+// geometry a renderer produces with the request switch off.
+export function continuationLabels(config, request) {
+  const on = continuationMarkersEnabled(request);
+  const rowLabel = config?.continuation?.rowLabel;
+  return {
+    row: {
+      enabled: on && rowLabel?.enabled !== false,
+      text: rowLabel?.text ?? CONTINUATION_MARKERS.row,
+    },
+  };
 }
 
 // A value that must format as a DateTime when no explicit Format is present. Mirrors the date branch of

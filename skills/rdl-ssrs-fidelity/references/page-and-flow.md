@@ -35,6 +35,11 @@ Reproduce SSRS's absolute coordinate model and its page/pagination rules.
   boundary breaks a value SSRS keeps together and ends the fragment mid-row, where no closing rule is drawn,
   so the table stops flush on the printable body boundary against the page footer's own rule. A row whose
   cell holds a **child data region** is the documented exception: the break falls between the child's rows.
+- The continuation label (this engine's opt-in `pagination.continuationMarkers`, not an RDL feature)
+  states a measured layout fact and must never be emitted for a page break as such. It belongs only on a
+  page where a physical row's own content, cut by the break, resumes. A group instance spanning the
+  boundary, a repeated header, and a child-region fragment that starts on a row boundary are all pages that
+  begin a whole row, and are not labelled.
 - Tablix `RepeatColumnHeaders`/`RepeatRowHeaders` repeat headers at the top of each page/fragment;
   `KeepWithGroup`/group headers stay with their data. Repeated headers must not add a blank page.
 - **Wide content**: a tablix/matrix wider than the printable body is split across horizontal page columns,

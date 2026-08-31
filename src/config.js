@@ -52,6 +52,16 @@ export function loadConfig(env = process.env) {
     // decision per request while preserving substitution accounting; this switch is the operational
     // rollback path for the optimization.
     pdfFontSelectionCache: booleanFlag(env.RDL_PDF_FONT_SELECTION_CACHE, true),
+    // The continuation label. `pagination.continuationMarkers` on the request is the per-call on/off
+    // switch; this is the deployment-wide default for what is written once it is on. It is driven by
+    // detected continuation state, never by a page break: it marks a physical tablix row whose own content
+    // the break cut and which resumes on the page being started. Nothing else is annotated.
+    continuation: Object.freeze({
+      rowLabel: Object.freeze({
+        enabled: booleanFlag(env.RDL_CONTINUATION_ROW_LABEL, true),
+        text: env.RDL_CONTINUATION_ROW_LABEL_TEXT ?? 'Continued from previous page',
+      }),
+    }),
     // Minimum PDF border stroke width in points. 0 = honour the RDL width exactly (default). A floor only
     // makes borders heavier, not more uniform (the unevenness is a viewer sub-pixel artifact, not width),
     // so it is opt-in and off by default.
