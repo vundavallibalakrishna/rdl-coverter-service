@@ -22,6 +22,11 @@ paint every container at its **rendered** extent.
   row: that row is sized to the tallest content ending in it, so **every** cell of that row — not only the
   merged one — is painted and ruled at the grown height. The difference is never an unowned band appended
   after the row, which would leave the other columns' boxes short and their grid lines missing.
+- The content of such a cell — including a child data region — occupies the whole **block** of rows it
+  spans, starting at the block's top and flowing past the first row's bottom. Its rows therefore interleave
+  with the spanned rows rather than preceding them. A grid renderer must distribute the child's edges to the
+  spanned rows that contain them; confining them to the row the cell starts in makes that row as tall as the
+  whole child and displaces every row below it.
 - A grown row pushes every following row down; the tablix's total height is the sum of rendered row
   heights, not the sum of declared heights.
 
