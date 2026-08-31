@@ -111,6 +111,8 @@ test('continues a PDF table cell taller than a page without clipping or duplicat
   const extracted = await execFileAsync('pdftotext', ['-layout', pdfPath, '-']);
   assert.equal((extracted.stdout.match(/PDF_GIANT_START/g) || []).length, 1);
   assert.equal((extracted.stdout.match(/PDF_GIANT_END/g) || []).length, 1);
+  // This row's own text is cut by the break, so the label belongs on every page it resumes on. Nothing
+  // announces a continuation before it happens.
   assert.equal((extracted.stdout.match(/Continued from previous page/g) || []).length > 0, true);
   assert.equal((extracted.stdout.match(/Continued on next page/g) || []).length, 0);
   for (let index = 1; index <= 180; index += 1) {

@@ -235,6 +235,23 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
   pagination. Regression: `test/nested-region-page-fill.test.js` (split + KeepTogether counterexamples for
   both nested tablix and bundled subreport, plus DOCX_EDITABLE and XLSX coverage). Ref: `page-and-flow.md`.
 
+- **Continuation markers fired on every page break instead of on a real continuation.** The opt-in
+  `pagination.continuationMarkers` label was emitted whenever a tablix crossed a page boundary with any
+  row-span open, and unconditionally on every page break of a paginated child region. A grouped tablix
+  therefore carried "Continued from previous page" on every page of the report even though each of those
+  pages simply STARTED a fresh row (measured: a 244-page grouped fixture drew 243 of them; the bands also
+  cost 35 pages of body height, so removing them returned the same data to 209 pages). The label is now
+  decided from the one piece of measured state that means it: a physical row whose own content the break
+  cut and which resumes on the page being started — the split-text loop and the child-region fragment loop
+  in `drawRow`, which already know they are mid-row. An open row-span no longer qualifies (a group
+  spanning the boundary is not a row that was cut), and neither does a merge that outgrew its rows: that
+  break passes `rowContinuation: false`, keeping the fragment's open bottom edge without claiming a row
+  continued. Text and on/off are deployment config (`continuation.rowLabel`); disabled, the geometry is
+  identical to rendering without the request option. Shared-layer fix in the tablix pagination engine
+  (`renderTablix`, `pdf.js`), so `DOCX_EDITABLE` and `DOCX_VISUAL` inherit it through the canonical
+  trace; XLSX has no pagination and therefore no continuation. Regression:
+  `test/tablix-continuation-labels.test.js`. Ref: `page-and-flow.md`.
+
 - **A merge's extra height belonged to no row (grid missing under a grown group).** A merged (row-span) cell
   taller than the rows it spans grows its group; SSRS sizes a row to the tallest content that *ends* in it,
   so that growth belongs to the merge's LAST spanned row and every cell of that row is painted and ruled at

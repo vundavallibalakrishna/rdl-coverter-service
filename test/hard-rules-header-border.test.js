@@ -360,23 +360,23 @@ test('oversized tablix output uses one bordered native page table per canonical 
   // length plus the repository-wide trace raster gate proves that recording itself emits no PDF operators.
   assert.equal(canonical.buffer.length, ordinary.buffer.length,
     'recording a continuation marker must not add PDF drawing content');
+  // Every one of these rows fits whole, so no row's content is ever cut and nothing is annotated — not
+  // the pages, and not the merged group cell that spans them.
   const tracedMarkers = canonical.layoutTrace.pages
     .flatMap((page) => page.items)
     .filter((item) => item.traceRole === 'continuationMarker');
-  assert.equal(tracedMarkers.length, canonical.pageCount - 1);
-  assert.equal(tracedMarkers.every((item) => item.text === 'Continued from previous page'), true);
-  for (const page of canonical.layoutTrace.pages.slice(1)) {
-    const marker = page.items.find((item) => item.traceRole === 'continuationMarker');
-    const firstTableTop = Math.min(...page.items.filter((item) => item.kind === 'tablixCell').map((item) => item.y));
-    assert.ok(Math.abs(marker.y + marker.height - firstTableTop) <= 0.25,
-      'the marker must end at the existing repeated-header boundary without moving table cells');
+  assert.deepEqual(tracedMarkers, [], 'a page that starts a fresh row is not a continuation');
+  for (const [index, page] of canonical.layoutTrace.pages.entries()) {
+    const groupCells = page.items.filter((item) => item.kind === 'tablixCell' && (item.text || '').startsWith('GROUP_HEADER_ONLY'));
+    assert.equal(groupCells.length, 1, `page ${index + 1} re-draws the group that spans it`);
+    assert.equal(groupCells[0].text, 'GROUP_HEADER_ONLY', 'and re-draws it with its plain value');
   }
   const xml = await documentXml((await renderEditableDocx(m, renderRequest, config)).buffer);
   const tables = [...xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)].map((match) => match[0]);
   assert.equal(tables.length, canonical.pageCount, 'each canonical page must become one explicit native page table');
   assert.equal((xml.match(/<w:sectPr(?:\s|>)/g) || []).length, tables.length);
-  assert.equal((xml.match(/Continued from previous page/g) || []).length, tracedMarkers.length,
-    'Word must fill the already-reserved canonical marker region with native text');
+  assert.equal((xml.match(/Continued/g) || []).length, 0,
+    'Word inherits the canonical trace, which carries no annotation here');
   for (const table of tables) {
     const physicalRows = [...table.matchAll(/<w:tr>[\s\S]*?<\/w:tr>/g)].map((match) => match[0]);
     assert.equal(physicalRows.every((row) => /<w:cantSplit\/>/.test(row)), true);

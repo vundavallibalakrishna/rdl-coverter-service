@@ -1,7 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PdfLibDocument } from 'pdf-lib';
 import { ServiceError } from '../errors.js';
-import { CONTINUATION_MARKERS, cellBorderStyle, cellText, cellTextbox, color, continuationMarkersEnabled, enforcedBottomBorder, isCanvasCell, isFreeFormCell, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleText, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
+import { cellBorderStyle, cellText, cellTextbox, color, continuationLabels, enforcedBottomBorder, isCanvasCell, isFreeFormCell, isHidden, matchingChangedGroupOwnerRowBoundary, materializedCellContext, materializedCellVisualSignature, normalizeDatasets, shouldEnforceTablixBottom, styleColor, styleSize, styleText, styleValue, styledSegmentsForText, styledTextForItem, tablixRows, textForItem } from './common.js';
 import { fontVerticalMetrics, pdfFont } from './fonts.js';
 import { computeCellPlacements } from './tableGrid.js';
 import { cellGeometryPt, resolveGridColumns } from './tableLayout.js';
@@ -736,7 +736,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   const placements = computeCellPlacements(rows, columnWidths.length);
   const rowIndexes = new Map(rows.map((row, index) => [row, index]));
   const outerContext = { parameters: request.parameters || {}, globals, dataset: datasets[item.datasetName] || [], datasets, fields: {} };
-  const showContinuationMarkers = continuationMarkersEnabled(request);
+  // The continuation label is driven by detected state, never by "a page break happened": it marks a
+  // physical row this break cut in half, which resumes on the page being started. It resolves to disabled
+  // when the request does not ask for markers, and every site below is gated on it, so the geometry with
+  // the feature off is exactly the geometry this renderer produced before it existed.
+  const labels = continuationLabels(config, request);
 
   const markerDetails = (row) => {
     const textbox = row?.cells?.map((cell) => cellTextbox(cell)).find(Boolean);
@@ -749,15 +753,15 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     return { style, context, fontSize, height: Math.max(10, fontSize * 1.5) };
   };
 
-  const drawContinuationMarker = (label, row, options = {}) => {
+  // The row label for a row whose content resumes on the page just started. It occupies a reserved band
+  // in the tablix's own box, above the repeated column header, and advances the cursor by exactly the band
+  // it painted — so no cell moves and nothing is clipped.
+  const drawContinuationMarker = (label, row) => {
     const { style, context, fontSize, height } = markerDetails(row);
-    // The marker is drawn for whichever region continued. A top-level tablix uses its own geometry and
-    // advances the shared cursor; a paginated CHILD region passes its own box and cursor instead, and
-    // takes the height back so it can advance its own.
-    const markerX = options.x ?? startX;
-    const markerWidth = options.width ?? totalWidth;
-    const markerTablixName = options.tablixName ?? (item.name || null);
-    const markerY = options.top ?? y;
+    const markerX = startX;
+    const markerWidth = totalWidth;
+    const markerTablixName = item.name || null;
+    const markerY = y;
     const markerStyle = {
       ...style,
       fontSize,
@@ -827,11 +831,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       borders: { top: null, right: null, bottom: null, left: null },
     });
     doc.restore();
-    if (options.top === undefined) {
-      y += height;
-      addedHeight += height;
-    }
-    return height;
+    y += height;
+    addedHeight += height;
   };
 
   // Grid occupancy map: which cell (and its owning row) covers each grid position, so a cell can find
@@ -1409,19 +1410,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
         offset = end;
         if (offset >= dataRows.length) break;
         addPage();
+        // This loop advances whole child rows, so the new page STARTS a row rather than resuming one, and
+        // a page break on its own is never a continuation. Nothing is labelled here.
         cursor = addPage.bodyTop;
-        // The "continued from previous page" annotation belongs to whichever region actually crossed the
-        // boundary. Only the top-level tablix's continuation path used to emit it, so a report whose tables
-        // are all CHILD regions — every table inside one body-level canvas — carried no marker at all even
-        // with pagination.continuationMarkers enabled. Label the child's own fragment, over its own box.
-        if (showContinuationMarkers) {
-          cursor += drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, allRows[leadingHeaders.length + offset] || null, {
-            x: parentX + (nested.item.left || 0),
-            width: full.width,
-            top: cursor,
-            tablixName: nested.item.name || null,
-          });
-        }
       }
     } finally {
       nested.rows = allRows;
@@ -1733,7 +1724,9 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       // the group, exactly like a split row. Naming the row being continued keeps the fragment from being
       // closed with the table's synthesized bottom rule, which would land on the printable body boundary
       // and sit flush against the page footer's own rule.
-      startContinuationPage(blocking.sourceRow || null);
+      // The cut is inside the merged cell, not inside any row's own content: the fragment stays open (the
+      // row argument), but no row was split, so nothing is labelled.
+      startContinuationPage(blocking.sourceRow || null, { rowContinuation: false });
       const outstandingAfter = Math.max(...closing.map(spanOutstanding));
       if (guard > 0 && outstandingAfter >= outstandingBefore - 0.5) {
         throw new ServiceError(
@@ -1914,12 +1907,13 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     if (rowComplete) closeSpansEndingAt(rowIndex);
   };
 
-  const startContinuationPage = (continuedRow = null) => {
+  // `continuedRow` is the row whose box this break cuts — it drives the fragment's open bottom edge.
+  // `rowContinuation` is the narrower question the label asks: does that row's own CONTENT resume on the
+  // next page? The two differ for a merge that outgrew its rows, where the cut is inside the merged cell
+  // (so the fragment stays open) but no row's content is split, and nothing is labelled.
+  const startContinuationPage = (continuedRow = null, { rowContinuation = Boolean(continuedRow) } = {}) => {
     // End each open span at this page's content bottom, break, repeat the headers, then re-open the spans
     // just below the repeated headers so their value redraws at the top of the new page.
-    // An open row-span proves that the same logical group crosses this page boundary, even when no single
-    // textbox needed line-level splitting. Label that boundary just like a split physical row.
-    const logicalContinuationRow = continuedRow || openSpans[0]?.sourceRow || null;
     for (const span of openSpans) drawSpanSegment(span, y);
     // Close and flush the actual table fragment before breaking so the final data row retains its bottom
     // border. The continuation annotation belongs only to the next page, above its repeated table header.
@@ -1928,7 +1922,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     closeOuterBorderFragment(y, Boolean(continuedRow));
     addPage();
     y = addPage.bodyTop;
-    if (showContinuationMarkers && logicalContinuationRow) drawContinuationMarker(CONTINUATION_MARKERS.fromPrevious, logicalContinuationRow);
+    // The label appears for exactly one reason: this same row's content continues onto this page. An open
+    // row-span used to qualify too, which put the label on every page of every grouped tablix even though
+    // each of those pages simply started a fresh row — a group spanning the break is not a row that was
+    // cut, and is not annotated at all.
+    if (labels.row.enabled && rowContinuation && continuedRow) drawContinuationMarker(labels.row.text, continuedRow);
     fragmentStartY = y;
     const repeatedHeaders = headerMeasurements();
     headers.forEach((header, index) => drawRowContent(header, repeatedHeaders.heights[index]));
