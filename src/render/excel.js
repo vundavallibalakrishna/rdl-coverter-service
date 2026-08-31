@@ -1771,9 +1771,16 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       }
     }
   };
-  const rowProfiles = rows.map((row) => {
+  // A cell that spans several logical rows holds its child region in the whole BLOCK of rows it covers,
+  // not in the row it starts in. Seeding this row's profile from that child would make the starting row as
+  // tall as the entire child grid, which pushes every later row of the block below it — the same defect the
+  // PDF fixed by growing a merge's LAST spanned row. The declared span is enough here; the measured child
+  // boundaries are distributed across the block once the row heights are known.
+  const spannedRowCount = (rowIndex, rowSpan) => Math.max(1, Math.min(Math.max(1, rowSpan || 1), rows.length - rowIndex));
+  const rowProfiles = rows.map((row, rowIndex) => {
     const boundaries = new Set([0, point(row.height || DEFAULT_ROW_POINTS)]);
     for (const cell of row.cells || []) {
+      if (spannedRowCount(rowIndex, cell.rowSpan) > 1) continue;
       for (const nested of cell.nestedTablixes || []) addNestedYBoundaries(nested, 0, boundaries);
     }
     const maximum = Math.max(...boundaries);
@@ -1956,6 +1963,24 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     if (required > available) measuredHeights[endRow] += required - available;
   }
 
+  // Block coordinates for a cell that spans logical rows `rowIndex`..`rowIndex + span - 1`: the offsets of
+  // those rows' tops from the block's own top, and the row an offset inside the block falls in. A child
+  // region is placed in this space, so it flows down the block exactly as the fixed-layout renderer draws
+  // it inside the merged cell, instead of being confined to the first row.
+  const blockRowOffsets = (rowIndex, rowSpan) => {
+    const offsets = [0];
+    for (let index = 0; index < spannedRowCount(rowIndex, rowSpan); index += 1) {
+      offsets.push(point(offsets[offsets.length - 1] + measuredHeights[rowIndex + index]));
+    }
+    return offsets;
+  };
+  const blockPosition = (rowIndex, rowSpan, offset, offsets = blockRowOffsets(rowIndex, rowSpan)) => {
+    const value = point(offset);
+    let index = 0;
+    while (index < offsets.length - 2 && value >= offsets[index + 1]) index += 1;
+    return { rowIndex: rowIndex + index, offset: point(value - offsets[index]) };
+  };
+
   // Replace declared child-row boundaries with their measured CanGrow boundaries before mapping them to
   // physical Excel rows. Otherwise a nested row may grow in measurement but still be rendered into its old
   // one-line interval.
@@ -1987,12 +2012,35 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
       }
     });
   };
+  const rowBoundaries = rows.map((row) => new Set([0, point(row.height || DEFAULT_ROW_POINTS)]));
+  // Rows whose profile carries an edge of a child grid. A row that only INHERITS such an edge from a cell
+  // spanning into it is one of these too, which is why this is recorded while the edges are distributed
+  // rather than re-derived from each row's own cells.
+  const rowsWithChildEdges = new Set();
   rows.forEach((row, rowIndex) => {
-    const boundaries = new Set([0, point(row.height || DEFAULT_ROW_POINTS)]);
     for (const cell of row.cells || []) {
-      for (const nested of cell.nestedTablixes || []) addMeasuredNestedYBoundaries(nested, 0, boundaries, nestedTop(cell, nested));
+      if (!(cell.nestedTablixes || []).length) continue;
+      const span = spannedRowCount(rowIndex, cell.rowSpan);
+      if (span === 1) {
+        rowsWithChildEdges.add(rowIndex);
+        for (const nested of cell.nestedTablixes) addMeasuredNestedYBoundaries(nested, 0, rowBoundaries[rowIndex], nestedTop(cell, nested));
+        continue;
+      }
+      // The child's edges are offsets from the block top. Each one becomes a boundary of whichever row of
+      // the block contains it, so the grid splits the rows the child actually crosses and the rows below
+      // keep their own content instead of being displaced by the whole child grid.
+      const blockEdges = new Set();
+      for (const nested of cell.nestedTablixes) addMeasuredNestedYBoundaries(nested, 0, blockEdges, nestedTop(cell, nested));
+      const offsets = blockRowOffsets(rowIndex, span);
+      for (const edge of blockEdges) {
+        const position = blockPosition(rowIndex, span, edge, offsets);
+        rowsWithChildEdges.add(position.rowIndex);
+        rowBoundaries[position.rowIndex].add(position.offset);
+      }
     }
-    rowProfiles[rowIndex] = [...boundaries].sort((left, right) => left - right);
+  });
+  rows.forEach((unused, rowIndex) => {
+    rowProfiles[rowIndex] = [...rowBoundaries[rowIndex]].sort((left, right) => left - right);
   });
 
   // A logical parent row may contain a child grid with several physical rows. Split only that parent row
@@ -2001,8 +2049,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
   rowProfiles.forEach((profile, rowIndex) => {
     const declared = profile.at(-1) || 0;
     if (measuredHeights[rowIndex] > declared) {
-      const containsNestedGrid = rows[rowIndex].cells.some((cell) => (cell.nestedTablixes || []).length > 0);
-      if (containsNestedGrid) {
+      if (rowsWithChildEdges.has(rowIndex)) {
         // The child's final edge can coincide with the parent's declared row edge. When another cell grows
         // the parent, replacing that edge erases a boundary required to place the child; preserve it and
         // append the grown parent edge. This is the native-grid equivalent of a short child table followed
@@ -2067,6 +2114,37 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     rowTops.push(point(rowTopCursor));
     rowTopCursor += profile.at(-1) || 0;
   });
+  // Every physical Excel row keyed by its top, measured from the tablix's own top. A child region inside a
+  // merged cell spans logical rows, so its edges are resolved against this one flat list rather than
+  // against the profile of the row its cell happens to start in.
+  const physicalRowTops = [];
+  rowProfiles.forEach((profile, rowIndex) => {
+    for (let index = 0; index < profile.length - 1; index += 1) {
+      physicalRowTops.push({ top: point(rowTops[rowIndex] + profile[index]), row: physicalStarts[rowIndex] + index });
+    }
+  });
+  // The row an edge opens: the physical row whose top it coincides with, or — for a coordinate the grid
+  // does not address exactly — the row that contains it. Never the nearest row in either direction, which
+  // would let an unaddressed edge snap backwards past content that already occupies those rows.
+  const physicalRowAt = (absoluteTop) => {
+    const value = point(absoluteTop);
+    let containing = physicalRowTops[0];
+    for (const candidate of physicalRowTops) {
+      if (Math.abs(candidate.top - value) <= 1 / POINT_PRECISION) return candidate.row;
+      if (candidate.top <= value) containing = candidate;
+    }
+    return containing ? containing.row : startRow;
+  };
+  // The row an edge closes: the last physical row that starts above it. A region never ends above the row
+  // it starts in, so a zero-height edge keeps its own row.
+  const physicalRowBefore = (absoluteTop, absoluteBottom) => {
+    const value = point(absoluteBottom);
+    let last = physicalRowAt(absoluteTop);
+    for (const candidate of physicalRowTops) {
+      if (candidate.top < value - 1 / POINT_PRECISION && candidate.row > last) last = candidate.row;
+    }
+    return last;
+  };
   rowProfiles.forEach((profile, rowIndex) => {
     for (let index = 0; index < profile.length - 1; index += 1) {
       const height = profile[index + 1] - profile[index];
@@ -2094,14 +2172,10 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
     if (!Object.values(borders).some(Boolean)) return;
     const left = point(parentCellLeft + frameLeft);
     const top = point(baseTop + ownTop);
-    const profile = rowProfiles[parentRowIndex];
     const range = {
       ...gridRange(xGrid, left, extent.width),
-      startRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, top),
-      endRow: physicalStarts[parentRowIndex] + Math.max(
-        boundaryIndex(profile, top) + 1,
-        boundaryIndex(profile, point(top + extent.height)),
-      ) - 1,
+      startRow: physicalRowAt(rowTops[parentRowIndex] + top),
+      endRow: physicalRowBefore(rowTops[parentRowIndex] + top, rowTops[parentRowIndex] + top + extent.height),
     };
     notePainted(range);
     applyRegionBorder(worksheet, range, borders);
@@ -2170,11 +2244,10 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         const width = point(nestedOffsets[Math.min(nestedColumns.length, start + colSpan)] - nestedOffsets[start]);
         const top = rowOffsets[rowIndex];
         const bottom = rowOffsets[Math.min(nestedRows.length, rowIndex + rowSpan)];
-        const profile = rowProfiles[parentRowIndex];
         const range = {
           ...gridRange(xGrid, left, width),
-          startRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, top),
-          endRow: physicalStarts[parentRowIndex] + boundaryIndex(profile, bottom) - 1,
+          startRow: physicalRowAt(rowTops[parentRowIndex] + top),
+          endRow: physicalRowBefore(rowTops[parentRowIndex] + top, rowTops[parentRowIndex] + bottom),
         };
         notePainted(range);
         const borders = reportCellBorders(nestedOwners, owner, nested.item.style, shouldEnforceTablixBottom(nestedRows, nested.item), nestedRows, nested.item);

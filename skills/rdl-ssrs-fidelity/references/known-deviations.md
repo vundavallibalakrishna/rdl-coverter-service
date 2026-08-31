@@ -235,6 +235,26 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
   pagination. Regression: `test/nested-region-page-fill.test.js` (split + KeepTogether counterexamples for
   both nested tablix and bundled subreport, plus DOCX_EDITABLE and XLSX coverage). Ref: `page-and-flow.md`.
 
+- **XLSX confined a merged cell's child data region to the row it starts in.** A cell that spans several
+  tablix rows holds its child region in the whole BLOCK of rows it covers: the fixed layout draws the child
+  from the block's top and lets it flow past the first row's bottom, so the child's rows and the spanned
+  rows interleave. `renderReportTablix` (`excel.js`) gave every child edge to the profile of the row the
+  cell starts in, which made that row as tall as the entire child grid and pushed every later row of the
+  block below it — the worksheet form of the defect the fixed-layout renderer fixed by growing a merge's
+  LAST spanned row. In a report whose group band pairs a merged subreport column with three detail rows,
+  the second and third detail rows began under the whole child table instead of beside its second and third
+  rows, so none of the row rules lined up across the two columns. Fixed in the Excel grid layer: child edges
+  are now measured from the block top and distributed to whichever spanned row contains each one
+  (`blockRowOffsets`/`blockPosition`), a row that only INHERITS such an edge is recorded so the
+  grow-to-measured-height pass appends rather than overwrites it, and regions are placed against one flat
+  map of physical row tops (`physicalRowAt`/`physicalRowBefore`) instead of a single row's profile.
+  Format-specific by construction: PDF already laid the block out correctly and is the oracle here,
+  `DOCX_EDITABLE`/`DOCX_VISUAL` inherit that PDF geometry, and only XLSX rebuilds the grid itself.
+  Verified by comparing, for every pair of content blocks, the vertical relationship the canonical PDF gives
+  them against the one the workbook gives them: the reported report went from 26 mismatched pairs to 0, and
+  three unrelated corpus reports from 40, 36 and 37 to 0, 0 and 3. Regression:
+  `test/excel-merged-cell-child-grid.test.js`. Ref: `sizing-and-growth.md`.
+
 - **Continuation markers fired on every page break instead of on a real continuation.** The opt-in
   `pagination.continuationMarkers` label was emitted whenever a tablix crossed a page boundary with any
   row-span open, and unconditionally on every page break of a paginated child region. A grouped tablix
