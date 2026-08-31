@@ -1686,7 +1686,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     for (let guard = 0; ; guard += 1) {
       const closing = openSpans.filter((span) => span.endRowIndex <= rowIndex);
       if (closing.length === 0) return;
-      const shortfall = Math.max(0, ...closing.map((span) => spanOutstanding(span) - (y - span.segStartY)));
+      // The merge that still owes the most height decides both how far the group has to grow and, when it
+      // cannot finish here, which row the next page is continuing.
+      const blocking = closing.reduce((worst, span) => (
+        spanOutstanding(span) - (y - span.segStartY) > spanOutstanding(worst) - (y - worst.segStartY) ? span : worst
+      ), closing[0]);
+      const shortfall = Math.max(0, spanOutstanding(blocking) - (y - blocking.segStartY));
       if (shortfall <= 0.5) return;
       if (y + shortfall <= pageBottom + 0.5) {
         addedHeight += shortfall;
@@ -1698,7 +1703,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       const outstandingBefore = Math.max(...closing.map(spanOutstanding));
       addedHeight += filled;
       y = pageBottom;
-      startContinuationPage();
+      // The page ends because the merge ran out of room, not because the table ended: this is a cut inside
+      // the group, exactly like a split row. Naming the row being continued keeps the fragment from being
+      // closed with the table's synthesized bottom rule, which would land on the printable body boundary
+      // and sit flush against the page footer's own rule.
+      startContinuationPage(blocking.sourceRow || null);
       const outstandingAfter = Math.max(...closing.map(spanOutstanding));
       if (guard > 0 && outstandingAfter >= outstandingBefore - 0.5) {
         throw new ServiceError(
