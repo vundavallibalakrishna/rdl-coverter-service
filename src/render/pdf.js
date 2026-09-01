@@ -187,6 +187,7 @@ function traceTextbox(doc, config, item, x, y, context, details) {
         baseline: font.metrics ? absoluteTextTop + font.metrics.ascender : null,
         width: run.width,
         font,
+        hyperlink: run.hyperlink || null,
       };
       runX += run.width + justifyExtra * ((run.text.match(/ /g) || []).length);
       return tracedRun;
@@ -306,14 +307,26 @@ function renderedTextHeight(doc, text, width) {
   const lines = String(text ?? '').split('\n');
   // heightOfString ignores a single trailing empty line; mirror that so existing layouts are unchanged.
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
-  const lineHeight = doc.currentLineHeight(true);
-  return lines.reduce((total, line) => total
-    + (line.includes(' ') ? doc.heightOfString(line, { width, lineGap: 0 }) : lineHeight), 0);
+  // SSRS's default text line box uses the font ascender/descender, not the font's optional
+  // external leading. PDFKit only adds that leading when passed `true`; doing so made every
+  // implicit-line-height line taller than SSRS and accumulated into incorrect page breaks.
+  const lineHeight = doc.currentLineHeight();
+  return lines.reduce((total, line) => {
+    if (!line.includes(' ')) return total + lineHeight;
+    // PDFKit owns the word-wrap decision, but reports its own (gap-inclusive) height. Convert that
+    // height back to a wrapped-line count and charge the SSRS line box for every resulting line.
+    const pdfKitLineHeight = doc.currentLineHeight(true);
+    const measured = doc.heightOfString(line, { width, lineGap: 0 });
+    const lineCount = Math.max(1, Math.round(measured / pdfKitLineHeight));
+    return total + lineCount * lineHeight;
+  }, 0);
 }
 
 function lineHeightForStyle(doc, config, style, context) {
   applyFont(doc, config, style, context);
-  return styleSize(style?.lineHeight, context, 0) || doc.currentLineHeight(true);
+  // An RDL LineHeight is authoritative. Without one, match SSRS's default ascender/descender
+  // line box rather than PDFKit's opt-in external-leading variant.
+  return styleSize(style?.lineHeight, context, 0) || doc.currentLineHeight();
 }
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
@@ -381,7 +394,7 @@ function layoutStyledText(doc, config, item, context, text, width) {
     const whitespace = /^\s+$/.test(token);
     applyFont(doc, config, segment.style, context, token);
     const tokenWidth = doc.widthOfString(token);
-    const tokenHeight = styleSize(segment.style?.lineHeight, context, 0) || doc.currentLineHeight(true);
+    const tokenHeight = styleSize(segment.style?.lineHeight, context, 0) || doc.currentLineHeight();
     if (line.runs.length > 0 && line.width + tokenWidth > width) {
       finishLine(false);
       line = startLine(segment.style, segment.paragraphStyle, segment.paragraphIndex);
@@ -389,7 +402,7 @@ function layoutStyledText(doc, config, item, context, text, width) {
       if (whitespace) return;
     }
     if (whitespace || tokenWidth <= width) {
-      line.runs.push({ text: token, style: segment.style, width: tokenWidth });
+      line.runs.push({ text: token, style: segment.style, width: tokenWidth, hyperlink: segment.hyperlink });
       line.width += tokenWidth;
       line.contentHeight = Math.max(line.contentHeight, tokenHeight);
       line.height = line.before + line.contentHeight;
@@ -405,7 +418,7 @@ function layoutStyledText(doc, config, item, context, text, width) {
       const end = fittingGraphemeEnd(doc, parts, start, width);
       const fragment = parts.slice(start, end).join('');
       const fragmentWidth = doc.widthOfString(fragment);
-      line.runs.push({ text: fragment, style: segment.style, width: fragmentWidth });
+      line.runs.push({ text: fragment, style: segment.style, width: fragmentWidth, hyperlink: segment.hyperlink });
       line.width += fragmentWidth;
       line.contentHeight = Math.max(line.contentHeight, tokenHeight);
       line.height = line.before + line.contentHeight;
@@ -477,6 +490,26 @@ function drawStyledText(doc, config, item, context, layout, x, y, width) {
           .stroke()
           .restore();
       }
+      lineX += run.width + justifyExtra * ((run.text.match(/ /g) || []).length);
+    }
+    lineY += line.height;
+  }
+}
+
+function addStyledLinks(doc, item, context, layout, x, y, padding, localTextY, innerWidth) {
+  let lineY = localTextY;
+  for (const line of layout.lines) {
+    const textY = y + padding.top + lineY + line.before;
+    const alignment = String(styleValue(line.paragraphStyle?.textAlign ?? item.style?.textAlign, context, 'left')).toLowerCase();
+    let lineX = x + padding.left;
+    if (alignment === 'center') lineX += Math.max(0, (innerWidth - line.width) / 2);
+    else if (alignment === 'right') lineX += Math.max(0, innerWidth - line.width);
+    const spaces = line.runs.reduce((count, run) => count + ((run.text.match(/ /g) || []).length), 0);
+    const justifyExtra = alignment === 'justify' && !line.paragraphEnd && spaces > 0
+      ? Math.max(0, innerWidth - line.width) / spaces
+      : 0;
+    for (const run of line.runs) {
+      if (run.hyperlink && run.width > 0) doc.link(lineX, textY, run.width, line.contentHeight, run.hyperlink);
       lineX += run.width + justifyExtra * ((run.text.match(/ /g) || []).length);
     }
     lineY += line.height;
@@ -560,6 +593,9 @@ function drawTextbox(doc, config, item, x, y, context, override = {}) {
     });
   }
   doc.restore();
+  // PDF annotations use page coordinates, not the transformed text canvas. Rotated writing modes need a
+  // quadrilateral annotation transform and therefore remain unsupported for hyperlink actions.
+  if (styledLayout && !rotated) addStyledLinks(doc, item, context, styledLayout, x, y, { top: padTop, left: paddingLeft }, localTextY, innerWidth);
 }
 
 function drawImage(doc, model, item, x, y, context = {}) {
@@ -786,7 +822,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // flow paragraph that could repaginate the table. Recording is deliberately side-effect-free: all
     // metrics come from the font state already used to draw the marker.
     const textWidth = doc.widthOfString(label);
-    const contentHeight = doc.currentLineHeight(true);
+    const contentHeight = doc.currentLineHeight();
     const textY = markerY + Math.max(0, (height - fontSize) / 2 - 1);
     const font = {
       ...resolvedTraceFont(config, markerStyle, context, label),
@@ -2200,7 +2236,13 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       }
       return;
     }
-    if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart) {
+    // KeepTogether cannot move an intrinsically oversized *first* body row away from its leading headers.
+    // It is best-effort: begin that row in the available space and let the normal text-splitting path
+    // continue it, rather than leaving an orphaned repeatable header on the preceding page. Restrict this
+    // exception to the initial header/body boundary; ordinary KeepTogether pagination is unchanged.
+    const followsLeadingHeaders = leadingHeaders.length > 0 && rowIndexes.get(row) === leadingHeaders.length;
+    const keepOnFreshPage = !followsLeadingHeaders || measured <= freshPageCapacity + 0.5;
+    if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart && keepOnFreshPage) {
       movedForFit = true;
       startContinuationPage();
       measured = measureRow(row, remainingTexts);

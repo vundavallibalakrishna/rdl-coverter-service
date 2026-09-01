@@ -7,6 +7,7 @@ import { analyzeRdl, parseRdl } from '../src/rdl/parser.js';
 import { loadConfig } from '../src/config.js';
 import { textForItem } from '../src/render/common.js';
 import { renderEditableDocx } from '../src/render/docx.js';
+import { pdfFont } from '../src/render/fonts.js';
 import { measureTextboxHeight, renderPdf } from '../src/render/pdf.js';
 
 const fixture = await fs.readFile(new URL('./fixtures/basic.rdl', import.meta.url), 'utf8');
@@ -109,4 +110,34 @@ test('embedded TextRun newlines receive paragraph spacing once in canonical PDF 
   assert.match(xml, />1<\/w:t>/);
   assert.match(xml, />2<\/w:t>/);
   assert.match(xml, /<w:br\/>/);
+});
+
+test('implicit text line height excludes a font external leading gap, while explicit RDL LineHeight remains authoritative', () => {
+  const model = parseRdl(fixture);
+  const title = model.body.items.find((item) => item.name === 'TitleBox');
+  title.style = {
+    ...title.style,
+    fontFamily: 'Arial',
+    fontSize: 11,
+    lineHeight: null,
+    paddingTop: 0,
+    paddingBottom: 0,
+    paddingLeft: 0,
+    paddingRight: 0,
+  };
+  title.paragraphStyles = [{ ...title.style, spaceBefore: 0, spaceAfter: 0 }];
+  title.paragraphs = [[{ value: 'First line\nSecond line', markupType: 'None', style: title.style }]];
+  const context = { parameters: request.parameters, globals: {}, fields: {} };
+  const measurementDoc = new PDFDocument({ autoFirstPage: false });
+  measurementDoc.on('data', () => {});
+  measurementDoc.addPage();
+  measurementDoc.font(pdfFont(config, 'Arial', false, false, 'First line')).fontSize(11);
+  const ssrsDefaultLineHeight = measurementDoc.currentLineHeight();
+  const measured = measureTextboxHeight(measurementDoc, config, title, context, 'First line\nSecond line', title.width);
+  measurementDoc.end();
+
+  assert.ok(
+    Math.abs(measured - (2 * ssrsDefaultLineHeight)) < 0.01,
+    `expected two SSRS default line boxes (${2 * ssrsDefaultLineHeight}), got ${measured}`,
+  );
 });

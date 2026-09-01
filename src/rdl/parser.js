@@ -92,10 +92,13 @@ function textboxParagraphs(textbox, defaultFontFamily) {
     markupType: 'None',
     style: styleOf(textbox.Style, defaultFontFamily),
   }]];
-  return paragraphs.map((paragraph) => asArray(paragraph.TextRuns?.TextRun).map((run) => ({
+  return paragraphs.map((paragraph) => asArray(paragraph.TextRuns?.TextRun).map((run) => {
+    const action = asArray(run.ActionInfo?.Actions?.Action)[0];
+    return ({
     value: textValue(run.Value, ''),
     evaluationMode: evaluationModeOf(run.Value),
     markupType: textValue(run.MarkupType, 'None'),
+    hyperlink: action?.Hyperlink === undefined ? null : textValue(action.Hyperlink, null),
     // TextRun styles are independent within a textbox. Preserve their effective inherited style instead
     // of flattening every run to the first run's font. Renderers can then switch weight, size, family,
     // colour, and decoration at the exact run boundary declared by the RDL.
@@ -105,7 +108,8 @@ function textboxParagraphs(textbox, defaultFontFamily) {
       ...(run.Style || {}),
       Border: textbox.Style?.Border,
     }, defaultFontFamily),
-  })));
+    });
+  }));
 }
 
 function textboxParagraphStyles(textbox, defaultFontFamily) {
