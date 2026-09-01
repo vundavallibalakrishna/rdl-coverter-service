@@ -634,6 +634,46 @@ test('multiple RDL text runs remain native Excel rich text', async () => {
   assert.equal(cell.value.richText[1].font.color.argb, 'FFCC0000');
 });
 
+test('a non-textbox tablix cell does not invoke textbox hyperlink handling', async () => {
+  const nonTextbox = structuredClone(model);
+  const tablix = nonTextbox.body.items.find((item) => item.type === 'Tablix');
+  const cell = tablix.rows[0].cells[0];
+  const frameStyle = structuredClone(cell.items[0].style);
+  // Rectangle-only CellContents is valid RDL. It has no paragraphs or ActionInfo, so it must retain the
+  // ordinary blank cell path instead of attempting rich-text/hyperlink resolution on an absent textbox.
+  cell.items = [{
+    type: 'Rectangle', name: 'HeaderFrame', top: 0, left: 0, width: 0, height: 0,
+    zIndex: 0, hidden: 'false', style: frameStyle, items: [],
+  }];
+
+  const result = await renderExcel(nonTextbox, request, config, null);
+  assert.equal(result.buffer.subarray(0, 2).toString(), 'PK');
+  const ws = await load(result.buffer);
+  assert.ok(ws, 'the workbook must be loadable when a tablix cell has no textbox');
+});
+
+test('a bordered cell does not donate its outer top and bottom borders to a borderless adjacent cell', async () => {
+  const adjacent = structuredClone(model);
+  const tablix = adjacent.body.items.find((item) => item.type === 'Tablix');
+  const noBorder = { style: 'None', color: '#000000', width: 1 };
+  const solid = { style: 'Solid', color: '#000000', width: 1 };
+  const withAllSides = (style, border) => ({
+    ...style,
+    border,
+    borders: { top: border, right: border, bottom: border, left: border },
+  });
+  tablix.rows[0].cells[0].items[0].style = withAllSides(tablix.rows[0].cells[0].items[0].style, noBorder);
+  tablix.rows[0].cells[1].items[0].style = withAllSides(tablix.rows[0].cells[1].items[0].style, solid);
+
+  const ws = await load((await renderExcel(adjacent, request, config, null)).buffer);
+  const borderless = findCell(ws, 'Name');
+  const bordered = findCell(ws, 'Amount');
+  assert.equal(borderless.border?.top, undefined, 'the adjacent cell top edge is not a shared edge');
+  assert.equal(borderless.border?.left, undefined, 'the borderless cell keeps its own outer edge empty');
+  assert.equal(borderless.border?.right, undefined, 'the borderless cell must not inherit its neighbour\'s edge');
+  for (const side of ['top', 'right', 'bottom', 'left']) assert.equal(bordered.border?.[side]?.style, 'thin');
+});
+
 test('rectangle-wrapped tablix text keeps inner run and paragraph formatting while the grid keeps its border', async () => {
   const wrapped = parseRdl(rectangleWrappedSymbolRdl());
   const wrappedRequest = { outputFileName: 'Movement', parameters: {}, datasets: { D: [{ Movement: '⬍' }] } };
