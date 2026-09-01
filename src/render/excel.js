@@ -906,6 +906,9 @@ function richTextValue(textbox, context, requestedText) {
 // action when every visible run in the cell resolves to the same target; mixed run-level actions retain
 // their text and formatting rather than assigning a misleading cell-wide link.
 function excelHyperlinkValue(textbox, context, requestedText) {
+  // A valid tablix cell can be owned by a Rectangle, Line, Image, or a nested data region rather than a
+  // Textbox. Only textboxes carry paragraphs/actions; non-text owners retain the ordinary cell value.
+  if (!textbox?.paragraphs) return null;
   const paragraphs = styledTextForItem(textbox, context);
   if (!paragraphs) return null;
   const runs = paragraphs.flatMap((paragraph) => paragraph.runs).filter((run) => String(run.text ?? '') !== '');
@@ -1528,22 +1531,13 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure, r
   const below = endRow + 1 < gridOwners.length ? gridOwners[endRow + 1][columnIndex] : null;
   const left = columnIndex > 0 ? gridOwners[rowIndex][columnIndex - 1] : null;
   const right = columnIndex + span < gridOwners[rowIndex].length ? gridOwners[rowIndex][columnIndex + span] : null;
-  const sameRowEdge = (side) => [
-    ...gridOwners[rowIndex].slice(columnIndex, columnIndex + span),
-    gridOwners[rowIndex][columnIndex - 1],
-    gridOwners[rowIndex][columnIndex + span],
-  ]
-    .map((candidate) => (candidate && candidate !== owner ? resolvedOwnerBorder(candidate, side) : null))
-    .find(Boolean);
   const bottom = resolvedOwnerBorder(owner, 'bottom')
     || (below && resolvedOwnerBorder(below, 'top'))
-    || sameRowEdge('bottom')
     || (enforceBottomClosure && endRow === gridOwners.length - 1
       ? excelBorderSide(enforcedBottomBorder(itemStyle, rows, tablix), owner.context)
       : undefined);
   const top = above === owner ? undefined : resolvedOwnerBorder(owner, 'top')
     || (above && resolvedOwnerBorder(above, 'bottom'))
-    || sameRowEdge('top')
     || matchingChangedGroupOwnerRowBoundary(
       owner,
       above,
@@ -1557,8 +1551,11 @@ function reportCellBorders(gridOwners, owner, itemStyle, enforceBottomClosure, r
   return {
     top,
     bottom,
-    left: resolvedOwnerBorder(owner, 'left') || (left && resolvedOwnerBorder(left, 'right')) || undefined,
-    right: resolvedOwnerBorder(owner, 'right') || (right && resolvedOwnerBorder(right, 'left')) || undefined,
+    // Excel draws a shared vertical edge from the cell that declares it. Copying a neighbour's edge onto
+    // this owner makes a deliberately borderless cell appear framed, unlike SSRS (notably beside a
+    // Rectangle-wrapped rating box). Keep border ownership with the declaring RDL item.
+    left: resolvedOwnerBorder(owner, 'left') || undefined,
+    right: resolvedOwnerBorder(owner, 'right') || undefined,
   };
 }
 
