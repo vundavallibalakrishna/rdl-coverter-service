@@ -214,6 +214,33 @@ test('3: the row is split where its overflowing cell overflows, not pushed whole
   assert.deepEqual(rowLabelPages(rendered), [2]);
 });
 
+// ------------------------------------------------------------------ 3b. use a remainder before a fresh page
+
+test('3b: a growable row that fits a fresh page uses the current remainder and resumes below the repeated header', async () => {
+  const rdl = report({ keepTogether: true });
+  const rows = [
+    ...Array.from({ length: 4 }, (unused, index) => dataRow({ key: `LEAD_${index + 1}` })),
+    dataRow({ key: 'R2', tall: 8, tallColumn: 4, prefix: 'REMAINDER' }),
+    dataRow({ key: 'R3' }),
+  ];
+  const rendered = await render(rdl, rows);
+  const firstLinePage = pagesWith(rendered, 'REMAINDER_001')[0];
+  const lastLinePage = pagesWith(rendered, 'REMAINDER_008')[0];
+
+  assert.equal(firstLinePage, 1, 'the row starts in the otherwise unused remainder');
+  assert.equal(lastLinePage, 2, 'the row continues on the following page even though it fits a fresh page');
+  assert.deepEqual(rowLabelPages(rendered), [2], 'only the split row receives a continuation label');
+
+  const secondPageItems = items(rendered).filter((item) => item.page === 2);
+  const repeatedHeader = secondPageItems.find((item) => item.kind === 'tablixCell' && item.text.includes('HEAD_A'));
+  const label = secondPageItems.find((item) => item.traceRole === 'continuationMarker');
+  const tail = secondPageItems.find((item) => item.kind === 'tablixCell' && item.text.includes('REMAINDER_008'));
+  assert.ok(repeatedHeader && label && tail, 'the continued page contains its repeated header, label and tail');
+  assert.ok(repeatedHeader.y < label.y, 'the repeated table header precedes the continuation label');
+  assert.ok(label.y + label.height <= tail.y + 0.5, 'the continuation label precedes the remaining row content');
+  assert.equal(pagesWith(rendered, 'A_R3')[0], 2, 'the following whole row uses the same continuation page');
+});
+
 // ------------------------------------------------------------------ 4. a row taller than a whole page
 
 test('4: a row spanning three pages is labelled on every continuation page, under repeated headers', async () => {

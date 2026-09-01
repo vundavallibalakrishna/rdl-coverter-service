@@ -790,7 +790,7 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   };
 
   // The row label for a row whose content resumes on the page just started. It occupies a reserved band
-  // in the tablix's own box, above the repeated column header, and advances the cursor by exactly the band
+  // in the tablix's own box below the repeated column header, and advances the cursor by exactly the band
   // it painted — so no cell moves and nothing is clipped.
   const drawContinuationMarker = (label, row) => {
     const { style, context, fontSize, height } = markerDetails(row);
@@ -1948,24 +1948,25 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // next page? The two differ for a merge that outgrew its rows, where the cut is inside the merged cell
   // (so the fragment stays open) but no row's content is split, and nothing is labelled.
   const startContinuationPage = (continuedRow = null, { rowContinuation = Boolean(continuedRow) } = {}) => {
-    // End each open span at this page's content bottom, break, repeat the headers, then re-open the spans
-    // just below the repeated headers so their value redraws at the top of the new page.
+    // End each open span at this page's content bottom, break, repeat the headers and continuation marker,
+    // then re-open the spans below that page-start block so their value redraws in the right place.
     for (const span of openSpans) drawSpanSegment(span, y);
     // Close and flush the actual table fragment before breaking so the final data row retains its bottom
-    // border. The continuation annotation belongs only to the next page, above its repeated table header.
+    // border. The continuation annotation belongs only to the next page, below its repeated table header.
     // A caller that names the row it is continuing is cutting inside that row, so this fragment ends
     // mid-row and has no row edge to close.
     closeOuterBorderFragment(y, Boolean(continuedRow));
     addPage();
     y = addPage.bodyTop;
-    // The label appears for exactly one reason: this same row's content continues onto this page. An open
-    // row-span used to qualify too, which put the label on every page of every grouped tablix even though
-    // each of those pages simply started a fresh row — a group spanning the break is not a row that was
-    // cut, and is not annotated at all.
-    if (labels.row.enabled && rowContinuation && continuedRow) drawContinuationMarker(labels.row.text, continuedRow);
     fragmentStartY = y;
     const repeatedHeaders = headerMeasurements();
     headers.forEach((header, index) => drawRowContent(header, repeatedHeaders.heights[index]));
+    // The label appears for exactly one reason: this same row's content continues onto this page. An open
+    // row-span used to qualify too, which put the label on every page of every grouped tablix even though
+    // each of those pages simply started a fresh row — a group spanning the break is not a row that was
+    // cut, and is not annotated at all. It is drawn after the repeated header, matching the page-start
+    // order of a continued tablix row.
+    if (labels.row.enabled && rowContinuation && continuedRow) drawContinuationMarker(labels.row.text, continuedRow);
     // Continue overflowing values from where they were clipped; repeat values that fully fit.
     for (const span of openSpans) {
       if (span.pendingTail) { span.text = span.pendingTail; span.pendingTail = null; }
@@ -2121,10 +2122,17 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     let measured = measureRow(row, remainingTexts);
     const repeatedHeaderHeight = headerMeasurements().total;
     const freshPageCapacity = pageBottom - addPage.bodyTop - repeatedHeaderHeight;
-    // KeepTogether is best-effort: when a physical data row does not fit in the current remainder, move it
-    // before splitting any cell text. If an oversized row is already at the fresh-page content boundary, it
-    // must split there; attempting another break would create an endless blank-page loop. Repeating headers
-    // use their existing pagination path and must not recursively request a continuation page themselves.
+    // A growable, unmerged data row can consume a usable remainder before it continues. This is distinct
+    // from a row-span or nested region, whose pagination has its own ownership rules below. The predicate is
+    // deliberately structural: it never depends on a report, item, row number, or observed height.
+    const canSplitIntoRemainder = !row.isHeader
+      && !row.keepSpanTogether
+      && !row.cells.some((cell) => (cell.rowSpan || 1) > 1)
+      && row.cells.some((cell) => Boolean(cellTextbox(cell) && cellText(cell)));
+    // KeepTogether remains best-effort. A row that cannot be split still moves whole to a fresh page; an
+    // otherwise splittable text row uses the unused body area and resumes after the next page's header.
+    // Repeating headers use their existing pagination path and must not recursively request a continuation
+    // page themselves.
     const atFreshContentStart = y <= addPage.bodyTop + repeatedHeaderHeight + 0.5;
     // SSRS moves a non-fitting row to the next page at most ONCE. `atFreshContentStart` is a snapshot of
     // this row's original cursor, so once any branch below has broken the page it no longer reports where
@@ -2242,7 +2250,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // exception to the initial header/body boundary; ordinary KeepTogether pagination is unchanged.
     const followsLeadingHeaders = leadingHeaders.length > 0 && rowIndexes.get(row) === leadingHeaders.length;
     const keepOnFreshPage = !followsLeadingHeaders || measured <= freshPageCapacity + 0.5;
-    if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart && keepOnFreshPage) {
+    if (!row.isHeader && row.keepTogether && y + measured > pageBottom && !atFreshContentStart
+      && keepOnFreshPage && !canSplitIntoRemainder) {
       movedForFit = true;
       startContinuationPage();
       measured = measureRow(row, remainingTexts);
@@ -2278,16 +2287,11 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     measured = measureRow(row, remainingTexts);
     // A merge that closes in this row is part of this row's height (see closingMergeRequirement).
     let target = Math.max(measured, closingMergeRequirement(row));
-    // A tablix row is SSRS's indivisible pagination unit: a row that does not fit what is left of the
-    // page moves whole to the next one, and only a row that cannot fit a page at all is split. Splitting a
-    // row that would have fitted a fresh page both breaks a value SSRS keeps on one page and ends the
-    // fragment mid-row — where, by design, no closing rule is drawn — so the table stops flush on the
-    // printable body boundary, hard against the page footer's own rule, instead of showing the gap its
-    // last complete row leaves. This also covers a row with no continuation-able text (the trailing row of
-    // a row-span group, whose columns are covered by the merged header), which the split loop below cannot
-    // advance: it would be left undrawn with its span still open, and the residual would later paint over
-    // the next group.
-    if (y + target > pageBottom && !atFreshContentStart && !movedForFit && target <= freshPageCapacity) {
+    // Use an otherwise idle body remainder for a splittable text row. Atomic constructs still move whole:
+    // this includes row spans and rows with no continuation-capable text, for which the split loop cannot
+    // make progress safely.
+    if (y + target > pageBottom && !atFreshContentStart && !movedForFit && target <= freshPageCapacity
+      && !canSplitIntoRemainder) {
       movedForFit = true;
       startContinuationPage();
       measured = measureRow(row, remainingTexts);
