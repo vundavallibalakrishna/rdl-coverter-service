@@ -188,6 +188,11 @@ function itemDeclaresVisibleBorder(item) {
   // A nested tablix owns an independent grid. Its outer border must never be promoted into a full-width
   // closing edge for the containing tablix fragment.
   if (item.type === 'Tablix') return false;
+  // A Line is a rule drawn at its own coordinates inside the cell, and RDL gives it no stroke property —
+  // its rule IS its Style.Border. Reading that as a declared cell edge makes any borderless form/layout
+  // tablix that holds separator lines look like a bordered grid, which is then closed with a synthesized
+  // full-width rule the report never declared.
+  if (item.type === 'Line') return false;
   // Only direct cell content can express a cell/grid edge needed to close a containing fragment; nested
   // descendants paint their own local coordinates and cannot imply a parent-table border.
   return styleDeclaresVisibleBorder(item.style);
