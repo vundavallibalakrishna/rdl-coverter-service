@@ -902,6 +902,19 @@ function richTextValue(textbox, context, requestedText) {
   return richText.length > 1 ? { richText } : null;
 }
 
+// ExcelJS represents a hyperlink on the complete cell, not an individual rich-text run. Preserve the RDL
+// action when every visible run in the cell resolves to the same target; mixed run-level actions retain
+// their text and formatting rather than assigning a misleading cell-wide link.
+function excelHyperlinkValue(textbox, context, requestedText) {
+  const paragraphs = styledTextForItem(textbox, context);
+  if (!paragraphs) return null;
+  const runs = paragraphs.flatMap((paragraph) => paragraph.runs).filter((run) => String(run.text ?? '') !== '');
+  const targets = [...new Set(runs.map((run) => run.hyperlink).filter(Boolean))];
+  if (runs.length === 0 || targets.length !== 1 || runs.some((run) => run.hyperlink !== targets[0])) return null;
+  const text = paragraphs.map((paragraph) => paragraph.runs.map((run) => run.text).join('')).join('\n');
+  return text === String(requestedText ?? '') ? { text, hyperlink: targets[0] } : null;
+}
+
 function applyFillFontAlignment(cell, style, context) {
   const fill = hex(styleColor(style?.backgroundColor, context, null));
   if (fill) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${fill}` } };
@@ -1353,7 +1366,7 @@ async function renderFreeformItem({
     mergeSafe(worksheet, range, merges, item.name);
     const text = cellString(textForItem(item, context));
     const target = worksheet.getCell(range.startRow, range.startCol);
-    target.value = richTextValue(item, context, text) || text;
+    target.value = richTextValue(item, context, text) || excelHyperlinkValue(item, context, text) || text;
     applyFillFontAlignment(target, item.style || {}, context);
     // Measure against the width the worksheet actually gives the cell, not the declared RDL width: the
     // merged range is snapped to the section's shared column grid, so the two differ whenever another
@@ -2304,7 +2317,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
           const target = worksheet.getCell(range.startRow, range.startCol);
           const { value, numFmt } = excelCellValue(cell, owner.context);
           const display = cellText(cell);
-          target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
+          target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || excelHyperlinkValue(owner.textbox, owner.context, display) || value) : value;
           if (numFmt) target.numFmt = numFmt;
           applyFillFontAlignment(target, owner.style || {}, owner.context);
           target.border = borders;
@@ -2356,7 +2369,7 @@ function renderReportTablix({ worksheet, model, item, request, globals, config, 
         target = worksheet.getCell(excelRow, range.startCol);
         const { value, numFmt } = excelCellValue(owner.cell, owner.context);
         const display = cellText(owner.cell);
-        target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || value) : value;
+        target.value = typeof value === 'string' ? (richTextValue(owner.textbox, owner.context, display) || excelHyperlinkValue(owner.textbox, owner.context, display) || value) : value;
         if (numFmt) target.numFmt = numFmt;
         applyFillFontAlignment(target, owner.style || {}, owner.context);
       }

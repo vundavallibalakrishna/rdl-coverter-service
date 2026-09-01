@@ -6,6 +6,7 @@ import {
   BorderStyle,
   BuilderElement,
   Document,
+  ExternalHyperlink,
   Footer,
   HeightRule,
   HorizontalPositionRelativeFrom,
@@ -610,7 +611,9 @@ function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null,
             },
           }));
         }
-        runs.push(textRun);
+        runs.push(run.hyperlink
+          ? new ExternalHyperlink({ link: run.hyperlink, children: [textRun] })
+          : textRun);
       });
     });
     return new Paragraph({

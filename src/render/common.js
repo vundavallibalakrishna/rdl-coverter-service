@@ -52,6 +52,16 @@ export function isHidden(expression, context) {
   return result === true || String(result).toLowerCase() === 'true';
 }
 
+// RDL Hyperlink actions become external document links. Do not emit executable or local-file schemes into
+// an output artifact; those are not browser-style report navigation and are unsafe to hand to a viewer.
+export function resolveHyperlink(value, context) {
+  if (value === null || value === undefined || value === '') return null;
+  let resolved;
+  try { resolved = evaluateExpression(value, context); } catch { return null; }
+  const href = String(resolved ?? '').trim();
+  return /^(https?:\/\/|mailto:)/i.test(href) ? href : null;
+}
+
 // Resolves a size that may be a literal number, a unit string ("1pt"), or a conditional expression
 // (=IIF(...,"1pt","0pt")) into points. Border widths and similar sizes can be data-dependent, so they are
 // kept as expressions by the parser and resolved here per row/scope.
@@ -77,7 +87,8 @@ export function styledTextForItem(item, context) {
         ? definition.value
         : evaluateExpression(definition.value, context);
       const runStyle = definition.style || item.style;
-      if (value === null || value === undefined) return { text: '', style: runStyle };
+      const hyperlink = resolveHyperlink(definition.hyperlink, context);
+      if (value === null || value === undefined) return { text: '', style: runStyle, hyperlink };
       const format = styleValue(runStyle?.format ?? item.style?.format, context, null);
       // A Date with no explicit Format must resolve through the .NET-style formatter (its default date
       // pattern), not JS String(Date) — the latter emits the verbose "Tue Aug 18 2026 14:27:38 GMT+0530
@@ -90,6 +101,7 @@ export function styledTextForItem(item, context) {
       return {
         text: normalizeDisplayText(renderMarkupText(formatted, definition.markupType)),
         style: runStyle,
+        hyperlink,
       };
     }),
   }));
@@ -109,7 +121,7 @@ export function styledSegmentsForText(item, context, requestedText) {
   for (const [paragraphIndex, paragraph] of paragraphs.entries()) {
     for (const run of paragraph.runs) {
       const text = String(run.text ?? '');
-      segments.push({ text, style: run.style || item.style, paragraphStyle: paragraph.style || item.style, paragraphIndex });
+      segments.push({ text, style: run.style || item.style, hyperlink: run.hyperlink || null, paragraphStyle: paragraph.style || item.style, paragraphIndex });
       fullText += text;
     }
     if (paragraphIndex < paragraphs.length - 1) {

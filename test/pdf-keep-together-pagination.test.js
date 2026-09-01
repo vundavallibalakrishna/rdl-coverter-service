@@ -149,6 +149,19 @@ test('splits an oversized keep-together row when it already starts on a fresh pa
   }
 });
 
+test('starts an oversized keep-together row below its leading repeated header instead of orphaning that header', async (context) => {
+  const scenario = keepTogetherScenario(80, true);
+  const rendered = await renderAndExtract(context, scenario, 'oversized-row-leading-header');
+  const firstPage = await execFileAsync('pdftotext', ['-f', '1', '-l', '1', '-layout', rendered.pdfPath, '-']);
+
+  assert.match(firstPage.stdout, /LEADING_PAGE_CONTENT/);
+  assert.match(firstPage.stdout, /Group/);
+  assert.match(firstPage.stdout, /KEEP_ROW_START/,
+    'the first physical row must begin under its header, even though it will continue on later pages');
+  assert.equal((rendered.text.match(/KEEP_ROW_START/g) || []).length, 1);
+  assert.equal((rendered.text.match(/KEEP_ROW_END/g) || []).length, 1);
+});
+
 test('fills the current page through a vertical merge unless its member declares KeepTogether', async (context) => {
   const splittable = verticalMergeScenario(false);
   const tablix = splittable.model.body.items.find((item) => item.type === 'Tablix');
