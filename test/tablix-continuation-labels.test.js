@@ -236,8 +236,10 @@ test('3b: a growable row that fits a fresh page uses the current remainder and r
   const label = secondPageItems.find((item) => item.traceRole === 'continuationMarker');
   const tail = secondPageItems.find((item) => item.kind === 'tablixCell' && item.text.includes('REMAINDER_008'));
   assert.ok(repeatedHeader && label && tail, 'the continued page contains its repeated header, label and tail');
-  assert.ok(repeatedHeader.y < label.y, 'the repeated table header precedes the continuation label');
-  assert.ok(label.y + label.height <= tail.y + 0.5, 'the continuation label precedes the remaining row content');
+  assert.ok(label.y + label.height <= repeatedHeader.y + 0.5,
+    'the continuation label is directly below the page header and precedes the repeated table header');
+  assert.ok(repeatedHeader.y + repeatedHeader.height <= tail.y + 0.5,
+    'the repeated table header still precedes the remaining row content');
   assert.equal(pagesWith(rendered, 'A_R3')[0], 2, 'the following whole row uses the same continuation page');
 });
 

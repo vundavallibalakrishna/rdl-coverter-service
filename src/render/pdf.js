@@ -790,8 +790,8 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   };
 
   // The row label for a row whose content resumes on the page just started. It occupies a reserved band
-  // in the tablix's own box below the repeated column header, and advances the cursor by exactly the band
-  // it painted — so no cell moves and nothing is clipped.
+  // in the tablix's own box immediately below the page header and before any repeated table header. It
+  // advances the cursor by exactly the band it painted — so no cell moves and nothing is clipped.
   const drawContinuationMarker = (label, row) => {
     const { style, context, fontSize, height } = markerDetails(row);
     const markerX = startX;
@@ -1948,25 +1948,25 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
   // next page? The two differ for a merge that outgrew its rows, where the cut is inside the merged cell
   // (so the fragment stays open) but no row's content is split, and nothing is labelled.
   const startContinuationPage = (continuedRow = null, { rowContinuation = Boolean(continuedRow) } = {}) => {
-    // End each open span at this page's content bottom, break, repeat the headers and continuation marker,
-    // then re-open the spans below that page-start block so their value redraws in the right place.
+    // End each open span at this page's content bottom, break, draw the continuation marker and repeat
+    // headers, then re-open spans below that page-start block so their value redraws in the right place.
     for (const span of openSpans) drawSpanSegment(span, y);
     // Close and flush the actual table fragment before breaking so the final data row retains its bottom
-    // border. The continuation annotation belongs only to the next page, below its repeated table header.
+    // border. The continuation annotation belongs only to the next page, immediately below the page header.
     // A caller that names the row it is continuing is cutting inside that row, so this fragment ends
     // mid-row and has no row edge to close.
     closeOuterBorderFragment(y, Boolean(continuedRow));
     addPage();
     y = addPage.bodyTop;
-    fragmentStartY = y;
-    const repeatedHeaders = headerMeasurements();
-    headers.forEach((header, index) => drawRowContent(header, repeatedHeaders.heights[index]));
     // The label appears for exactly one reason: this same row's content continues onto this page. An open
     // row-span used to qualify too, which put the label on every page of every grouped tablix even though
     // each of those pages simply started a fresh row — a group spanning the break is not a row that was
-    // cut, and is not annotated at all. It is drawn after the repeated header, matching the page-start
-    // order of a continued tablix row.
+    // cut, and is not annotated at all. It is drawn immediately after the page header, before a repeated
+    // tablix header, so the page's continuation state is visible before the table fragment begins.
     if (labels.row.enabled && rowContinuation && continuedRow) drawContinuationMarker(labels.row.text, continuedRow);
+    fragmentStartY = y;
+    const repeatedHeaders = headerMeasurements();
+    headers.forEach((header, index) => drawRowContent(header, repeatedHeaders.heights[index]));
     // Continue overflowing values from where they were clipped; repeat values that fully fit.
     for (const span of openSpans) {
       if (span.pendingTail) { span.text = span.pendingTail; span.pendingTail = null; }
