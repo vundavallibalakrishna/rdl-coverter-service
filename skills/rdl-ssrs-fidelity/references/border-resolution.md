@@ -46,6 +46,17 @@ defect.
 - Repeated tablix headers and split rows always close their fragment with the correct bottom/edge borders;
   a merged (row-span) cell redraws its shared borders per fragment.
 
+## What counts as a declared edge
+
+- A cell's grid edge is declared by the cell, or by the **textbox** that fills it — the common RDL idiom of
+  a `Border=None` tablix whose every cell textbox carries the rule.
+- An item that draws its own box at its own coordinates inside the cell does **not** declare a cell edge: a
+  `Line` (whose rule is expressed through `Style.Border`, RDL giving it no stroke property), a nested
+  `Tablix` (which strokes its own outer border), a `Rectangle` frame. Reading any of those as grid intent
+  makes a borderless form/layout tablix look like a bordered grid.
+- A synthesized fragment closure **reuses** a border the report declares. Inventing one where the report
+  declares none draws a decoration SSRS never draws.
+
 ## Renderer parity
 
 Border resolution is a shared semantic. Fix it in the tablix/border layer and reflect it in PDF strokes,

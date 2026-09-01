@@ -235,6 +235,25 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
   pagination. Regression: `test/nested-region-page-fill.test.js` (split + KeepTogether counterexamples for
   both nested tablix and bundled subreport, plus DOCX_EDITABLE and XLSX coverage). Ref: `page-and-flow.md`.
 
+- **A separator Line in a cell made a borderless tablix draw a synthesized closing rule.** A data tablix
+  whose cells declare grid edges is closed with a rule where it ends, so a bordered grid is never left open.
+  The test for that intent read the cells' direct content and accepted any item whose `Style` declared a
+  border — and a `Line` report item always does: RDL gives a line no stroke property, so its rule IS its
+  `Style.Border`. A borderless form/layout tablix that merely held separator lines therefore read as a
+  bordered grid, and, finding no border anywhere to reuse, `enforcedBottomBorder` fell back to a
+  synthesized solid black rule across the full tablix width. In the reported report that put a full-width
+  line after the last field of every block — and where a block happened to end low on the page, a few points
+  above the page footer, where it read as a footer border the report never declares (12 such rules across 42
+  pages). Fixed in `itemDeclaresVisibleBorder` (`common.js`): a `Line` never expresses a cell edge, the
+  same reason a nested `Tablix`'s outer border is already refused. Shared layer — `shouldEnforceTablixBottom`
+  is consumed by the PDF closure and by the XLSX cell-border resolver, and `DOCX_EDITABLE`/`DOCX_VISUAL`
+  inherit the PDF geometry. Corpus check: of six PDF payloads only that report's family changed (12
+  synthesized rules → 0); every other report kept all of its closures, and each of those reuses a border its
+  RDL actually declares. Regression: `test/tablix-closure-own-box-items.test.js`. **Residual:** when
+  `shouldEnforceTablixBottom` is satisfied only by a cell span and the report declares no border anywhere,
+  `enforcedBottomBorder` still invents `Solid #000000 1pt`. No corpus report reaches that path any more,
+  but it is the one remaining way this engine can draw a rule SSRS would not. Ref: `border-resolution.md`.
+
 - **XLSX confined a merged cell's child data region to the row it starts in.** A cell that spans several
   tablix rows holds its child region in the whole BLOCK of rows it covers: the fixed layout draws the child
   from the block's top and lets it flow past the first row's bottom, so the child's rows and the spanned
