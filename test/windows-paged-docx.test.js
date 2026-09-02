@@ -873,6 +873,44 @@ test('page-locked DOCX coalesces a trace-rounded tablix fragment closure with it
   assert.match(documentXml, /<w:bottom w:val="single" w:color="000000" w:sz="8"\/>/);
 });
 
+test('page-locked DOCX keeps a tablix closing border on the body/footer boundary', async () => {
+  const boundaryModel = structuredClone(baseModel);
+  const tablix = boundaryModel.body.items.find((item) => item.type === 'Tablix');
+  const boundaryRequest = {
+    ...request,
+    outputFileName: 'body-footer-tablix-closure',
+    datasets: {
+      Sales: Array.from({ length: 100 }, (_, index) => ({ Name: `Boundary row ${index + 1}`, Amount: index + 1 })),
+    },
+  };
+  const initial = await renderPdf(boundaryModel, boundaryRequest, config, { captureLayoutTrace: true });
+  const initialClosure = initial.layoutTrace.pages[0].items.find((item) => (
+    item.traceRole === 'resolvedTablixFragmentBorder'
+    && item.tablixName === tablix.name
+    && item.fragmentSide === 'bottom'
+  ));
+  assert.ok(initialClosure, 'the fixture must draw a first-page tablix closure');
+  tablix.top += initial.layoutTrace.pages[0].bodyBottom - initialClosure.y;
+  const canonical = await renderPdf(boundaryModel, boundaryRequest, config, { captureLayoutTrace: true });
+  const closure = canonical.layoutTrace.pages[0].items.find((item) => (
+    item.traceRole === 'resolvedTablixFragmentBorder'
+    && item.tablixName === tablix.name
+    && item.fragmentSide === 'bottom'
+  ));
+  assert.ok(closure);
+  assert.equal(canonical.pageCount > 1, true, 'the growable detail row must split across pages');
+  assert.equal(closure.region, 'footer', 'the physical boundary is classified with the footer region');
+  assert.ok(Math.abs(closure.y - canonical.layoutTrace.pages[0].bodyBottom) <= 0.5);
+
+  const rendered = await renderEditableDocx(boundaryModel, boundaryRequest, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+  const bodyTable = [...documentXml.matchAll(/<w:tbl>([\s\S]*?)<\/w:tbl>/g)][0]?.[1] || '';
+  const finalRow = [...bodyTable.matchAll(/<w:tr>([\s\S]*?)<\/w:tr>/g)].at(-1)?.[1] || '';
+  assert.match(finalRow, /<w:bottom w:val="single" w:color="000000" w:sz="8"\/>/,
+    'the canonical closure must belong to the last native body-table row, not the footer story');
+});
+
 test('page-locked DOCX still rejects a line that penetrates editable content', async () => {
   const crossingFixture = Buffer.from(fixture.toString('utf8').replace(
     '          <Tablix Name="SalesTable">',
