@@ -56,6 +56,7 @@ const SECTION_ANCHOR_POINTS = 2;
 const GEOMETRY_EPSILON = 0.13;
 const CERTIFIED_GEOMETRY_TOLERANCE_POINTS = 0.5;
 const NONE_BORDER = Object.freeze({ style: BorderStyle.NONE, size: 0, color: 'auto' });
+const RESOLVED_TABLIX_FRAGMENT_BORDER = 'resolvedTablixFragmentBorder';
 const VARIANTS = Object.freeze([
   { key: 'regular', bold: false, italic: false, element: 'embedRegular' },
   { key: 'bold', bold: true, italic: false, element: 'embedBold' },
@@ -981,7 +982,7 @@ function perpendicularOverlap(first, second, side) {
 function alignResolvedFragmentBordersToCellEdges(lines, owners, canonicalBounds) {
   for (const line of lines) {
     const side = String(line.fragmentSide || '').toLowerCase();
-    if (line.traceRole !== 'resolvedTablixFragmentBorder'
+    if (line.traceRole !== RESOLVED_TABLIX_FRAGMENT_BORDER
       || !['top', 'right', 'bottom', 'left'].includes(side)
       || !line.tablixName) continue;
 
@@ -1010,12 +1011,24 @@ function alignResolvedFragmentBordersToCellEdges(lines, owners, canonicalBounds)
       > CERTIFIED_GEOMETRY_TOLERANCE_POINTS + GEOMETRY_EPSILON) continue;
     if (side === 'top' || side === 'bottom') line.y = target;
     else line.x = target;
+    // The canonical PDF has already proved that this fragment rule closes these exact cell edges. Keep
+    // that association with the owner instead of depending solely on a second match after Word-grid
+    // rounding. A split tablix can end on a fractional edge that is represented by a vertical merge in
+    // Word; if that later line-to-band comparison misses by a snap interval, Word receives no bottom
+    // border and leaves an open table corner despite the canonical PDF's closing rule.
+    for (const cell of matchingCells) {
+      cell.fragmentBorders = {
+        ...cell.fragmentBorders,
+        [side]: strongerBorder(cell.fragmentBorders?.[side], lineBorder(line)),
+      };
+    }
   }
 }
 
 function resolvedRenderedBorders(box, owner, decorators, lines) {
   return Object.fromEntries(['top', 'right', 'bottom', 'left'].map((side) => {
     let resolved = owner?.borders?.[side] || null;
+    resolved = strongerBorder(resolved, owner?.fragmentBorders?.[side]);
     for (const decorator of decorators) {
       if (edgeMatches(decorator, side, box)) resolved = strongerBorder(resolved, decorator.borders?.[side]);
     }
@@ -1298,7 +1311,9 @@ function emptyFooterParagraph() {
 function footerLayout(page) {
   const region = page.regions?.footer;
   if (!region || region.height <= GEOMETRY_EPSILON) return null;
-  const items = page.items.filter((item) => item.region === 'footer');
+  const items = page.items.filter((item) => (
+    item.region === 'footer' && item.traceRole !== RESOLVED_TABLIX_FRAGMENT_BORDER
+  ));
   const contentBottom = items.length > 0
     ? Math.max(...items.map((item) => Number(item.y || 0) + Number(item.height || 0)))
     : region.y + region.height;
@@ -1851,7 +1866,13 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
       // the section's body table; keeping footer rows in that table lets the terminal paragraph push the
       // final footer row onto a blank page. A native footer is positioned independently from body flow.
       const bodyGrid = preparePageGrid(page, {
-        items: page.items.filter((item) => item.region !== 'footer'),
+        // A tablix closure exactly on the printable body/footer boundary is recorded at that coordinate.
+        // Region classification places boundary primitives in the footer, but the edge belongs to the
+        // last body cell. Keep it in the body grid so its closing rule is emitted on that cell rather than
+        // being detached into the footer story; all ordinary footer items remain independent.
+        items: page.items.filter((item) => (
+          item.region !== 'footer' || item.traceRole === RESOLVED_TABLIX_FRAGMENT_BORDER
+        )),
       });
       const footer = await nativePageFooter(
         page,
