@@ -48,6 +48,14 @@ DOCX_EDITABLE (embedded picture) and DOCX_VISUAL. XLSX represents chart source a
 drawing). An axis/label fix in the chart layer therefore fixes PDF and both DOCX modes together; note XLSX
 non-applicability with its reason.
 
+## Titles
+
+- A chart title is **docked** to a side and occupies that whole band: a top/bottom title's area spans the
+  chart's content width, a side title's spans its height. A declared `BackgroundColor` fills that area, so
+  it reads as a header bar across the chart — never a tab auto-sized to the caption.
+- `Position` (TopLeft … BottomRight) is the title's alignment property: it places the caption inside the
+  band. It is not the text-box `TextAlign`, and the two must not both act on the same placement.
+
 ## Verification
 
 Assert clean tick labels (no float noise) at a max that forces fractional intervals (e.g. max 1 → interval

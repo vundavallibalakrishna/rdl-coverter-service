@@ -265,18 +265,21 @@ function anchoredStart(start, end, size, alignment) {
   return start + (end - start - size) / 2;
 }
 
-function drawTitle(doc, config, chart, x, y, width, height, context) {
+function drawTitle(doc, config, chart, x, y, width, height, context, positionAlign = 'center') {
   const caption = String(evaluateExpression(chart.title.caption, context) ?? '').trim();
   const style = chart.title.style || {};
   drawStyledBox(doc, x, y, width, height, style, context);
   const appearance = styleFont(doc, config, style, context, 9);
-  const align = String(styleValue(style.textAlign, context, 'Center')).toLowerCase();
+  // Where the caption sits inside the title's area is the Position's own alignment word — TopLeft, TopCenter,
+  // TopRight — which is the chart title's alignment property, not the text-box TextAlign. Letting TextAlign
+  // override it would make the two properties fight over one placement.
+  const align = ['left', 'right', 'center'].includes(positionAlign) ? positionAlign : 'center';
   const paddingLeft = styleSize(style.paddingLeft, context, 2);
   const paddingRight = styleSize(style.paddingRight, context, 2);
   const paddingTop = styleSize(style.paddingTop, context, 2);
   fillText(doc, caption, x + paddingLeft, y + paddingTop, {
     width: Math.max(1, width - paddingLeft - paddingRight),
-    align: ['left', 'right', 'center'].includes(align) ? align : 'center',
+    align,
     color: appearance.color,
   });
 }
@@ -658,13 +661,20 @@ export function drawChart(doc, config, chart, data, x, y, width, height, outerCo
     const titlePosition = String(styleValue(chart.title.position, context, 'TopCenter'))
       .replace(/\s+/g, '')
       .toLowerCase();
-    const measuredWidth = titleWidth(doc, config, chart, context, content.right - content.left);
+    // A title docked to the top or bottom occupies that whole band: its box — and therefore its
+    // background — spans the chart's content width, and the Position's alignment word places the caption
+    // inside it. Shrink-wrapping the box to the caption instead turned a declared title background into a
+    // small tab floating over the plot rather than the full-width header the report asks for.
+    const bandWidth = Math.max(1, content.right - content.left);
     if (titlePosition.startsWith('bottom')) {
       const alignment = titlePosition.slice('bottom'.length) || 'center';
-      const titleX = anchoredStart(content.left, content.right, measuredWidth, alignment);
-      drawTitle(doc, config, chart, titleX, content.bottom - measuredHeight, measuredWidth, measuredHeight, context);
+      drawTitle(doc, config, chart, content.left, content.bottom - measuredHeight, bandWidth, measuredHeight, context, alignment);
       content.bottom -= measuredHeight + 6;
     } else if (titlePosition.startsWith('left') || titlePosition.startsWith('right')) {
+      // A side-docked title is rotated in SSRS and this renderer draws it upright, so its box stays the
+      // size of the caption: painting a full-height band around horizontal text would be a different
+      // misrepresentation, not a closer one.
+      const measuredWidth = titleWidth(doc, config, chart, context, content.right - content.left);
       const side = titlePosition.startsWith('left') ? 'left' : 'right';
       const alignment = titlePosition.slice(side.length) || 'center';
       const titleY = anchoredStart(content.top, content.bottom, measuredHeight, alignment);
@@ -676,8 +686,7 @@ export function drawChart(doc, config, chart, data, x, y, width, height, outerCo
       const alignment = titlePosition.startsWith('top')
         ? titlePosition.slice('top'.length) || 'center'
         : 'center';
-      const titleX = anchoredStart(content.left, content.right, measuredWidth, alignment);
-      drawTitle(doc, config, chart, titleX, content.top, measuredWidth, measuredHeight, context);
+      drawTitle(doc, config, chart, content.left, content.top, bandWidth, measuredHeight, context, alignment);
       content.top += measuredHeight + 6;
     }
   }

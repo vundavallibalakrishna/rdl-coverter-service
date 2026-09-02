@@ -235,6 +235,22 @@ verified against a real SSRS oracle. Never let an entry justify a report-specifi
   pagination. Regression: `test/nested-region-page-fill.test.js` (split + KeepTogether counterexamples for
   both nested tablix and bundled subreport, plus DOCX_EDITABLE and XLSX coverage). Ref: `page-and-flow.md`.
 
+- **A chart title's background shrank to its caption instead of spanning the chart.** An SSRS chart title
+  is docked to a side of the chart and occupies that whole band, so the `BackgroundColor` its RDL declares
+  paints a header bar across the chart's content width; `Position` (TopLeft / TopCenter / TopRight) places
+  the caption inside that band. `drawChart` (`chart.js`) sized the title's box to the measured caption
+  width and anchored that small box by Position, so a declared background rendered as a small tab floating
+  over the plot — in the reported report, a 65pt tab on a 432pt-wide chart. Fixed in the chart title layout:
+  a top- or bottom-docked title's box is the content band, and the Position alignment is passed through to
+  place the caption in it. A side-docked title keeps its caption-sized box, because SSRS rotates those and
+  this renderer draws them upright — a full-height band around horizontal text would be a different
+  misrepresentation, not a closer one. `TextAlign` no longer competes for the same placement: the chart
+  title's alignment property is `Position`, which is what `test/chart-properties.test.js` already
+  required across PDF, editable Word, visual Word and Excel. Format-agnostic: every renderer draws charts
+  through this one function (Word/Excel embed the same chart as a picture). A title with no declared
+  background is unaffected — the caption lands in the same place either way. Regression:
+  `test/chart-title-band.test.js`. Ref: `charts-and-axes.md`.
+
 - **A separator Line in a cell made a borderless tablix draw a synthesized closing rule.** A data tablix
   whose cells declare grid edges is closed with a rule where it ends, so a bordered grid is never left open.
   The test for that intent read the cells' direct content and accepted any item whose `Style` declared a
