@@ -8,6 +8,7 @@ import {
   Document,
   ExternalHyperlink,
   Footer,
+  Header,
   HeightRule,
   HorizontalPositionRelativeFrom,
   ImageRun,
@@ -1301,11 +1302,27 @@ function preparePageGrid(page, {
   };
 }
 
-function emptyFooterParagraph() {
+function emptyStoryParagraph() {
   return new Paragraph({
     spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
     children: [new TextRun({ text: '' })],
   });
+}
+
+function headerLayout(page) {
+  const region = page.regions?.header;
+  if (!region || region.height <= GEOMETRY_EPSILON) return null;
+  const items = page.items.filter((item) => item.region === 'header');
+  const contentBottom = items.length > 0
+    ? Math.max(...items.map((item) => Number(item.y || 0) + Number(item.height || 0)))
+    : region.y + region.height;
+  const height = Math.max(region.height, contentBottom - region.y);
+  return {
+    region,
+    items,
+    height,
+    topDistance: Math.max(0, region.y),
+  };
 }
 
 function footerLayout(page) {
@@ -1342,7 +1359,7 @@ async function nativePageFooter(
   if (layout.items.length === 0) {
     // Every canonical page owns its footer relationship. An explicit empty footer prevents Word from
     // inheriting visible content from the previous one-page section when the RDL hides a page footer.
-    return new Footer({ children: [emptyFooterParagraph()] });
+    return new Footer({ children: [emptyStoryParagraph()] });
   }
 
   const grid = preparePageGrid(page, {
@@ -1366,7 +1383,49 @@ async function nativePageFooter(
         chartCounter,
         fitTextCounter,
       ),
-      emptyFooterParagraph(),
+      emptyStoryParagraph(),
+    ],
+  });
+}
+
+async function nativePageHeader(
+  page,
+  resources,
+  model,
+  request,
+  config,
+  tempDir,
+  chartCounter,
+  fitTextCounter,
+) {
+  const layout = headerLayout(page);
+  if (!layout) return null;
+
+  if (layout.items.length === 0) {
+    // Each canonical page owns its header relationship. An explicit empty header prevents Word from
+    // inheriting visible content from a preceding one-page section when the RDL suppresses a header.
+    return new Header({ children: [emptyStoryParagraph()] });
+  }
+
+  const grid = preparePageGrid(page, {
+    items: layout.items,
+    originY: layout.region.y,
+    canvasHeight: layout.height,
+    reserveSectionAnchor: false,
+  });
+  return new Header({
+    children: [
+      await pageTable(
+        grid,
+        resources,
+        model,
+        request,
+        config,
+        tempDir,
+        chartCounter,
+        fitTextCounter,
+      ),
+      emptyStoryParagraph(),
     ],
   });
 }
@@ -1614,6 +1673,8 @@ async function pageTable(
 
 function pageProperties(page, index) {
   const landscape = page.width > page.height;
+  const bodyTop = Number(page.regions?.body?.y || 0);
+  const headerDistance = headerLayout(page)?.topDistance || 0;
   const footerDistance = footerLayout(page)?.bottomDistance || 0;
   return {
     type: index === 0 ? undefined : SectionType.NEXT_PAGE,
@@ -1630,7 +1691,10 @@ function pageProperties(page, index) {
           orientation: PageOrientation.PORTRAIT,
         },
       margin: {
-        top: 0,
+        // Body flow begins at the canonical body band. Keeping it at the physical page origin places
+        // an opaque Word body table over the native header story, so headers appear to disappear even
+        // though their relationships exist in the package.
+        top: pointsToTwips(bodyTop),
         right: 0,
         // The canonical body grid already stops before the PDF footer. A small negative bottom margin
         // gives Word's mandatory end-of-section paragraph a non-visible flow allowance below that fixed
@@ -1638,7 +1702,9 @@ function pageProperties(page, index) {
         // Footer placement is governed independently by the exact w:footer distance below.
         bottom: -pointsToTwips(SECTION_ANCHOR_POINTS),
         left: 0,
-        header: 0,
+        // The RDL PageHeader height controls the native header grid. Word's Header from Top is the
+        // traced header band's physical offset from the page edge, which is the RDL top margin.
+        header: pointsToTwips(headerDistance),
         footer: pointsToTwips(footerDistance),
         gutter: 0,
       },
@@ -1862,7 +1928,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
     const fitTextCounter = { value: 1 };
     const sections = [];
     for (const [index, page] of trace.pages.entries()) {
-      // Footer items must not participate in body flow. Word always inserts a terminal paragraph after
+      // Header/footer items must not participate in body flow. Word always inserts a terminal paragraph after
       // the section's body table; keeping footer rows in that table lets the terminal paragraph push the
       // final footer row onto a blank page. A native footer is positioned independently from body flow.
       const bodyGrid = preparePageGrid(page, {
@@ -1871,9 +1937,24 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
         // last body cell. Keep it in the body grid so its closing rule is emitted on that cell rather than
         // being detached into the footer story; all ordinary footer items remain independent.
         items: page.items.filter((item) => (
-          item.region !== 'footer' || item.traceRole === RESOLVED_TABLIX_FRAGMENT_BORDER
+          (item.region !== 'footer' && item.region !== 'header')
+            || item.traceRole === RESOLVED_TABLIX_FRAGMENT_BORDER
         )),
+        // The native body table flows inside Word's body area. Its coordinates are therefore relative
+        // to the canonical body band, while the section top margin restores the absolute PDF position.
+        originY: Number(page.regions?.body?.y || 0),
+        canvasHeight: page.height - Number(page.regions?.body?.y || 0),
       });
+      const header = await nativePageHeader(
+        page,
+        resources,
+        model,
+        canonicalRequest,
+        config,
+        workingTempDir,
+        chartCounter,
+        fitTextCounter,
+      );
       const footer = await nativePageFooter(
         page,
         resources,
@@ -1886,6 +1967,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
       );
       sections.push({
         properties: pageProperties(page, index),
+        headers: header ? { default: header } : undefined,
         footers: footer ? { default: footer } : undefined,
         children: [await pageTable(
           bodyGrid,

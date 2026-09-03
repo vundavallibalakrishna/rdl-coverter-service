@@ -268,8 +268,10 @@ test('a near-full PDF page preserves traced row heights and uses only the non-vi
   const zip = await JSZip.loadAsync(rendered.buffer);
   const documentXml = await zip.file('word/document.xml').async('string');
 
-  // The 10pt PDF spacer remains exactly 200 twips; pagination capacity comes only from the section margin.
-  assert.match(documentXml, /<w:trHeight w:val="200" w:hRule="exact"\/>/);
+  // Native headers own the 10pt header band, so the body grid starts at the canonical body origin
+  // instead of adding an opaque spacer row that can cover the Word header story.
+  assert.match(documentXml, /<w:trHeight w:val="3400" w:hRule="exact"\/>/);
+  assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:top="200")/);
   assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-40")/);
 });
 
@@ -317,6 +319,50 @@ test('multi-row PDF footer content is isolated in one native footer part outside
   assert.equal((footerXml.match(/<w:tbl>/g) || []).length, 1);
   assert.match(footerXml, /FOOTER_PRIMARY_ROW[\s\S]*FOOTER_SECONDARY_ROW/);
   assert.equal((footerXml.match(/<w:trHeight[^>]*w:hRule="exact"/g) || []).length >= 2, true);
+});
+
+test('PDF page headers are emitted in native Word header stories rather than the body grid', async () => {
+  const headerModel = structuredClone(baseModel);
+  const source = baseModel.body.items.find((item) => item.type === 'Textbox');
+  const headerItem = {
+    ...structuredClone(source),
+    name: 'NativeHeaderStory',
+    value: 'NATIVE_HEADER_STORY_MARKER',
+    paragraphs: [['NATIVE_HEADER_STORY_MARKER']],
+    left: 12,
+    top: 6,
+    width: 250,
+    height: 18,
+    canGrow: false,
+  };
+  headerModel.page.header = {
+    height: 42,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [headerItem],
+  };
+  headerModel.page.footer = null;
+
+  const canonical = await renderPdf(headerModel, request, config, { captureLayoutTrace: true });
+  const tracedHeader = canonical.layoutTrace.pages[0].regions.header;
+  assert.equal(tracedHeader.y, headerModel.page.marginTop);
+  assert.equal(tracedHeader.height, headerModel.page.header.height);
+
+  const rendered = await renderEditableDocx(headerModel, request, config);
+  const zip = await JSZip.loadAsync(rendered.buffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  const documentRelationships = await zip.file('word/_rels/document.xml.rels').async('string');
+  const headerXml = await zip.file('word/header1.xml').async('string');
+
+  assert.doesNotMatch(documentXml, /NATIVE_HEADER_STORY_MARKER/);
+  assert.match(documentXml, /<w:headerReference w:type="default" r:id="[^"]+"\/>/);
+  assert.match(
+    documentXml,
+    new RegExp(`<w:pgMar\\b(?=[^>]*w:header="${Math.round(tracedHeader.y * 20)}")`),
+  );
+  assert.match(documentRelationships, /Type="[^"]*\/header" Target="header1\.xml"/);
+  assert.match(headerXml, /NATIVE_HEADER_STORY_MARKER/);
+  assert.equal((headerXml.match(/<w:tbl>/g) || []).length, 1);
 });
 
 test('Windows page, grid-column, and editable-overlap limits fail closed generically', async () => {
