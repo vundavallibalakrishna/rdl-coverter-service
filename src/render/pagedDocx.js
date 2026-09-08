@@ -1608,7 +1608,13 @@ function emptyStoryParagraph() {
 function headerLayout(page) {
   const region = page.regions?.header;
   if (!region || region.height <= GEOMETRY_EPSILON) return null;
-  const items = page.items.filter((item) => item.region === 'header');
+  // A tablix fragment edge exactly on the body/header boundary is classified as a header primitive by
+  // the trace's inclusive region test, but it still belongs to the body tablix.  The body grid retains
+  // these provenance-marked edges so it can close the correct cell.  Emitting one in the native header
+  // story as well gives Word a second, detached rule immediately below the page header.
+  const items = page.items.filter((item) => (
+    item.region === 'header' && item.traceRole !== RESOLVED_TABLIX_FRAGMENT_BORDER
+  ));
   const contentBottom = items.length > 0
     ? Math.max(...items.map((item) => Number(item.y || 0) + Number(item.height || 0)))
     : region.y + region.height;

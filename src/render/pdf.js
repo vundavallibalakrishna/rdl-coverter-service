@@ -2142,7 +2142,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
     // Merged cells are excluded: their child regions are paginated by the open-span path, which knows the
     // merge's real extent. Sizing or splitting them from this row would put the whole child in the row it
     // starts in, which is the growth bug this row measurement no longer has.
-    const hasNestedTablix = row.cells.some((cell) => (cell.rowSpan || 1) === 1 && (cell.nestedTablixes || []).length > 0);
+    // An empty nested data region has no rows to paginate. Let the ordinary row path own it: in
+    // particular, that path accounts for any parent merge which closes on this row. Treating an empty
+    // child as a paginated region moved the row to a fresh page and returned at its natural height,
+    // bypassing that closing-merge growth and leaving an unowned band below the row.
+    const hasNestedTablix = row.cells.some((cell) => (cell.rowSpan || 1) === 1
+      && (cell.nestedTablixes || []).some((nested) => (nested.rows || []).some((nestedRow) => !nestedRow.isHeader)));
     // SSRS breaks a page at the deepest boundary that can still fill it. A parent row holding a child data
     // region (nested tablix or bundled subreport) is therefore NOT atomic: the break falls between the
     // child region's own rows and the remainder continues on the next page. The whole row moves only when
@@ -2335,7 +2340,12 @@ function renderTablix({ doc, config, model, item, request, startX, startY, pageB
       });
       const hasContinuation = parts.some((part) => part.tail.length > 0);
       const heads = parts.map((part) => part.head);
-      const segmentHeight = hasContinuation ? availableHeight : Math.min(availableHeight, measureRow(row, heads));
+      // When a text-capable closing row is moved to a continuation page, this path still owns the
+      // complete row even if its text happens to fit in one segment. Preserve the height required by a
+      // vertical merge closing here; otherwise only the natural text height is consumed and the merge
+      // appends an unowned, borderless band below the row.
+      const resolvedHeight = Math.max(measureRow(row, heads), closingMergeRequirement(row));
+      const segmentHeight = hasContinuation ? availableHeight : Math.min(availableHeight, resolvedHeight);
       drawRowContent(row, segmentHeight, heads, !hasContinuation);
       remainingTexts = parts.map((part) => part.tail);
       if (hasContinuation) {

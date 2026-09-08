@@ -28,7 +28,7 @@ const textbox = (name, value) => `<Textbox Name="${name}"><CanGrow>true</CanGrow
   + '<PaddingLeft>2pt</PaddingLeft><PaddingRight>2pt</PaddingRight></Style></Textbox>';
 
 // One group of DETAILS physical rows, plus a merged group header whose height is the variable under test.
-const report = (headerLines) => Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
+const report = (headerLines, pageHeight = 11) => Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
 <Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
   <DataSets><DataSet Name="DS"><Fields>
     <Field Name="G"><DataField>G</DataField><TypeName>System.String</TypeName></Field>
@@ -53,7 +53,7 @@ const report = (headerLines) => Buffer.from(`<?xml version="1.0" encoding="utf-8
       </TablixMembers></TablixRowHierarchy>
       <DataSetName>DS</DataSetName><Top>0in</Top><Left>0in</Left><Height>0.25in</Height><Width>4.5in</Width><Style/></Tablix>
   </ReportItems><Height>8in</Height><Style/></Body><Width>8in</Width>
-  <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.3in</LeftMargin><RightMargin>0.3in</RightMargin><TopMargin>0.3in</TopMargin><BottomMargin>0.3in</BottomMargin></Page>
+  <Page><PageHeight>${pageHeight}in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.3in</LeftMargin><RightMargin>0.3in</RightMargin><TopMargin>0.3in</TopMargin><BottomMargin>0.3in</BottomMargin></Page>
   </ReportSection></ReportSections></Report>`, 'utf8');
 
 const DETAILS = 2;
@@ -110,6 +110,26 @@ test('a merge that fits its rows changes no row height', async () => {
     Math.abs(bottom(short.side[DETAILS - 1]) - bottom(short.detail[DETAILS - 1])) <= 0.5,
     'and the columns still close together',
   );
+});
+
+test('a text row that closes a merge after a page break owns the merge height', async () => {
+  const continuedRows = Array.from({ length: 12 }, (unused, index) => ({
+    G: 'G1', D: `PAGE_DETAIL_${index + 1}`, E: `PAGE_SIDE_${index + 1}`,
+  }));
+  const rendered = await renderPdf(
+    parseRdl(report(14, 3.2)),
+    { ...request('PDF'), datasets: { DS: continuedRows } },
+    config,
+    { captureLayoutTrace: true },
+  );
+  assert.ok(rendered.pageCount > 1, 'the closing row must be moved to a continuation page');
+  const items = rendered.layoutTrace.pages.flatMap((page) => page.items || []);
+  const firstDetail = items.find((item) => item.kind === 'tablixCell' && item.text === 'PAGE_DETAIL_1');
+  const finalDetail = items.find((item) => item.kind === 'tablixCell' && item.text === 'PAGE_DETAIL_12');
+  const finalSide = items.find((item) => item.kind === 'tablixCell' && item.text === 'PAGE_SIDE_12');
+  assert.ok(firstDetail && finalDetail && finalSide, 'the continuation merge and its final physical row are rendered');
+  assert.ok(finalDetail.height > firstDetail.height + 1, 'the final text row carries the merge growth');
+  assert.ok(Math.abs(bottom(finalDetail) - bottom(finalSide)) <= 0.5, 'the neighbouring cell closes at the same edge');
 });
 
 test('the grown closing row reaches editable Word and Excel', async () => {

@@ -768,6 +768,61 @@ test('PDF page headers are emitted in native Word header stories rather than the
   assert.equal((headerXml.match(/<w:tbl>/g) || []).length, 1);
 });
 
+test('a tablix top edge on the body/header boundary remains in the body grid only', async () => {
+  // A resolved fragment border has a zero-height box on the first body coordinate. The trace's
+  // inclusive region classification calls that coordinate "header", but SSRS paints the rule as the
+  // tablix's body edge. Native Word must not also add it to the header story.
+  const boundaryModel = structuredClone(baseModel);
+  const bodyTextbox = boundaryModel.body.items.find((item) => item.type === 'Textbox');
+  const tablix = boundaryModel.body.items.find((item) => item.type === 'Tablix');
+  boundaryModel.body.items = [tablix];
+  tablix.top = 0;
+  tablix.style.borders = {
+    top: { style: 'Solid', color: '#000000', width: 1 },
+    right: { style: 'Solid', color: '#000000', width: 1 },
+    bottom: { style: 'Solid', color: '#000000', width: 1 },
+    left: { style: 'Solid', color: '#000000', width: 1 },
+  };
+  boundaryModel.page.marginTop = 36;
+  boundaryModel.page.header = {
+    height: 30,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [{
+      ...bodyTextbox,
+      name: 'BoundaryHeader',
+      value: 'HEADER_MARKER',
+      paragraphs: [['HEADER_MARKER']],
+      left: 0,
+      top: 0,
+      width: 200,
+      height: 20,
+      canGrow: false,
+    }],
+  };
+
+  const canonical = await renderPdf(boundaryModel, request, config, { captureLayoutTrace: true });
+  const boundaryLine = canonical.layoutTrace.pages[0].items.find((item) => (
+    item.traceRole === 'resolvedTablixFragmentBorder' && item.fragmentSide === 'top'
+  ));
+  assert.equal(boundaryLine?.region, 'header');
+  assert.equal(boundaryLine?.y, canonical.layoutTrace.pages[0].regions.body.y);
+
+  for (const [render, output] of [
+    [renderEditableDocx, 'DOCX_EDITABLE'],
+    [renderReflowableDocx, 'DOCX_REFLOWABLE'],
+  ]) {
+    const rendered = await render(boundaryModel, { ...request, output }, config);
+    const zip = await JSZip.loadAsync(rendered.buffer);
+    const headerXml = await zip.file('word/header1.xml').async('string');
+    const documentXml = await zip.file('word/document.xml').async('string');
+    assert.match(headerXml, /HEADER_MARKER/);
+    assert.equal((headerXml.match(/<w:tr>/g) || []).length, 1);
+    assert.doesNotMatch(headerXml, /<w:top w:val="single"/);
+    assert.match(documentXml, /<w:top w:val="single"/);
+  }
+});
+
 test('Windows page, grid-column, and editable-overlap limits fail closed generically', async () => {
   const oversizedPage = structuredClone(baseModel);
   oversizedPage.page.width = 23 * 72;
